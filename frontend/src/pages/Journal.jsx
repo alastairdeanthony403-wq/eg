@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import api from "@/lib/api";
 import { Plus, Trash2, BookOpen } from "lucide-react";
 
@@ -15,16 +15,31 @@ export default function Journal() {
   const [open, setOpen] = useState(false);
   const [form, setForm] = useState({ symbol: "BTCUSDT", side: "BUY", entry: 0, exit: 0, pnl: 0, mood: "neutral", tags: "", notes: "" });
 
-  const load = () => api.get("/journal").then(({ data }) => setItems(data || [])).catch(() => {});
-  useEffect(() => { load(); }, []);
+  const load = useCallback(() => {
+    api.get("/journal")
+      .then(({ data }) => setItems(data || []))
+      .catch((err) => console.error("journal load failed:", err));
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
 
   const save = async () => {
-    await api.post("/journal", { ...form, tags: form.tags.split(",").map((s) => s.trim()).filter(Boolean) });
-    setOpen(false); setForm({ symbol: "BTCUSDT", side: "BUY", entry: 0, exit: 0, pnl: 0, mood: "neutral", tags: "", notes: "" });
-    load();
+    try {
+      await api.post("/journal", { ...form, tags: form.tags.split(",").map((s) => s.trim()).filter(Boolean) });
+      setOpen(false);
+      setForm({ symbol: "BTCUSDT", side: "BUY", entry: 0, exit: 0, pnl: 0, mood: "neutral", tags: "", notes: "" });
+      load();
+    } catch (err) {
+      console.error("journal save failed:", err);
+      alert("Failed to save entry");
+    }
   };
 
-  const del = async (id) => { if (window.confirm("Delete entry?")) { await api.delete(`/journal/${id}`); load(); } };
+  const del = async (id) => {
+    if (!window.confirm("Delete entry?")) return;
+    try { await api.delete(`/journal/${id}`); load(); }
+    catch (err) { console.error("journal delete failed:", err); }
+  };
 
   return (
     <div className="space-y-6 fade-up" data-testid="journal-page">

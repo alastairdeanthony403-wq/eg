@@ -15,9 +15,10 @@ export function AuthProvider({ children }) {
       api.get("/auth/me").then((r) => {
         localStorage.setItem("ate_user", JSON.stringify(r.data));
         setUser(r.data);
-      }).catch(() => {});
+      }).catch((err) => console.error("auth/me failed:", err));
     }
-  }, []); // eslint-disable-line
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const login = async (email, password) => {
     setLoading(true);

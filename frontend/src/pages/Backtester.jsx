@@ -20,7 +20,8 @@ export default function Backtester() {
   const [err, setErr] = useState("");
 
   const loadHistory = useCallback(async () => {
-    try { const { data } = await api.get("/backtest-runs"); setHistory(data || []); } catch {}
+    try { const { data } = await api.get("/backtest-runs"); setHistory(data || []); }
+    catch (err) { console.error("history load failed:", err); }
   }, []);
   useEffect(() => { loadHistory(); }, [loadHistory]);
 
@@ -29,15 +30,17 @@ export default function Backtester() {
     try {
       const { data } = await api.post("/backtest", params);
       setResult(data); loadHistory();
-    } catch (e) { setErr(e?.response?.data?.error || "Backtest failed"); }
-    finally { setRunning(false); }
+    } catch (e) {
+      console.error("backtest failed:", e);
+      setErr(e?.response?.data?.error || "Backtest failed");
+    } finally { setRunning(false); }
   };
 
   const loadRun = async (id) => {
     try {
       const { data } = await api.get(`/backtest-runs/${id}`);
       setResult({ summary: data.summary, trades: data.trades, signals: [] });
-    } catch {}
+    } catch (err) { console.error("load run failed:", err); }
   };
 
   const sm = result?.summary;

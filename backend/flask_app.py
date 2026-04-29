@@ -660,9 +660,13 @@ def run_backtest_engine(candles, signals, starting_balance=1000, fee_pct=0.04, s
     sess_perf = {"London": 0.0, "New York": 0.0, "Asia": 0.0}
 
     for sig in signals:
-        ei = sig["index"]; ep = float(sig["price"]); side = sig["type"]
-        sl = float(sig["stop_loss"]); tp = float(sig["take_profit"])
-        et = sig["time"]; sym = sig.get("symbol", "N/A"); tf = sig.get("interval", "N/A")
+        ei = int(sig.get("index", 0))
+        ep = float(sig.get("price", 0) or 0)
+        side = sig.get("type", "BUY")
+        sl = float(sig.get("stop_loss", ep) or ep)
+        tp = float(sig.get("take_profit", ep) or ep)
+        et = sig.get("time", "")
+        sym = sig.get("symbol", "N/A"); tf = sig.get("interval", "N/A")
         xp = ep; xt = et; gp = 0.0; reason = "Timed exit"
         max_fwd = min(ei + 30, len(candles) - 1)
         for j in range(ei + 1, max_fwd + 1):

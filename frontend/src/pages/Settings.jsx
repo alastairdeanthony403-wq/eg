@@ -9,7 +9,11 @@ export default function Settings() {
   const [saving, setSaving] = useState(false);
   const [savedAt, setSavedAt] = useState(null);
 
-  useEffect(() => { api.get("/settings").then(({ data }) => setCfg(data)).catch(() => {}); }, []);
+  useEffect(() => {
+    api.get("/settings")
+      .then(({ data }) => setCfg(data))
+      .catch((err) => console.error("settings load failed:", err));
+  }, []);
 
   if (!cfg) return <div className="text-[var(--text-mute)]">Loading...</div>;
 
@@ -22,7 +26,8 @@ export default function Settings() {
   const save = async () => {
     setSaving(true);
     try { const { data } = await api.post("/settings", cfg); setCfg(data); setSavedAt(new Date()); }
-    catch {} finally { setSaving(false); }
+    catch (err) { console.error("settings save failed:", err); }
+    finally { setSaving(false); }
   };
 
   return (
