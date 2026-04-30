@@ -1,72 +1,70 @@
-import { NavLink, Outlet, useNavigate } from "react-router-dom";
-import { useAuth } from "@/lib/auth";
-import { LayoutDashboard, LineChart, Settings, BookOpen, FlaskConical, LogOut, TrendingUp, Activity } from "lucide-react";
+import React, { useMemo, useState } from "react";
+import { motion } from "framer-motion";
+import { Activity, BarChart3, BookOpen, Bot, FlaskConical, Gauge, LineChart, Lock, LogOut, Plus, RefreshCw, Save, Settings, Sparkles, Zap } from "lucide-react";
 
-export default function AppShell() {
-  const { user, logout } = useAuth();
-  const nav = useNavigate();
-  const items = [
-    { to: "/dashboard", label: "Signals", icon: <LayoutDashboard size={17} /> },
-    { to: "/backtester", label: "Backtester", icon: <FlaskConical size={17} /> },
-    { to: "/journal", label: "Journal", icon: <BookOpen size={17} /> },
-    { to: "/settings", label: "Strategy", icon: <Settings size={17} /> },
+const symbols = [
+  { pair: "BTC/USDT", price: "$76,109.9", change: "+0.07%", conf: 85, smc: "5/9" },
+  { pair: "ETH/USDT", price: "$2,259.97", change: "+0.08%", conf: 70, smc: "3/9" },
+  { pair: "BNB/USDT", price: "$615.77", change: "+0.02%", conf: 70, smc: "3/9" },
+  { pair: "SOL/USDT", price: "$83.07", change: "+0.07%", conf: 70, smc: "3/9" },
+];
+
+const candles = Array.from({ length: 120 }, (_, i) => {
+  const base = i < 30 ? 185 - i * 2.2 : i < 45 ? 112 + (i - 30) * 1.4 : i < 75 ? 125 + Math.sin(i / 3) * 8 : 130 + Math.sin(i / 5) * 10;
+  const wobble = Math.sin(i * 1.9) * 5 + Math.cos(i * 0.7) * 3;
+  const open = base + wobble;
+  const close = open + Math.sin(i * 2.7) * 8 + (i % 7 === 0 ? -10 : 4);
+  const high = Math.max(open, close) + 6 + (i % 5);
+  const low = Math.min(open, close) - 6 - (i % 4);
+  return { open, close, high, low };
+});
+
+function cx(...classes) { return classes.filter(Boolean).join(" "); }
+
+function Shell({ children, page, setPage, signedIn, setSignedIn }) {
+  const nav = [
+    ["Signals", BarChart3], ["Backtester", FlaskConical], ["Journal", BookOpen], ["Strategy", Settings],
   ];
-
-  return (
-    <div className="min-h-screen flex" data-testid="app-shell">
-      {/* sidebar */}
-      <aside className="w-64 shrink-0 border-r border-[var(--line)] bg-[var(--bg-1)] flex flex-col">
-        <div className="px-5 py-5 border-b border-[var(--line)]">
-          <div className="flex items-center gap-3">
-            <div className="w-9 h-9 rounded-lg bg-[var(--accent)] flex items-center justify-center" style={{ boxShadow: "var(--glow-mint)" }}>
-              <TrendingUp size={18} color="#00130b" strokeWidth={2.5} />
-            </div>
-            <div>
-              <div className="font-bold text-sm leading-none">AI Trading</div>
-              <div className="mono text-[10px] text-[var(--text-mute)] mt-1">ENGINE · v2</div>
-            </div>
-          </div>
-        </div>
-
-        <nav className="flex-1 p-3 space-y-1">
-          <div className="section-title px-3 pt-2 pb-3">Workspace</div>
-          {items.map((it) => (
-            <NavLink key={it.to} to={it.to} end className={({ isActive }) => `sidebar-link ${isActive ? "active" : ""}`} data-testid={`nav-${it.label.toLowerCase()}`}>
-              {it.icon}
-              <span>{it.label}</span>
-            </NavLink>
-          ))}
-
-          <div className="section-title px-3 pt-6 pb-3">Status</div>
-          <div className="sidebar-link">
-            <span className="pulse-dot" />
-            <span className="text-xs">Live · Binance</span>
-          </div>
-          <div className="sidebar-link">
-            <Activity size={16} className="text-[var(--accent-2)]" />
-            <span className="text-xs">Coinbase fallback</span>
-          </div>
-        </nav>
-
-        <div className="p-3 border-t border-[var(--line)]">
-          <div className="panel-flat p-3 mb-2">
-            <div className="text-xs text-[var(--text-mute)]">Signed in</div>
-            <div className="text-sm font-semibold truncate" data-testid="sidebar-user-name">{user?.name || user?.email}</div>
-            <div className="text-xs text-[var(--text-dim)] truncate">{user?.email}</div>
-          </div>
-          <button className="btn btn-ghost w-full" onClick={() => { logout(); nav("/login"); }} data-testid="logout-btn">
-            <LogOut size={15} /> Logout
-          </button>
-        </div>
-      </aside>
-
-      {/* main */}
-      <main className="flex-1 overflow-y-auto relative grid-bg">
-        <div className="aurora" />
-        <div className="relative z-10 max-w-[1500px] mx-auto p-8">
-          <Outlet />
-        </div>
-      </main>
-    </div>
-  );
+  return <div className="min-h-screen bg-[#05080c] text-slate-200 selection:bg-emerald-400/30 overflow-hidden font-sans">
+    <div className="fixed inset-0 bg-[linear-gradient(rgba(255,255,255,.035)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,.035)_1px,transparent_1px)] bg-[size:48px_48px]" />
+    <div className="fixed left-0 top-0 h-full w-[520px] bg-emerald-500/10 blur-3xl opacity-40" />
+    <div className="fixed right-0 bottom-0 h-[420px] w-[420px] bg-cyan-500/10 blur-3xl opacity-40" />
+    {signedIn && <aside className="fixed left-0 top-0 z-20 h-screen w-[245px] border-r border-slate-700/50 bg-[#090f14]/95">
+      <div className="flex h-20 items-center gap-3 border-b border-slate-700/50 px-5">
+        <Logo />
+        <div><div className="font-black tracking-tight">AI Trading</div><div className="text-[10px] uppercase tracking-[.22em] text-slate-500">Engine · v2</div></div>
+      </div>
+      <div className="px-4 py-6"><p className="mb-4 text-[11px] font-bold uppercase tracking-[.32em] text-slate-500">Workspace</p>
+        <div className="space-y-2">{nav.map(([n, Icon]) => <button key={n} onClick={() => setPage(n)} className={cx("flex w-full items-center gap-3 rounded-lg border px-4 py-3 text-left text-sm font-semibold transition", page === n ? "border-emerald-400/50 bg-emerald-400/12 text-emerald-300" : "border-transparent text-slate-400 hover:bg-slate-800/50 hover:text-slate-200")}><Icon size={16}/>{n}</button>)}</div>
+      </div>
+      <div className="px-5 py-3"><p className="mb-4 text-[11px] font-bold uppercase tracking-[.32em] text-slate-500">Status</p><Status text="Live · Binance"/><Status text="Coinbase fallback" icon={<Activity size={14}/>}/></div>
+      <div className="absolute bottom-4 left-3 right-3 space-y-2"><div className="rounded-xl border border-slate-700 bg-slate-900/60 p-3 text-xs"><p className="text-slate-500">Signed in</p><p className="font-bold">a&amp;d</p><p className="truncate text-slate-500">alastaireanthony403@gmail.c...</p></div><button onClick={() => setSignedIn(false)} className="flex w-full items-center justify-center gap-2 rounded-lg border border-slate-700 bg-slate-900/60 py-3 text-sm font-bold text-slate-300"><LogOut size={15}/> Logout</button></div>
+    </aside>}
+    <main className={cx("relative z-10 transition-all", signedIn ? "ml-[245px]" : "ml-0")}>{children}</main>
+    <div className="fixed bottom-5 left-1/2 z-50 flex -translate-x-1/2 items-center gap-4 rounded-full border border-slate-600/60 bg-slate-800/90 px-5 py-2 text-sm font-black shadow-2xl backdrop-blur">Frontend Preview Only. Please wake servers to enable backend functionality.<button className="rounded-full bg-emerald-400/15 px-4 py-1 text-emerald-300">Wake up servers</button></div>
+  </div>;
 }
+
+function Logo(){return <div className="flex h-9 w-9 items-center justify-center rounded-md bg-emerald-400 text-black shadow-[0_0_28px_rgba(16,244,166,.55)]"><LineChart size={20} strokeWidth={3}/></div>}
+function Status({text, icon}){return <div className="mb-4 flex items-center gap-3 text-sm text-slate-400"><span className="text-emerald-400">{icon || <span className="block h-2 w-2 rounded-full bg-emerald-400"/>}</span>{text}</div>}
+function Card({children, className}){return <div className={cx("rounded-xl border border-slate-700/70 bg-gradient-to-br from-slate-900/95 to-[#0b1118]/95 shadow-2xl shadow-black/20", className)}>{children}</div>}
+function Label({children}){return <label className="mb-1 block text-xs font-bold text-slate-500">{children}</label>}
+function Input(props){return <input {...props} className="h-11 w-full rounded-lg border border-slate-600/80 bg-[#080d12] px-4 text-sm font-semibold text-slate-200 outline-none focus:border-emerald-400"/>}
+function Select({children}){return <select className="h-11 w-full rounded-lg border border-slate-600/80 bg-[#080d12] px-4 text-sm font-bold text-slate-200 outline-none focus:border-emerald-400">{children}</select>}
+function Button({children, className, ...props}){return <button {...props} className={cx("rounded-lg bg-emerald-400 px-5 py-3 text-sm font-black text-black shadow-[0_0_28px_rgba(16,244,166,.35)] transition hover:scale-[1.01]", className)}>{children}</button>}
+
+function Auth({mode, setMode, setSignedIn}){return <div className="grid min-h-screen place-items-center px-6"><div className="grid w-full max-w-[980px] grid-cols-1 items-center gap-20 md:grid-cols-2"><motion.div initial={{opacity:0,y:20}} animate={{opacity:1,y:0}}><div className="mb-5 flex items-center gap-3"><Logo/><div><div className="text-lg font-black">AI Trading Engine</div><div className="text-[10px] uppercase tracking-[.28em] text-slate-500">SMC · Backtest · Journal</div></div></div><h1 className="mb-5 text-5xl font-black leading-[.95] tracking-tight text-white">Trade like a<br/><span className="text-cyan-300">quant desk.</span></h1><p className="max-w-md text-base font-semibold leading-7 text-slate-400">Smart-money signals across BTC, ETH, BNB, SOL — with explainable confidence, a real backtest, and a journal that learns from every trade.</p><div className="mt-8 grid grid-cols-3 gap-4">{[[9,"SMC checks per signal"],[4,"Live symbols tracked"],["1m–4h","Multi-timeframe"]].map(([a,b])=><Card key={b} className="p-5"><div className="text-2xl font-black text-emerald-300">{a}</div><div className="mt-2 text-xs font-semibold text-slate-500">{b}</div></Card>)}</div></motion.div><Card className="p-8"><div className="mb-6 text-xs font-black uppercase tracking-[.32em] text-slate-500"><Sparkles className="mr-2 inline text-emerald-400" size={14}/>{mode==='login'?'Welcome back':'Create account'}</div><h2 className="mb-6 text-3xl font-black text-white">{mode==='login'?'Sign in to your terminal.':'Start trading smarter'}</h2><div className="space-y-4">{mode==='signup'&&<><Label>Name</Label><Input defaultValue="Alex"/></>}<Label>Email</Label><Input defaultValue="you@firm.com"/><Label>Password</Label><Input type="password" defaultValue={mode==='login'?'password':'min 6 characters'}/><Button onClick={()=>setSignedIn(true)} className="w-full">{mode==='login'?'Sign in':'Create account'}</Button></div><div className="mt-6 border-t border-slate-700 pt-5 text-center text-sm font-bold text-slate-500">{mode==='login'?'New here? ':'Already have one? '}<button onClick={()=>setMode(mode==='login'?'signup':'login')} className="text-emerald-300">{mode==='login'?'Create an account':'Sign in'}</button></div></Card></div></div>}
+
+function Signals(){const [tf,setTf]=useState('5m');return <Page eyebrow="Live signals" title="Signal terminal" sub="Smart-money concepts on BTC, ETH, BNB, SOL — refreshed every 15s"><div className="absolute right-0 top-2 flex gap-3"><div className="flex rounded-lg border border-slate-700 bg-slate-900/70 p-1">{['1m','5m','15m','1h','4h'].map(x=><button onClick={()=>setTf(x)} className={cx('rounded px-3 py-2 text-xs font-bold',tf===x?'bg-emerald-400 text-black':'text-slate-400')}>{x}</button>)}</div><button className="flex items-center gap-2 rounded-lg border border-slate-700 bg-slate-900/70 px-4 text-sm font-bold text-slate-300"><RefreshCw size={14}/> Refresh</button></div><div className="grid grid-cols-4 gap-4">{symbols.map((s,i)=><Card className={cx('p-5',i===0&&'border-emerald-400 shadow-[0_0_24px_rgba(16,244,166,.15)]')}><div className="mb-4 flex justify-between"><span className="font-black">{s.pair.split('/')[0]}<span className="text-slate-500">/{s.pair.split('/')[1]}</span></span><span className="text-xs font-black text-emerald-300">{s.change}</span></div><div className="text-2xl font-black">{s.price}</div><div className="mt-4 flex items-center justify-between text-xs font-bold text-slate-500"><span>Confidence</span><span>{s.conf}%</span></div><div className="mt-2 h-2 rounded-full bg-slate-700"><div className="h-full rounded-full bg-cyan-300" style={{width:s.conf+'%'}}/></div><div className="mt-3 flex justify-between text-xs font-bold"><span>SMC {s.smc}</span><span className="text-slate-500">Range / Quiet</span></div></Card>)}</div><div className="mt-6 grid grid-cols-[1fr_430px] gap-6"><Card className="p-5"><div className="mb-3 flex justify-between"><div><div className="text-[11px] font-black uppercase tracking-[.32em] text-slate-500">Price action</div><div className="font-black">BTCUSDT · {tf}</div></div><div className="text-sm font-black"><span>76109.9</span> · <span className="text-rose-400">76109.9</span> · <span className="text-emerald-300">76109.9</span></div></div><Chart/><div className="absolute right-[460px] top-[220px] flex gap-2"><Button className="px-6">↗ Paper Buy</Button><Button className="bg-rose-400 text-white shadow-none">↘ Paper Sell</Button></div></Card><Card className="p-5"><div className="text-[11px] font-black uppercase tracking-[.32em] text-slate-500"><Zap className="mr-2 inline text-emerald-400" size={14}/>Signal explanation</div><h3 className="mt-2 text-xl font-black">Wait for clearer confirmation</h3><p className="mt-2 text-sm font-bold text-slate-500">HTF bias Bearish on 1h</p><div className="my-5 border-t border-slate-700"/>{['HTF bias bearish','Price in premium zone','Confidence ≥75%','Clear structure (not range)','Active session window'].map(x=><p className="mb-3 text-sm font-bold"><span className="mr-3 text-emerald-300">⊙</span>{x}</p>)}{['Sell-side liquidity sweep','Bearish break of structure','FVG retracement short','Trending / active regime'].map(x=><p className="mb-3 text-sm font-bold text-slate-600"><span className="mr-3">⊙</span>{x}</p>)}</Card></div><Card className="mt-6 p-5"><div className="text-[11px] font-black uppercase tracking-[.32em] text-slate-500">Open paper trades</div><div className="mt-2 text-xl font-black">0 active</div><p className="py-10 text-center text-sm font-semibold text-slate-600">No open trades. Click Paper Buy/Sell to simulate one.</p></Card></Page>}
+function Chart(){return <svg viewBox="0 0 760 320" className="h-[330px] w-full overflow-visible"><defs><pattern id="grid" width="60" height="40" patternUnits="userSpaceOnUse"><path d="M 60 0 L 0 0 0 40" fill="none" stroke="rgba(148,163,184,.12)" strokeWidth="1"/></pattern></defs><rect width="760" height="320" fill="url(#grid)"/><line x1="0" x2="760" y1="185" y2="185" stroke="rgb(16,244,166)" strokeDasharray="2 3" opacity=".7"/>{candles.map((c,i)=>{const x=i*6.2+4; const y=v=>300-(v-70)*1.18; const up=c.close>=c.open; return <g key={i}><line x1={x} x2={x} y1={y(c.high)} y2={y(c.low)} stroke={up?'#10f4a6':'#fb7185'} strokeWidth="1.5"/><rect x={x-2.2} y={Math.min(y(c.open),y(c.close))} width="4.4" height={Math.max(2,Math.abs(y(c.open)-y(c.close)))} fill={up?'#10f4a6':'#fb7185'}/></g>})}<text x="8" y="308" fill="white" fontSize="22" fontWeight="900">17</text></svg>}
+
+function Backtester(){return <Page eyebrow="Strategy lab" title="Backtester" sub="Run your strategy across historical candles with fees and slippage."><div className="grid grid-cols-[310px_1fr] gap-6"><Card className="p-5"><SectionTitle icon={<FlaskConical size={14}/>} text="Configure"/><FormStack labels={[['Symbol','select'],['Interval','select'],['Strategy','select'],['Candles (100–1000)','500'],['Starting balance ($)','1000'],['Fee %','0.04'],['Slippage %','0.02']]}/><Button className="mt-3 w-full">▷ Run backtest</Button></Card><Card className="grid h-36 place-items-center text-center text-slate-600"><FlaskConical size={34}/><p className="font-semibold">Configure a strategy on the left and run a backtest to see results.</p></Card></div><Card className="mt-6 p-5"><SectionTitle icon={<RefreshCw size={14}/>} text="Recent runs"/><table className="mt-4 w-full text-left text-xs font-black"><thead className="uppercase tracking-widest text-slate-500"><tr>{['Date','Symbol','Interval','Strategy','Trades','Net PnL','Win%','PF','DD%',''].map(h=><th className="border-b border-slate-700 py-4">{h}</th>)}</tr></thead><tbody><tr>{['2026-04-27 12:23:25','BTCUSDT','5m','bot','0','+0','0%','0','0%'].map(x=><td className="border-b border-slate-700 py-4">{x}</td>)}<td className="border-b border-slate-700"><button className="rounded-lg border border-slate-600 px-5 py-3">View</button></td></tr></tbody></table></Card></Page>}
+function Journal(){return <Page eyebrow="Reflection" title="Trade Journal" sub="Log every trade to find your edge — and your leaks."><Button className="absolute right-0 top-2"><Plus size={15} className="inline"/> New entry</Button><Card className="grid h-36 place-items-center text-center"><BookOpen className="text-slate-700" size={36}/><p className="font-semibold text-slate-600">No entries yet. Log your first trade to start spotting patterns.</p></Card></Page>}
+function Strategy(){return <Page eyebrow="Configuration" title="Strategy & Risk" sub="Tune signal filters, anti-overtrading limits, and trading mode."><Button className="absolute right-0 top-2"><Save size={15} className="inline"/> Save changes</Button><Card className="p-6"><SectionTitle icon={<Gauge size={14}/>} text="Trading mode"/><div className="grid grid-cols-2 gap-3"><Choice active title="Local Paper" desc="Fully simulated. Virtual balance, zero exchange calls."/><Choice title="Exchange Testnet" desc="Routes to Binance/Coinbase testnet. Requires API keys."/></div></Card><Card className="mt-6 p-6"><SectionTitle icon={<Settings size={14}/>} text="Watched symbols"/><div className="flex gap-3">{['BTCUSDT','ETHUSDT','BNBUSDT','SOLUSDT'].map(x=><button className="border border-emerald-400 px-5 py-3 text-sm font-black text-emerald-300">{x}</button>)}</div></Card><Card className="mt-6 p-6"><SectionTitle icon={<Bot size={14}/>} text="Signal filters"/><div className="grid grid-cols-2 gap-4"><Field label="Min confidence (%)" value="75"/><Field label="Min SMC score (0-9)" value="7"/><Field label="Risk/Reward ratio" value="2"/><Field label="Min volume multiplier" value="0.8"/></div><div className="mt-4 flex gap-8 text-sm font-bold"><span>☑ Avoid quiet markets</span><span>☑ Avoid sideways markets</span></div></Card><Card className="mt-6 p-6"><SectionTitle icon={<Lock size={14}/>} text="Risk management"/><div className="grid grid-cols-3 gap-4"><Field label="Starting balance ($)" value="10000"/><Field label="Risk per trade (%)" value="1"/><Field label="Max trades / day" value="5"/><Field label="Max daily loss (%)" value="3"/><Field label="Max consecutive losses" value="2"/></div></Card></Page>}
+function Page({eyebrow,title,sub,children}){return <div className="relative mx-auto min-h-screen max-w-[1320px] px-8 py-10"><div className="mb-6"><p className="text-[11px] font-black uppercase tracking-[.4em] text-slate-500">{eyebrow}</p><h1 className="text-4xl font-black tracking-tight text-white">{title}</h1><p className="text-sm font-semibold text-slate-500">{sub}</p></div>{children}</div>}
+function SectionTitle({icon,text}){return <div className="mb-4 flex items-center gap-2 text-[11px] font-black uppercase tracking-[.32em] text-slate-500"><span className="text-emerald-400">{icon}</span>{text}</div>}
+function FormStack({labels}){return <div className="space-y-3">{labels.map(([l,v])=><div><Label>{l}</Label>{v==='select'?<Select><option>{l==='Symbol'?'BTCUSDT':l==='Interval'?'5m':'Smart Money (Default)'}</option></Select>:<Input defaultValue={v}/>}</div>)}</div>}
+function Choice({active,title,desc}){return <div className={cx('rounded-xl border p-5',active?'border-emerald-400 bg-emerald-400/5':'border-slate-700')}><div className="font-black">{title}</div><div className="text-xs font-semibold text-slate-500">{desc}</div></div>}
+function Field({label,value}){return <div><Label>{label}</Label><Input defaultValue={value}/></div>}
+
+export default function App(){const [signedIn,setSignedIn]=useState(false); const [mode,setMode]=useState('login'); const [page,setPage]=useState('Signals'); const View = {Signals,Backtester,Journal,Strategy}[page]; return <Shell page={page} setPage={setPage} signedIn={signedIn} setSignedIn={setSignedIn}>{signedIn?<View/>:<Auth mode={mode} setMode={setMode} setSignedIn={setSignedIn}/>}</Shell>}
