@@ -18,7 +18,24 @@ from functools import wraps
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 app = Flask(__name__)
-CORS(app, supports_credentials=True)
+@app.before_request
+def handle_options():
+    if request.method == "OPTIONS":
+        response = app.response_class()
+        response.status_code = 200
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+        return response
+
+@app.after_request
+def add_cors_headers(response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+    return response
+
+CORS(app, resources={r"/api/*": {"origins": "*"}}, supports_credentials=True);
 
 # ------------ DEFAULT BOT CONFIG (per-user override stored in DB) ------------
 DEFAULT_CONFIG = {
@@ -116,6 +133,9 @@ def make_token(user_id, email):
 def auth_required(f):
     @wraps(f)
     def wrapper(*args, **kwargs):
+        if request.method == "OPTIONS":
+            return "", 200
+        
         auth = request.headers.get("Authorization", "")
         if not auth.startswith("Bearer "):
             return jsonify({"error": "Unauthorized"}), 401
@@ -145,7 +165,7 @@ def get_user_config():
     return cfg
 
 
-@app.route("/api/auth/register", methods=["POST"])
+@app.route("/api/auth/register", methods=["POST", "OPTIONS"])
 def register():
     data = request.get_json(force=True) or {}
     email = (data.get("email") or "").strip().lower()
@@ -171,7 +191,7 @@ def register():
     return jsonify({"token": token, "user": {"id": user_id, "email": email, "name": name}})
 
 
-@app.route("/api/auth/login", methods=["POST"])
+@app.route("/api/auth/login", methods=["POST", "OPTIONS"])
 def login():
     data = request.get_json(force=True) or {}
     email = (data.get("email") or "").strip().lower()

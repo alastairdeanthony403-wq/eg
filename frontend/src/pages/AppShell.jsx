@@ -1,6 +1,9 @@
 import { NavLink, Outlet, useNavigate } from "react-router-dom";
 import { useAuth } from "@/lib/auth";
+ HEAD
 import { LayoutDashboard, LineChart, Settings, BookOpen, FlaskConical, LogOut, TrendingUp, Activity } from "lucide-react";
+import { LayoutDashboard, Settings, BookOpen, FlaskConical, LogOut, TrendingUp, Activity } from "lucide-react";
+40deccd (Fix frontend backend connection and auth);
 
 export default function AppShell() {
   const { user, logout } = useAuth();
