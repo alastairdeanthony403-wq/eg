@@ -82,11 +82,11 @@ COINBASE_GRANULARITY_MAP = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 3
 
 
 # ---------------- DATABASE ----------------
-def get_conn():
-    conn = sqlite3.connect(DB_NAME)
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
+import os
+import psycopg2
 
+def get_conn():
+    return psycopg2.connect(os.environ["DATABASE_URL"])
 
 def init_db():
     conn = get_conn()
