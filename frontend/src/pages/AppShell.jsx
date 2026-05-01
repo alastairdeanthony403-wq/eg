@@ -1,3 +1,4 @@
+// force redeploy
 import { NavLink, Outlet, useNavigate } from "react-router-dom";
 import { useAuth } from "@/lib/auth";
 import { LayoutDashboard, Settings, BookOpen, FlaskConical, LogOut, TrendingUp, Activity } from "lucide-react";
