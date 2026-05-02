@@ -176,7 +176,7 @@ def register():
 
     conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT id FROM users WHERE email=?", (email,))
+    c.execute("SELECT id FROM users WHERE email=%s", (email,))
     if c.fetchone():
         conn.close()
         return jsonify({"error": "Email already registered"}), 400
@@ -198,7 +198,7 @@ def login():
     password = data.get("password") or ""
     conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT id, password_hash, name FROM users WHERE email=?", (email,))
+    c.execute("SELECT id, password_hash, name FROM users WHERE email=%s", (email,))
     row = c.fetchone()
     conn.close()
     if not row or not bcrypt.checkpw(password.encode(), row[1].encode()):
