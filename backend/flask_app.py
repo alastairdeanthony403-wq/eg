@@ -823,8 +823,8 @@ def run_simple_ma_strategy(candles, starting_balance=1000, fee_pct=0.04, slippag
     slippage_rate = float(slippage_pct) / 100
 
     for i in range(20, len(candles) - 10, 20):
-        entry_price = candles[i]["close"] * (1 + slippage_rate)
-        exit_price = candles[i + 10]["close"] * (1 - slippage_rate)
+        entry_price = float(candles[i][4]) * (1 + slippage_rate)
+        exit_price = float(candles[i + 10][4]) * (1 - slippage_rate)
 
         gross_pnl = exit_price - entry_price
         fees = (entry_price + exit_price) * fee_rate
@@ -835,8 +835,8 @@ def run_simple_ma_strategy(candles, starting_balance=1000, fee_pct=0.04, slippag
             "entry": entry_price,
             "exit": exit_price,
             "pnl": net_pnl,
-            "entry_time": candles[i]["time"],
-            "exit_time": candles[i + 10]["time"]
+            "entry_time": candles[i][0],
+            "exit_time": candles[i + 10][0]
         })
 
     return trades, balance
