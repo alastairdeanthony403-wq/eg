@@ -153,7 +153,7 @@ def auth_required(f):
 def get_user_config():
     conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT settings FROM users WHERE id=?", (g.user_id,))
+    c.execute("SELECT settings FROM users WHERE id=%s", (g.user_id,))
     row = c.fetchone()
     conn.close()
     cfg = dict(DEFAULT_CONFIG)
@@ -1052,8 +1052,7 @@ def close_paper_trade(tid):
 @auth_required
 def get_alerts():
     conn = get_conn(); c = conn.cursor()
-    c.execute("SELECT message, time FROM alerts WHERE user_id=? ORDER BY time DESC LIMIT 50",
-              (g.user_id,))
+   c.execute("SELECT message, time FROM alerts WHERE user_id=%s ORDER BY time DESC LIMIT 50", (g.user_id,))
     rows = c.fetchall(); conn.close()
     return jsonify([{"message": r[0], "time": r[1]} for r in rows])
 
@@ -1062,8 +1061,7 @@ def get_alerts():
 @auth_required
 def equity():
     conn = get_conn(); c = conn.cursor()
-    c.execute("""SELECT pnl, time FROM trades WHERE user_id=? AND status='CLOSED'
-                 ORDER BY time ASC""", (g.user_id,))
+    c.execute("SELECT pnl, time FROM trades WHERE user_id=%s AND status='CLOSED'", (g.user_id,))
     rows = c.fetchall(); conn.close()
     cfg = get_user_config()
     bal = cfg["starting_balance"]
@@ -1078,7 +1076,7 @@ def equity():
 @auth_required
 def stats():
     conn = get_conn(); c = conn.cursor()
-    c.execute("""SELECT pnl FROM trades WHERE user_id=? AND status='CLOSED'""", (g.user_id,))
+    c.execute("""SELECT pnl FROM trades WHERE user_id=%s AND status='CLOSED'""", (g.user_id,))
     pnls = [float(r[0] or 0) for r in c.fetchall()]
     conn.close()
     total = len(pnls); wins = [p for p in pnls if p > 0]; losses = [p for p in pnls if p < 0]
