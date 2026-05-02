@@ -898,19 +898,6 @@ def api_backtest():
         "trades": trades
     })
     
-
-            run_id = str(uuid.uuid4())
-            conn = get_conn()
-            c = conn.cursor()
-            c.execute("""INSERT INTO backtest_runs VALUES
-                (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""", (
-                run_id, g.user_id, symbol, interval, strategy,
-                data.get("start_date") or "", data.get("end_date") or "",
-                summary["total_trades"], summary["net_pnl"], summary["profit_factor"],
-                summary["max_drawdown"], summary["max_drawdown_percent"],
-                summary["win_rate"], json.dumps(summary), json.dumps(trades), now_str()))
-            conn.commit()
-            conn.close()
             return jsonify({"ok": True, "id": run_id, "summary": summary,
                             "signals": signals, "trades": trades})
         except Exception as e:
