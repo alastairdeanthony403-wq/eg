@@ -817,43 +817,27 @@ def get_klines(symbol="BTCUSDT", interval="5m", limit=500):
 
 def run_simple_ma_strategy(candles, starting_balance=1000, fee_pct=0.04, slippage_pct=0.02):
     trades = []
-    position = None
     balance = float(starting_balance)
 
     fee_rate = float(fee_pct) / 100
     slippage_rate = float(slippage_pct) / 100
 
-    for i in range(20, len(candles)):
-        close = candles[i]["close"]
+    for i in range(20, len(candles) - 10, 20):
+        entry_price = candles[i]["close"] * (1 + slippage_rate)
+        exit_price = candles[i + 10]["close"] * (1 - slippage_rate)
 
-        sma_short = sum(c["close"] for c in candles[i - 5:i]) / 5
-        sma_long = sum(c["close"] for c in candles[i - 20:i]) / 20
+        gross_pnl = exit_price - entry_price
+        fees = (entry_price + exit_price) * fee_rate
+        net_pnl = gross_pnl - fees
+        balance += net_pnl
 
-        if sma_short > sma_long and position is None:
-            entry_price = close * (1 + slippage_rate)
-            position = {
-                "entry": entry_price,
-                "time": candles[i]["time"]
-            }
-
-        elif sma_short < sma_long and position is not None:
-            exit_price = close * (1 - slippage_rate)
-
-            gross_pnl = exit_price - position["entry"]
-            fees = (position["entry"] + exit_price) * fee_rate
-            net_pnl = gross_pnl - fees
-
-            balance += net_pnl
-
-            trades.append({
-                "entry": position["entry"],
-                "exit": exit_price,
-                "pnl": net_pnl,
-                "entry_time": position["time"],
-                "exit_time": candles[i]["time"]
-            })
-
-            position = None
+        trades.append({
+            "entry": entry_price,
+            "exit": exit_price,
+            "pnl": net_pnl,
+            "entry_time": candles[i]["time"],
+            "exit_time": candles[i + 10]["time"]
+        })
 
     return trades, balance
 
