@@ -860,35 +860,39 @@ def api_backtest():
     symbol = str(data.get("symbol", "BTCUSDT")).upper()
     interval = str(data.get("interval", "5m"))
     limit = max(100, min(int(data.get("limit", 300)), 1000))
-    strategy = str(data.get("strategy", "bot")).lower()
     sb = float(data.get("starting_balance", 1000))
     fee = float(data.get("fee_percent", 0.04))
     slip = float(data.get("slippage_percent", 0.02))
-    cfg = get_user_config()
-    candles = fetch_binance_raw(symbol, interval, limit)
-    if not candles or len(candles) < 50:
-    return jsonify({
-    "total_trades": total_trades,
-    "net_pnl": net_pnl,
-    "win_rate": win_rate,
-    "profit_factor": profit_factor,
-    "trades": trades
-})
-    trades, ending_balance = run_simple_ma_strategy(
-    candles,
-    starting_balance=sb,
-    fee_pct=fee,
-    slippage_pct=slip
-)
-total_trades = len(trades)
-wins = [t for t in trades if t["pnl"] > 0]
-losses = [t for t in trades if t["pnl"] <= 0]
 
-net_pnl = ending_balance - sb
-win_rate = (len(wins) / total_trades * 100) if total_trades else 0
-gross_profit = sum(t["pnl"] for t in wins)
-gross_loss = abs(sum(t["pnl"] for t in losses))
-profit_factor = (gross_profit / gross_loss) if gross_loss else 0
+    candles = fetch_binance_raw(symbol, interval, limit)
+
+    if not candles or len(candles) < 50:
+        return jsonify({"error": "Not enough candle data"}), 400
+
+    trades, ending_balance = run_simple_ma_strategy(
+        candles,
+        starting_balance=sb,
+        fee_pct=fee,
+        slippage_pct=slip
+    )
+
+    total_trades = len(trades)
+    wins = [t for t in trades if t["pnl"] > 0]
+    losses = [t for t in trades if t["pnl"] <= 0]
+
+    net_pnl = ending_balance - sb
+    win_rate = (len(wins) / total_trades * 100) if total_trades else 0
+    gross_profit = sum(t["pnl"] for t in wins)
+    gross_loss = abs(sum(t["pnl"] for t in losses))
+    profit_factor = (gross_profit / gross_loss) if gross_loss else 0
+
+    return jsonify({
+        "total_trades": total_trades,
+        "net_pnl": net_pnl,
+        "win_rate": win_rate,
+        "profit_factor": profit_factor,
+        "trades": trades
+    })
     
 
             run_id = str(uuid.uuid4())
