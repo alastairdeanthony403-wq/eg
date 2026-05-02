@@ -809,14 +809,13 @@ def get_klines(symbol="BTCUSDT", interval="5m", limit=500):
         })
 
     return candles
-        return candles
 
 
 def run_simple_ma_strategy(candles, starting_balance=1000, fee_pct=0.04, slippage_pct=0.02):
     trades = []
     position = None
     balance = float(starting_balance)
-    
+
     fee_rate = float(fee_pct) / 100
     slippage_rate = float(slippage_pct) / 100
 
