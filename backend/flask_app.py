@@ -183,7 +183,7 @@ def register():
 
     user_id = str(uuid.uuid4())
     pw_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
-    c.execute("INSERT INTO users VALUES (?, ?, ?, ?, ?, ?)",
+    c.execute("INSERT INTO users VALUES (%s, %s, %s, %s, %s, %s)",
               (user_id, email, pw_hash, name, now_str(), json.dumps(DEFAULT_CONFIG)))
     conn.commit()
     conn.close()
