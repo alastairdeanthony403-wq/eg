@@ -653,6 +653,8 @@ def get_session_name(dt):
 
 
 def generate_backtest_signals(candles, symbol="BTCUSDT", interval="5m", strategy="bot", cfg=None):
+    print("SIGNALS:", signals[:5])
+    print("SIGNALS COUNT:", len(signals))
     df = raw_candles_to_df(candles)
     signals = []
     if df is None or len(df) < 50: return signals
@@ -674,6 +676,8 @@ def generate_backtest_signals(candles, symbol="BTCUSDT", interval="5m", strategy
 
 
 def run_backtest_engine(candles, signals, starting_balance=1000, fee_pct=0.04, slippage_pct=0.02):
+    print("TRADES:", trades[:5])
+    print("TRADES COUNT:", len(trades))
     balance = float(starting_balance); peak = balance; max_dd = 0.0
     trades = []; total_fees = 0.0; total_slip = 0.0
     cons_loss = 0; max_cons_loss = 0
