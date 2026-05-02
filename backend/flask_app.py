@@ -153,7 +153,7 @@ def auth_required(f):
 def get_user_config():
     conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT settings FROM users WHERE id=%s", (g.user_id,))
+    c.execute("SELECT settings FROM users WHERE id=?", (g.user_id,))
     row = c.fetchone()
     conn.close()
     cfg = dict(DEFAULT_CONFIG)
@@ -809,11 +809,14 @@ def get_klines(symbol="BTCUSDT", interval="5m", limit=500):
         })
 
     return candles
-    def run_simple_ma_strategy(candles, starting_balance=1000, fee_pct=0.04, slippage_pct=0.02):
+        return candles
+
+
+def run_simple_ma_strategy(candles, starting_balance=1000, fee_pct=0.04, slippage_pct=0.02):
     trades = []
     position = None
     balance = float(starting_balance)
-
+    
     fee_rate = float(fee_pct) / 100
     slippage_rate = float(slippage_pct) / 100
 
@@ -853,50 +856,42 @@ def get_klines(symbol="BTCUSDT", interval="5m", limit=500):
 
 @app.route("/api/backtest", methods=["POST", "OPTIONS"])
 @auth_required
-def api_backtest():
-    data = request.get_json(force=True) or {}
+    def api_backtest():
+        try:
+            data = request.get_json(force=True) or {}
+            symbol = str(data.get("symbol", "BTCUSDT")).upper()
+            interval = str(data.get("interval", "5m"))
+            limit = max(100, min(int(data.get("limit", 300)), 1000))
+            strategy = str(data.get("strategy", "bot")).lower()
+            sb = float(data.get("starting_balance", 1000))
+            fee = float(data.get("fee_percent", 0.04))
+            slip = float(data.get("slippage_percent", 0.02))
+            cfg = get_user_config()
+            candles = fetch_binance_raw(symbol, interval, limit)
+            if not candles or len(candles) < 50:
+                return jsonify({"error": "Not enough candle data"}), 400
+            signals = generate_backtest_signals(candles, symbol, interval, strategy, cfg)
+            summary, trades = run_backtest_engine(candles, signals, sb, fee, slip)
 
-    symbol = (data.get("symbol") or "BTCUSDT").upper()
-    interval = data.get("interval") or "5m"
-    candles_limit = int(data.get("limit") or 500)
-    starting_balance = float(data.get("starting_balance") or 1000)
-    fee_pct = float(data.get("fee_percent") or 0.04)
-    slippage_pct = float(data.get("slippage_percent") or 0.02)
+            run_id = str(uuid.uuid4())
+            conn = get_conn()
+            c = conn.cursor()
+            c.execute("""INSERT INTO backtest_runs VALUES
+                (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""", (
+                run_id, g.user_id, symbol, interval, strategy,
+                data.get("start_date") or "", data.get("end_date") or "",
+                summary["total_trades"], summary["net_pnl"], summary["profit_factor"],
+                summary["max_drawdown"], summary["max_drawdown_percent"],
+                summary["win_rate"], json.dumps(summary), json.dumps(trades), now_str()))
+            conn.commit()
+            conn.close()
+            return jsonify({"ok": True, "id": run_id, "summary": summary,
+                            "signals": signals, "trades": trades})
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            return jsonify({"error": str(e)}), 500
 
-    candles = get_klines(symbol=symbol, interval=interval, limit=candles_limit)
 
-    trades, ending_balance = run_simple_ma_strategy(
-        candles,
-        starting_balance=starting_balance,
-        fee_pct=fee_pct,
-        slippage_pct=slippage_pct
-    )
-
-    total_trades = len(trades)
-    wins = [t for t in trades if t["pnl"] > 0]
-    losses = [t for t in trades if t["pnl"] <= 0]
-
-    net_pnl = ending_balance - starting_balance
-    win_rate = (len(wins) / total_trades * 100) if total_trades else 0
-    gross_profit = sum(t["pnl"] for t in wins)
-    gross_loss = abs(sum(t["pnl"] for t in losses))
-    profit_factor = (gross_profit / gross_loss) if gross_loss else 0
-
-    return jsonify({
-        "symbol": symbol,
-        "interval": interval,
-        "starting_balance": starting_balance,
-        "ending_balance": ending_balance,
-        "net_pnl": net_pnl,
-        "total_trades": total_trades,
-        "wins": len(wins),
-        "losses": len(losses),
-        "win_rate": win_rate,
-        "profit_factor": profit_factor,
-        "trades": trades
-    })
-
- 
 @app.route("/api/backtest-runs", methods=["GET"])
 @auth_required
 def list_backtest_runs():
@@ -1048,7 +1043,7 @@ def open_paper_trade():
 @auth_required
 def close_paper_trade(tid):
     conn = get_conn(); c = conn.cursor()
-    c.execute("SELECT symbol, type, entry, size FROM trades WHERE id= AND user_id=%s AND status='OPEN'",
+    c.execute("SELECT symbol, type, entry, size FROM trades WHERE id=%s AND user_id=%s AND status='OPEN'",
               (tid, g.user_id))
     row = c.fetchone()
     if not row: conn.close(); return jsonify({"error": "Trade not found"}), 404
@@ -1067,7 +1062,7 @@ def close_paper_trade(tid):
 @auth_required
 def get_alerts():
     conn = get_conn(); c = conn.cursor()
-    c.execute("SELECT message, time FROM alerts WHERE user_id=%s ORDER BY time DESC LIMIT 50",
+    c.execute("SELECT message, time FROM alerts WHERE user_id=? ORDER BY time DESC LIMIT 50",
               (g.user_id,))
     rows = c.fetchall(); conn.close()
     return jsonify([{"message": r[0], "time": r[1]} for r in rows])
@@ -1077,7 +1072,7 @@ def get_alerts():
 @auth_required
 def equity():
     conn = get_conn(); c = conn.cursor()
-    c.execute("""SELECT pnl, time FROM trades WHERE user_id=%s AND status='CLOSED'
+    c.execute("""SELECT pnl, time FROM trades WHERE user_id=? AND status='CLOSED'
                  ORDER BY time ASC""", (g.user_id,))
     rows = c.fetchall(); conn.close()
     cfg = get_user_config()
@@ -1093,7 +1088,7 @@ def equity():
 @auth_required
 def stats():
     conn = get_conn(); c = conn.cursor()
-    c.execute("""SELECT pnl FROM trades WHERE user_id=%s AND status='CLOSED'""", (g.user_id,))
+    c.execute("""SELECT pnl FROM trades WHERE user_id=? AND status='CLOSED'""", (g.user_id,))
     pnls = [float(r[0] or 0) for r in c.fetchall()]
     conn.close()
     total = len(pnls); wins = [p for p in pnls if p > 0]; losses = [p for p in pnls if p < 0]
