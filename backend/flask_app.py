@@ -882,8 +882,6 @@ def api_backtest():
         "trades": trades
     })
     
-            return jsonify({"ok": True, "id": run_id, "summary": summary,
-                            "signals": signals, "trades": trades})
         except Exception as e:
             import traceback; traceback.print_exc()
             return jsonify({"error": str(e)}), 500
