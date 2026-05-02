@@ -881,11 +881,6 @@ def api_backtest():
         "profit_factor": profit_factor,
         "trades": trades
     })
-    
-        except Exception as e:
-            import traceback; traceback.print_exc()
-            return jsonify({"error": str(e)}), 500
-
 
 @app.route("/api/backtest-runs", methods=["GET"])
 @auth_required
