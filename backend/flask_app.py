@@ -153,7 +153,7 @@ def auth_required(f):
 def get_user_config():
     conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT settings FROM users WHERE id=?", (g.user_id,))
+    c.execute("SELECT settings FROM users WHERE id=%s", (g.user_id,))
     row = c.fetchone()
     conn.close()
     cfg = dict(DEFAULT_CONFIG)
@@ -212,7 +212,7 @@ def login():
 def me():
     conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT id, email, name, created_at FROM users WHERE id=?", (g.user_id,))
+    c.execute("SELECT id, email, name, created_at FROM users WHERE id=%s", (g.user_id,))
     row = c.fetchone()
     conn.close()
     if not row:
@@ -243,7 +243,7 @@ def _cache_set(cache, key, value):
 def add_alert(user_id, message):
     conn = get_conn()
     c = conn.cursor()
-    c.execute("INSERT INTO alerts VALUES (?, ?, ?, ?)",
+    c.execute("INSERT INTO alerts VALUES (%s, %s, %s, %s)",
               (str(uuid.uuid4()), user_id, message, now_str()))
     conn.commit()
     conn.close()
@@ -810,7 +810,7 @@ def api_backtest():
         conn = get_conn()
         c = conn.cursor()
         c.execute("""INSERT INTO backtest_runs VALUES
-            (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (
+            (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""", (
             run_id, g.user_id, symbol, interval, strategy,
             data.get("start_date") or "", data.get("end_date") or "",
             summary["total_trades"], summary["net_pnl"], summary["profit_factor"],
@@ -832,7 +832,7 @@ def list_backtest_runs():
     c = conn.cursor()
     c.execute("""SELECT id, symbol, interval, strategy, total_trades, net_pnl,
                  profit_factor, max_drawdown_percent, win_rate, created_at
-                 FROM backtest_runs WHERE user_id=? ORDER BY created_at DESC LIMIT 50""",
+                 FROM backtest_runs WHERE user_id=%s ORDER BY created_at DESC LIMIT 50""",
               (g.user_id,))
     rows = c.fetchall()
     conn.close()
@@ -848,7 +848,7 @@ def backtest_run_detail(run_id):
     conn = get_conn()
     c = conn.cursor()
     c.execute("""SELECT symbol, interval, strategy, summary_json, trades_json, created_at
-                 FROM backtest_runs WHERE id=? AND user_id=?""", (run_id, g.user_id))
+                 FROM backtest_runs WHERE id=%s AND user_id=%s""", (run_id, g.user_id))
     row = c.fetchone()
     conn.close()
     if not row:
@@ -883,7 +883,7 @@ def update_settings():
         cfg["blocked_crypto_hours_utc"] = data["blocked_crypto_hours_utc"]
     conn = get_conn()
     c = conn.cursor()
-    c.execute("UPDATE users SET settings=? WHERE id=?", (json.dumps(cfg), g.user_id))
+    c.execute("UPDATE users SET settings=%s WHERE id=%s", (json.dumps(cfg), g.user_id))
     conn.commit()
     conn.close()
     return jsonify(cfg)
@@ -896,7 +896,7 @@ def list_journal():
     conn = get_conn()
     c = conn.cursor()
     c.execute("""SELECT id, symbol, side, entry, exit, pnl, mood, tags, notes, created_at
-                 FROM journal WHERE user_id=? ORDER BY created_at DESC""", (g.user_id,))
+                 FROM journal WHERE user_id=%s ORDER BY created_at DESC""", (g.user_id,))
     rows = c.fetchall()
     conn.close()
     return jsonify([{"id": r[0], "symbol": r[1], "side": r[2], "entry": r[3],
@@ -912,7 +912,7 @@ def create_journal():
     eid = str(uuid.uuid4())
     conn = get_conn()
     c = conn.cursor()
-    c.execute("INSERT INTO journal VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (
+    c.execute("INSERT INTO journal VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)", (
         eid, g.user_id, (d.get("symbol") or "").upper(), d.get("side"),
         float(d.get("entry") or 0), float(d.get("exit") or 0),
         float(d.get("pnl") or 0), d.get("mood") or "neutral",
@@ -928,7 +928,7 @@ def create_journal():
 def delete_journal(eid):
     conn = get_conn()
     c = conn.cursor()
-    c.execute("DELETE FROM journal WHERE id=? AND user_id=?", (eid, g.user_id))
+    c.execute("DELETE FROM journal WHERE id=%s AND user_id=%s", (eid, g.user_id))
     conn.commit()
     conn.close()
     return jsonify({"ok": True})
@@ -941,7 +941,7 @@ def list_trades():
     conn = get_conn()
     c = conn.cursor()
     c.execute("""SELECT id, symbol, type, entry, sl, tp, size, exit, pnl, status, time
-                 FROM trades WHERE user_id=? ORDER BY time DESC LIMIT 200""", (g.user_id,))
+                 FROM trades WHERE user_id=%s ORDER BY time DESC LIMIT 200""", (g.user_id,))
     rows = c.fetchall()
     conn.close()
     return jsonify([{"id": r[0], "symbol": r[1], "side": r[2], "entry": r[3],
@@ -965,7 +965,7 @@ def open_paper_trade():
     size = risk_amt / stop_dist if stop_dist else 0
     tid = str(uuid.uuid4())
     conn = get_conn(); c = conn.cursor()
-    c.execute("INSERT INTO trades VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 'OPEN', ?)", (
+    c.execute("INSERT INTO trades VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NULL, NULL, 'OPEN', %s)", (
         tid, g.user_id, sym, side, price, levels["sl"], levels["tp"], size, now_str()))
     conn.commit(); conn.close()
     add_alert(g.user_id, f"OPEN {sym} {side} @ {round(price,2)}")
@@ -976,7 +976,7 @@ def open_paper_trade():
 @auth_required
 def close_paper_trade(tid):
     conn = get_conn(); c = conn.cursor()
-    c.execute("SELECT symbol, type, entry, size FROM trades WHERE id=? AND user_id=? AND status='OPEN'",
+    c.execute("SELECT symbol, type, entry, size FROM trades WHERE id= AND user_id=%s AND status='OPEN'",
               (tid, g.user_id))
     row = c.fetchone()
     if not row: conn.close(); return jsonify({"error": "Trade not found"}), 404
@@ -984,7 +984,7 @@ def close_paper_trade(tid):
     df = fetch_binance(sym, "1m", 5)
     price = float(df.iloc[-1]["close"]) if df is not None else float(entry)
     pnl = (price - entry) * size if side == "BUY" else (entry - price) * size
-    c.execute("UPDATE trades SET exit=?, pnl=?, status='CLOSED', time=? WHERE id=?",
+    c.execute("UPDATE trades SET exit=%s, pnl=%s, status='CLOSED', time=%s WHERE id=%s",
               (price, pnl, now_str(), tid))
     conn.commit(); conn.close()
     add_alert(g.user_id, f"CLOSED {sym} PnL {round(pnl,2)}")
@@ -995,7 +995,7 @@ def close_paper_trade(tid):
 @auth_required
 def get_alerts():
     conn = get_conn(); c = conn.cursor()
-    c.execute("SELECT message, time FROM alerts WHERE user_id=? ORDER BY time DESC LIMIT 50",
+    c.execute("SELECT message, time FROM alerts WHERE user_id=%s ORDER BY time DESC LIMIT 50",
               (g.user_id,))
     rows = c.fetchall(); conn.close()
     return jsonify([{"message": r[0], "time": r[1]} for r in rows])
@@ -1005,7 +1005,7 @@ def get_alerts():
 @auth_required
 def equity():
     conn = get_conn(); c = conn.cursor()
-    c.execute("""SELECT pnl, time FROM trades WHERE user_id=? AND status='CLOSED'
+    c.execute("""SELECT pnl, time FROM trades WHERE user_id=%s AND status='CLOSED'
                  ORDER BY time ASC""", (g.user_id,))
     rows = c.fetchall(); conn.close()
     cfg = get_user_config()
@@ -1021,7 +1021,7 @@ def equity():
 @auth_required
 def stats():
     conn = get_conn(); c = conn.cursor()
-    c.execute("""SELECT pnl FROM trades WHERE user_id=? AND status='CLOSED'""", (g.user_id,))
+    c.execute("""SELECT pnl FROM trades WHERE user_id=%s AND status='CLOSED'""", (g.user_id,))
     pnls = [float(r[0] or 0) for r in c.fetchall()]
     conn.close()
     total = len(pnls); wins = [p for p in pnls if p > 0]; losses = [p for p in pnls if p < 0]
