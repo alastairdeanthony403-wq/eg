@@ -786,45 +786,117 @@ def chart_candles():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e), "data": []}), 500
 
+def get_klines(symbol="BTCUSDT", interval="5m", limit=500):
+    url = "https://api.binance.com/api/v3/klines"
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "limit": limit
+    }
 
-@app.route("/api/backtest", methods=["POST"])
+    res = requests.get(url, params=params, timeout=10)
+    res.raise_for_status()
+
+    candles = []
+    for k in res.json():
+        candles.append({
+            "time": k[0],
+            "open": float(k[1]),
+            "high": float(k[2]),
+            "low": float(k[3]),
+            "close": float(k[4]),
+            "volume": float(k[5])
+        })
+
+    return candles
+    def run_simple_ma_strategy(candles, starting_balance=1000, fee_pct=0.04, slippage_pct=0.02):
+    trades = []
+    position = None
+    balance = float(starting_balance)
+
+    fee_rate = float(fee_pct) / 100
+    slippage_rate = float(slippage_pct) / 100
+
+    for i in range(20, len(candles)):
+        close = candles[i]["close"]
+
+        sma_short = sum(c["close"] for c in candles[i - 5:i]) / 5
+        sma_long = sum(c["close"] for c in candles[i - 20:i]) / 20
+
+        if sma_short > sma_long and position is None:
+            entry_price = close * (1 + slippage_rate)
+            position = {
+                "entry": entry_price,
+                "time": candles[i]["time"]
+            }
+
+        elif sma_short < sma_long and position is not None:
+            exit_price = close * (1 - slippage_rate)
+
+            gross_pnl = exit_price - position["entry"]
+            fees = (position["entry"] + exit_price) * fee_rate
+            net_pnl = gross_pnl - fees
+
+            balance += net_pnl
+
+            trades.append({
+                "entry": position["entry"],
+                "exit": exit_price,
+                "pnl": net_pnl,
+                "entry_time": position["time"],
+                "exit_time": candles[i]["time"]
+            })
+
+            position = None
+
+    return trades, balance
+
+@app.route("/api/backtest", methods=["POST", "OPTIONS"])
 @auth_required
 def api_backtest():
-    try:
-        data = request.get_json(force=True) or {}
-        symbol = str(data.get("symbol", "BTCUSDT")).upper()
-        interval = str(data.get("interval", "5m"))
-        limit = max(100, min(int(data.get("limit", 300)), 1000))
-        strategy = str(data.get("strategy", "bot")).lower()
-        sb = float(data.get("starting_balance", 1000))
-        fee = float(data.get("fee_percent", 0.04))
-        slip = float(data.get("slippage_percent", 0.02))
-        cfg = get_user_config()
-        candles = fetch_binance_raw(symbol, interval, limit)
-        if not candles or len(candles) < 50:
-            return jsonify({"error": "Not enough candle data"}), 400
-        signals = generate_backtest_signals(candles, symbol, interval, strategy, cfg)
-        summary, trades = run_backtest_engine(candles, signals, sb, fee, slip)
+    data = request.get_json(force=True) or {}
 
-        run_id = str(uuid.uuid4())
-        conn = get_conn()
-        c = conn.cursor()
-        c.execute("""INSERT INTO backtest_runs VALUES
-            (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""", (
-            run_id, g.user_id, symbol, interval, strategy,
-            data.get("start_date") or "", data.get("end_date") or "",
-            summary["total_trades"], summary["net_pnl"], summary["profit_factor"],
-            summary["max_drawdown"], summary["max_drawdown_percent"],
-            summary["win_rate"], json.dumps(summary), json.dumps(trades), now_str()))
-        conn.commit()
-        conn.close()
-        return jsonify({"ok": True, "id": run_id, "summary": summary,
-                        "signals": signals, "trades": trades})
-    except Exception as e:
-        import traceback; traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
+    symbol = (data.get("symbol") or "BTCUSDT").upper()
+    interval = data.get("interval") or "5m"
+    candles_limit = int(data.get("limit") or 500)
+    starting_balance = float(data.get("starting_balance") or 1000)
+    fee_pct = float(data.get("fee_percent") or 0.04)
+    slippage_pct = float(data.get("slippage_percent") or 0.02)
 
+    candles = get_klines(symbol=symbol, interval=interval, limit=candles_limit)
 
+    trades, ending_balance = run_simple_ma_strategy(
+        candles,
+        starting_balance=starting_balance,
+        fee_pct=fee_pct,
+        slippage_pct=slippage_pct
+    )
+
+    total_trades = len(trades)
+    wins = [t for t in trades if t["pnl"] > 0]
+    losses = [t for t in trades if t["pnl"] <= 0]
+
+    net_pnl = ending_balance - starting_balance
+    win_rate = (len(wins) / total_trades * 100) if total_trades else 0
+    gross_profit = sum(t["pnl"] for t in wins)
+    gross_loss = abs(sum(t["pnl"] for t in losses))
+    profit_factor = (gross_profit / gross_loss) if gross_loss else 0
+
+    return jsonify({
+        "symbol": symbol,
+        "interval": interval,
+        "starting_balance": starting_balance,
+        "ending_balance": ending_balance,
+        "net_pnl": net_pnl,
+        "total_trades": total_trades,
+        "wins": len(wins),
+        "losses": len(losses),
+        "win_rate": win_rate,
+        "profit_factor": profit_factor,
+        "trades": trades
+    })
+
+ 
 @app.route("/api/backtest-runs", methods=["GET"])
 @auth_required
 def list_backtest_runs():
