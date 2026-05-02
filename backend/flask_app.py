@@ -1052,7 +1052,7 @@ def close_paper_trade(tid):
 @auth_required
 def get_alerts():
     conn = get_conn(); c = conn.cursor()
-   c.execute("SELECT message, time FROM alerts WHERE user_id=%s ORDER BY time DESC LIMIT 50", (g.user_id,))
+    c.execute("SELECT message, time FROM alerts WHERE user_id=%s ORDER BY time DESC LIMIT 50", (g.user_id,))
     rows = c.fetchall(); conn.close()
     return jsonify([{"message": r[0], "time": r[1]} for r in rows])
 
