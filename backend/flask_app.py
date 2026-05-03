@@ -990,6 +990,88 @@ def delete_journal(eid):
     conn.close()
     return jsonify({"ok": True})
 
+def simulate_market_execution(side, price, quantity, fee_percent=0.04, slippage_percent=0.02):
+    fee_rate = fee_percent / 100
+    slippage_rate = slippage_percent / 100
+
+    if side.upper() == "BUY":
+        fill_price = price * (1 + slippage_rate)
+    else:
+        fill_price = price * (1 - slippage_rate)
+
+    notional = fill_price * quantity
+    fee = notional * fee_rate
+
+    return {
+        "fill_price": fill_price,
+        "quantity": quantity,
+        "notional": notional,
+        "fee": fee,
+        "slippage_percent": slippage_percent,
+        "fee_percent": fee_percent
+    }
+
+def get_latest_price(symbol="BTCUSDT"):
+    candles = fetch_binance_raw(symbol, "1m", 2)
+    if not candles:
+        raise Exception("Could not fetch latest price")
+
+    latest = candles[-1]
+    return float(latest[4])
+
+    @app.route("/api/paper/start", methods=["POST", "OPTIONS"])
+@auth_required
+def paper_start():
+    data = request.get_json(force=True) or {}
+
+    symbol = (data.get("symbol") or "BTCUSDT").upper()
+    side = (data.get("side") or "BUY").upper()
+    quantity = float(data.get("quantity") or 0.001)
+
+    latest_price = get_latest_price(symbol)
+
+    execution = simulate_market_execution(
+        side=side,
+        price=latest_price,
+        quantity=quantity,
+        fee_percent=float(data.get("fee_percent") or 0.04),
+        slippage_percent=float(data.get("slippage_percent") or 0.02)
+    )
+
+    trade_id = str(uuid.uuid4())
+
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO trades
+            (id, user_id, symbol, type, entry, sl, tp, size, exit, pnl, status, time)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    """,
+    (
+        trade_id,
+        g.user_id,
+        symbol,
+        side,
+        execution["fill_price"],
+        0,
+        0,
+        quantity,
+        0,
+        0,
+        "OPEN",
+        now_str()
+    )
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "ok": True,
+        "trade_id": trade_id,
+        "symbol": symbol,
+        "side": side,
+        "latest_price": latest_price,
+        "execution": execution
+    })
 
 # Paper trades
 @app.route("/api/trades", methods=["GET"])
