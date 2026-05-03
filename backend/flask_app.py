@@ -1019,6 +1019,8 @@ def get_latest_price(symbol="BTCUSDT"):
     latest = candles[-1]
     return float(latest[4])
 
+AUTO_PAPER_TRADING = {}
+
 @app.route("/api/paper/start", methods=["POST", "OPTIONS"])
 @auth_required
 def paper_start():
@@ -1093,12 +1095,45 @@ def update_open_trades():
     conn.commit()
     conn.close()
 
+def run_auto_trading(user_id):
+    symbol = "BTCUSDT"
+
+    # get recent candles
+    candles = fetch_binance_raw(symbol, "5m", 100)
+
+    if not candles:
+        return
+
+    # VERY SIMPLE STRATEGY (placeholder)
+    last = candles[-1]
+    prev = candles[-2]
+
+    last_close = float(last[4])
+    prev_close = float(prev[4])
+
+    # basic momentum
+    if last_close > prev_close:
+        side = "BUY"
+    else:
+        side = "SELL"
+
+    # 🔥 place paper trade
+    place_paper_trade(user_id, symbol, side, 0.001)
 
 @app.route("/api/paper/update", methods=["POST", "OPTIONS"])
 @auth_required
 def paper_update():
+    # update existing trades
     update_open_trades()
-    return jsonify({"ok": True, "message": "Open paper trades updated"})
+
+    # 🔥 AUTO TRADING LOGIC
+    if AUTO_PAPER_TRADING.get(g.user_id, False):
+        try:
+            run_auto_trading(g.user_id)
+        except Exception as e:
+            print("AUTO TRADING ERROR:", e)
+
+    return jsonify({"ok": True, "message": "Updated + auto trading executed"})
 
     c.execute("SELECT id, symbol, type, entry, size FROM trades WHERE status='OPEN'")
     rows = c.fetchall()
@@ -1129,6 +1164,27 @@ def paper_update():
 
     conn.commit()
     conn.close()
+
+    @app.route("/api/paper/status", methods=["GET", "OPTIONS"])
+@auth_required
+def paper_status():
+    return jsonify({
+        "enabled": AUTO_PAPER_TRADING.get(g.user_id, False)
+    })
+
+
+@app.route("/api/paper/start-auto", methods=["POST", "OPTIONS"])
+@auth_required
+def paper_start_auto():
+    AUTO_PAPER_TRADING[g.user_id] = True
+    return jsonify({"ok": True, "enabled": True})
+
+
+@app.route("/api/paper/stop-auto", methods=["POST", "OPTIONS"])
+@auth_required
+def paper_stop_auto():
+    AUTO_PAPER_TRADING[g.user_id] = False
+    return jsonify({"ok": True, "enabled": False})
 
 # Paper trades
 @app.route("/api/trades", methods=["GET"])

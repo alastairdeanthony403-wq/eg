@@ -18,6 +18,7 @@ export default function Backtester() {
   const [result, setResult] = useState(null);
   const [history, setHistory] = useState([]);
   const [err, setErr] = useState("");
+  const [auto, setAuto] = useState(false);
 
   const loadHistory = useCallback(async () => {
     try { const { data } = await api.get("/backtest-runs"); setHistory(data || []); }
@@ -87,6 +88,26 @@ setResult({
 } finally {
   setRunning(false);
 }
+};
+
+const toggleAuto = async () => {
+  const token = localStorage.getItem("ate_token");
+
+  const url = auto
+    ? "/paper/stop-auto"
+    : "/paper/start-auto";
+
+  const res = await fetch(`https://eg-on9b.onrender.com/api${url}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${token}`
+    }
+  });
+
+  const data = await res.json();
+  setAuto(data.enabled);
+};
 
   const sm = result?.summary;
 
@@ -133,6 +154,9 @@ setResult({
           ))}
           <button className="btn btn-primary w-full" onClick={run} disabled={running} data-testid="bt-run-btn">
             <Play size={14} /> {running ? "Running..." : "Run backtest"}
+          </button>
+          <button className="btn w-full mt-2" onClick={toggleAuto}>
+          {auto ? "Stop Auto Trading" : "Start Auto Trading"}
           </button>
           {err && <div className="text-sm text-[var(--sell)]" data-testid="bt-error">{err}</div>}
         </div>
