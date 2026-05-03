@@ -1068,8 +1068,8 @@ def paper_start():
         "latest_price": latest_price,
         "execution": execution
     })
-
-   def update_open_trades():
+    
+def update_open_trades():
     conn = get_conn()
     c = conn.cursor()
 
