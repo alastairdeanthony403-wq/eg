@@ -29,12 +29,15 @@ export default function Backtester() {
     setRunning(true); setErr(""); setResult(null);
     try {
       const { data } = await api.post("/backtest", params);
-      setResult(data); loadHistory();
-    } catch (e) {
-      console.error("backtest failed:", e);
-      setErr(e?.response?.data?.error || "Backtest failed");
-    } finally { setRunning(false); }
-  };
+      setResult({
+  summary: {
+    total_trades: data.total_trades,
+    net_pnl: data.net_pnl,
+    win_rate: data.win_rate,
+    profit_factor: data.profit_factor
+  },
+  trades: data.trades
+});
 
   const loadRun = async (id) => {
     try {
