@@ -1019,7 +1019,7 @@ def get_latest_price(symbol="BTCUSDT"):
     latest = candles[-1]
     return float(latest[4])
 
-    @app.route("/api/paper/start", methods=["POST", "OPTIONS"])
+@app.route("/api/paper/start", methods=["POST", "OPTIONS"])
 @auth_required
 def paper_start():
     data = request.get_json(force=True) or {}
