@@ -1070,13 +1070,35 @@ def paper_start():
     })
 
     def update_open_trades():
-    @app.route("/api/paper/update", methods=["POST", "OPTIONS"])
-    @auth_required
-    def paper_update():
-        update_open_trades()
-        return jsonify({"ok": True, "message": "Open paper trades updated"})    
-        conn = get_conn()
-        c = conn.cursor()
+    conn = get_conn()
+    c = conn.cursor()
+
+    c.execute("SELECT id, symbol, type, entry, size FROM trades WHERE status='OPEN'")
+    rows = c.fetchall()
+
+    for trade_id, symbol, side, entry, size in rows:
+        current_price = get_latest_price(symbol)
+
+        if side == "BUY":
+            pnl = (current_price - entry) * size
+        else:
+            pnl = (entry - current_price) * size
+
+        c.execute("""
+            UPDATE trades
+            SET pnl=%s
+            WHERE id=%s
+        """, (pnl, trade_id))
+
+    conn.commit()
+    conn.close()
+
+
+@app.route("/api/paper/update", methods=["POST", "OPTIONS"])
+@auth_required
+def paper_update():
+    update_open_trades()
+    return jsonify({"ok": True, "message": "Open paper trades updated"})
 
     c.execute("SELECT id, symbol, type, entry, size FROM trades WHERE status='OPEN'")
     rows = c.fetchall()
