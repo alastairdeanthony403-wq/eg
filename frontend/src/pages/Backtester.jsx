@@ -31,13 +31,21 @@ export default function Backtester() {
       const { data } = await api.post("/backtest", params);
       setResult({
   summary: {
-    total_trades: data.total_trades,
-    net_pnl: data.net_pnl,
-    win_rate: data.win_rate,
-    profit_factor: data.profit_factor
+    total_trades: data.total_trades || 0,
+    net_pnl: data.net_pnl || 0,
+    win_rate: data.win_rate || 0,
+    profit_factor: data.profit_factor || 0,
+    max_drawdown_percent: data.max_drawdown_percent || 0,
+    wins: data.wins || 0,
+    losses: data.losses || 0,
+    best_trade: data.best_trade || 0,
+    worst_trade: data.worst_trade || 0,
+    fees_paid: data.fees_paid || 0,
+    slippage_paid: data.slippage_paid || 0
   },
-  trades: data.trades
+  trades: data.trades || []
 });
+  
 
   const loadRun = async (id) => {
     try {
