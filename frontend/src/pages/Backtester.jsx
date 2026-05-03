@@ -29,6 +29,7 @@ export default function Backtester() {
     setRunning(true); setErr(""); setResult(null);
     try {
       const { data } = await api.post("/backtest", params);
+      console.log("BACKTEST RESPONSE:", data);
       setResult({
   summary: {
     total_trades: data.total_trades || 0,
