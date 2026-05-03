@@ -1043,27 +1043,23 @@ def paper_start():
     conn = get_conn()
     c = conn.cursor()
     c.execute("""
-        INSERT INTO trades
-            (id, user_id, symbol, type, entry, sl, tp, size, exit, pnl, status, time)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-    """,
-    (
-        trade_id,
-        g.user_id,
-        symbol,
-        side,
-        execution["fill_price"],
-        0,
-        0,
-        quantity,
-        0,
-        0,
-        "OPEN",
-        now_str()
-    )
-    conn.commit()
-    conn.close()
-
+    INSERT INTO trades
+    (id, user_id, symbol, type, entry, sl, tp, size, exit, pnl, status, time)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+""", (
+    trade_id,
+    g.user_id,
+    symbol,
+    side,
+    execution["fill_price"],
+    0,
+    0,
+    quantity,
+    0,
+    0,
+    "OPEN",
+    now_str()
+))
     return jsonify({
         "ok": True,
         "trade_id": trade_id,
