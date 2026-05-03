@@ -30,21 +30,26 @@ export default function Backtester() {
     try {
       const { data } = await api.post("/backtest", params);
       console.log("BACKTEST RESPONSE:", data);
-      setResult({
+    const trades = data.trades || [];
+const wins = trades.filter((t) => t.pnl > 0);
+const losses = trades.filter((t) => t.pnl <= 0);
+const pnls = trades.map((t) => t.pnl);
+
+setResult({
   summary: {
-    total_trades: data.total_trades || 0,
+    total_trades: data.total_trades || trades.length,
     net_pnl: data.net_pnl || 0,
     win_rate: data.win_rate || 0,
     profit_factor: data.profit_factor || 0,
     max_drawdown_percent: data.max_drawdown_percent || 0,
-    wins: data.wins || 0,
-    losses: data.losses || 0,
-    best_trade: data.best_trade || 0,
-    worst_trade: data.worst_trade || 0,
+    wins: wins.length,
+    losses: losses.length,
+    best_trade: pnls.length ? Math.max(...pnls) : 0,
+    worst_trade: pnls.length ? Math.min(...pnls) : 0,
     fees_paid: data.fees_paid || 0,
     slippage_paid: data.slippage_paid || 0
   },
-  trades: data.trades || []
+  trades
 });
   
 
