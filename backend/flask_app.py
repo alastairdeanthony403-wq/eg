@@ -1069,25 +1069,25 @@ def paper_start():
         "execution": execution
     })
 
-    def update_open_trades():
-        conn = get_conn()
-        c = conn.cursor()
+   def update_open_trades():
+    conn = get_conn()
+    c = conn.cursor()
 
-        c.execute("SELECT id, symbol, type, entry, size FROM trades WHERE status='OPEN'")
-        rows = c.fetchall()
+    c.execute("SELECT id, symbol, type, entry, size FROM trades WHERE status='OPEN'")
+    rows = c.fetchall()
 
-        for trade_id, symbol, side, entry, size in rows:
-            current_price = get_latest_price(symbol)
+    for trade_id, symbol, side, entry, size in rows:
+        current_price = get_latest_price(symbol)
 
-            if side == "BUY":
-                pnl = (current_price - entry) * size
-            else:
-                pnl = (entry - current_price) * size
+        if side == "BUY":
+            pnl = (current_price - entry) * size
+        else:
+            pnl = (entry - current_price) * size
 
-            c.execute("""
-                UPDATE trades
-                SET pnl=%s
-                WHERE id=%s
+        c.execute("""
+            UPDATE trades
+            SET pnl=%s
+            WHERE id=%s
         """, (pnl, trade_id))
 
     conn.commit()
