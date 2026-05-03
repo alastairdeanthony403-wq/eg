@@ -160,7 +160,7 @@ const toggleAuto = async () => {
           </button>
           {err && <div className="text-sm text-[var(--sell)]" data-testid="bt-error">{err}</div>}
         </div>
-
+|
         {/* result */}
         <div className="lg:col-span-3 space-y-4">
           {!sm && (
