@@ -152,12 +152,15 @@ const toggleAuto = async () => {
                 onChange={(e) => setParams({ ...params, [f.k]: parseFloat(e.target.value) || 0 })} data-testid={`bt-${f.k}`}/>
             </div>
           ))}
-          <button className="btn btn-primary w-full" onClick={run} disabled={running} data-testid="bt-run-btn">
-            <Play size={14} /> {running ? "Running..." : "Run backtest"}
+          <button className="btn btn-primary w-full" onClick={run}>
+             <Play size={14} /> {running ? "Running..." : "Run backtest"}
           </button>
+
+          {/* 🔥 ALWAYS VISIBLE BUTTON */}
           <button className="btn w-full mt-2" onClick={toggleAuto}>
-          {auto ? "Stop Auto Trading" : "Start Auto Trading"}
+            {auto ? "Stop Auto Trading" : "Start Auto Trading"}
           </button>
+          
           {err && <div className="text-sm text-[var(--sell)]" data-testid="bt-error">{err}</div>}
         </div>
 |
