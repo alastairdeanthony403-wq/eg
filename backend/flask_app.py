@@ -1069,6 +1069,45 @@ def paper_start():
         "execution": execution
     })
 
+    def update_open_trades():
+    @app.route("/api/paper/update", methods=["POST", "OPTIONS"])
+    @auth_required
+    def paper_update():
+        update_open_trades()
+        return jsonify({"ok": True, "message": "Open paper trades updated"})    
+        conn = get_conn()
+        c = conn.cursor()
+
+    c.execute("SELECT id, symbol, type, entry, size FROM trades WHERE status='OPEN'")
+    rows = c.fetchall()
+
+    for t in rows:
+        trade_id, symbol, side, entry, size = t
+
+        current_price = get_latest_price(symbol)
+
+        if side == "BUY":
+            pnl = (current_price - entry) * size
+        else:
+            pnl = (entry - current_price) * size
+
+        # simple close rule (demo): close if profit or loss exceeds threshold
+        if abs(pnl) > 5:
+            c.execute("""
+                UPDATE trades
+                SET exit=%s, pnl=%s, status=%s
+                WHERE id=%s
+            """, (current_price, pnl, "CLOSED", trade_id))
+        else:
+            c.execute("""
+                UPDATE trades
+                SET pnl=%s
+                WHERE id=%s
+            """, (pnl, trade_id))
+
+    conn.commit()
+    conn.close()
+
 # Paper trades
 @app.route("/api/trades", methods=["GET"])
 @auth_required
