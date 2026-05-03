@@ -119,6 +119,9 @@ setResult({
           )}
           {sm && (
             <>
+            <pre className="panel p-4 text-xs overflow-auto max-h-96">
+  {JSON.stringify(result, null, 2)}
+</pre>
               <div className="grid grid-cols-2 md:grid-cols-4 gap-4" data-testid="bt-summary">
                 {[
                   { l: "Net PnL", v: `${sm.net_pnl >= 0 ? "+" : ""}$${sm.net_pnl}`, k: sm.net_pnl >= 0 ? "num-pos" : "num-neg" },
