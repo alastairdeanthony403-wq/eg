@@ -54,11 +54,39 @@ setResult({
   
 
   const loadRun = async (id) => {
-    try {
-      const { data } = await api.get(`/backtest-runs/${id}`);
-      setResult({ summary: data.summary, trades: data.trades, signals: [] });
-    } catch (err) { console.error("load run failed:", err); }
+   try {
+  const { data } = await api.post("/backtest", params);
+
+  const trades = data.trades || [];
+  const wins = trades.filter((t) => Number(t.pnl) > 0);
+  const losses = trades.filter((t) => Number(t.pnl) <= 0);
+  const pnls = trades.map((t) => Number(t.pnl || 0));
+
+  const fixedResult = {
+    summary: {
+      total_trades: Number(data.total_trades || trades.length || 0),
+      net_pnl: Number(data.net_pnl || 0),
+      win_rate: Number(data.win_rate || 0),
+      profit_factor: Number(data.profit_factor || 0),
+      max_drawdown_percent: Number(data.max_drawdown_percent || 0),
+      wins: wins.length,
+      losses: losses.length,
+      best_trade: pnls.length ? Math.max(...pnls) : 0,
+      worst_trade: pnls.length ? Math.min(...pnls) : 0,
+      fees_paid: Number(data.fees_paid || 0),
+      slippage_paid: Number(data.slippage_paid || 0)
+    },
+    trades
   };
+
+  console.log("BACKTEST FIXED RESULT:", fixedResult);
+  setResult(fixedResult);
+} catch (e) {
+  console.error("backtest failed:", e);
+  setErr(e?.response?.data?.error || "Backtest failed");
+} finally {
+  setRunning(false);
+}
 
   const sm = result?.summary;
 
