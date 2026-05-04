@@ -981,38 +981,38 @@ def api_backtest():
 
 
 
-if strategy == "unified_bot":
-     trades, ending_balance = run_unified_bot_strategy(
-        candles,
-        starting_balance=sb,
-        fee_pct=fee,
-        slippage_pct=slip
-    )
-else:
-    trades, ending_balance = run_simple_ma_strategy(
-        candles,
-        starting_balance=sb,
-        fee_pct=fee,
-        slippage_pct=slip
-    )
+    if strategy == "unified_bot":
+        trades, ending_balance = run_unified_bot_strategy(
+            candles,
+            starting_balance=sb,
+            fee_pct=fee,
+            slippage_pct=slip
+        )
+    else:
+        trades, ending_balance = run_simple_ma_strategy(
+            candles,
+            starting_balance=sb,
+            fee_pct=fee,
+            slippage_pct=slip
+        )
 
-total_trades = len(trades)
-wins = [t for t in trades if t["pnl"] > 0]
-losses = [t for t in trades if t["pnl"] <= 0]
+    total_trades = len(trades)
+    wins = [t for t in trades if t["pnl"] > 0]
+    losses = [t for t in trades if t["pnl"] <= 0]
 
-net_pnl = ending_balance - sb
-win_rate = (len(wins) / total_trades * 100) if total_trades else 0
-gross_profit = sum(t["pnl"] for t in wins)
-gross_loss = abs(sum(t["pnl"] for t in losses))
-profit_factor = (gross_profit / gross_loss) if gross_loss else 0
+    net_pnl = ending_balance - sb
+    win_rate = (len(wins) / total_trades * 100) if total_trades else 0
+    gross_profit = sum(t["pnl"] for t in wins)
+    gross_loss = abs(sum(t["pnl"] for t in losses))
+    profit_factor = (gross_profit / gross_loss) if gross_loss else 0
 
-return jsonify({
-    "total_trades": total_trades,
-    "net_pnl": net_pnl,
-    "win_rate": win_rate,
-    "profit_factor": profit_factor,
-    "trades": trades
-})
+    return jsonify({
+        "total_trades": total_trades,
+        "net_pnl": net_pnl,
+        "win_rate": win_rate,
+        "profit_factor": profit_factor,
+        "trades": trades
+    })
 
 @app.route("/api/backtest-runs", methods=["GET"])
 @auth_required
