@@ -887,17 +887,15 @@ def run_unified_bot_strategy(candles, starting_balance=1000, fee_pct=0.04, slipp
     closes = [float(c[4]) for c in candles]
     highs = [float(c[2]) for c in candles]
     lows = [float(c[3]) for c in candles]
-    
-    # 🔥 HIGHER TIMEFRAME BIAS (simple version)
+
     htf_ema = ema(closes, 100)
 
-def get_bias(price):
-    if not htf_ema:
-        return None
-        
-    return "bullish" if price > htf_ema else "bearish"
+    def get_bias(price):
+        if not htf_ema:
+            return None
+        return "bullish" if price > htf_ema else "bearish"
 
-    for i in range(50, len(candles)):
+    for i in range(100, len(candles)):
         recent_closes = closes[:i]
         recent_highs = highs[i - 20:i]
         recent_lows = lows[i - 20:i]
@@ -908,8 +906,6 @@ def get_bias(price):
         current_rsi = rsi(recent_closes, 14)
 
         close = closes[i]
-        previous_close = closes[i - 1]
-
         recent_high = max(recent_highs)
         recent_low = min(recent_lows)
 
@@ -919,56 +915,55 @@ def get_bias(price):
         bullish_bias = fast_ema and slow_ema and trend_ema and fast_ema > slow_ema and close > trend_ema
         bearish_bias = fast_ema and slow_ema and trend_ema and fast_ema < slow_ema and close < trend_ema
 
-bias = get_bias(close)
+        bias = get_bias(close)
 
-buy_signal = (
-    bias == "bullish" and
-    bullish_bias and
-    current_rsi and current_rsi < 70 and
-    bullish_break
-)
+        buy_signal = (
+            bias == "bullish"
+            and bullish_bias
+            and current_rsi
+            and current_rsi < 70
+            and bullish_break
+        )
 
-sell_signal = (
-    bias == "bearish" and
-    bearish_bias and
-    current_rsi and current_rsi > 30 and
-    bearish_break
-)
+        sell_signal = (
+            bias == "bearish"
+            and bearish_bias
+            and current_rsi
+            and current_rsi > 30
+            and bearish_break
+        )
 
-    
-    if position is None and buy_signal:
-        entry_price = close * (1 + slippage_rate)
-        position = {
-            "side": "BUY",
-            "entry": entry_price,
-            "time": candles[i][0],
-            "reason": "EMA bullish trend + RSI filter + bullish structure break"
+        if position is None and buy_signal:
+            entry_price = close * (1 + slippage_rate)
+            position = {
+                "side": "BUY",
+                "entry": entry_price,
+                "time": candles[i][0],
+                "reason": "HTF bullish bias + EMA trend + RSI filter + bullish structure break"
             }
 
-elif position is None and sell_signal:
-    entry_price = close * (1 - slippage_rate)
-    position = {
-        "side": "SELL",
-        "entry": entry_price,
-        "time": candles[i][0],
-        "reason": "EMA bearish trend + RSI filter + bearish structure break"
-    }
+        elif position is None and sell_signal:
+            entry_price = close * (1 - slippage_rate)
+            position = {
+                "side": "SELL",
+                "entry": entry_price,
+                "time": candles[i][0],
+                "reason": "HTF bearish bias + EMA trend + RSI filter + bearish structure break"
+            }
 
-elif position is not None:
-    exit_signal = False
+        elif position is not None:
+            if position["side"] == "BUY":
+                exit_signal = close < slow_ema or current_rsi > 75
+                gross_pnl = close - position["entry"]
+            else:
+                exit_signal = close > slow_ema or current_rsi < 25
+                gross_pnl = position["entry"] - close
 
-     if position["side"] == "BUY":
-        exit_signal = close < slow_ema or current_rsi > 75
-        gross_pnl = close - position["entry"]
-    else:
-        exit_signal = close > slow_ema or current_rsi < 25
-        gross_pnl = position["entry"] - close
-
-     if exit_signal:
-        exit_price = close
-        fees = (position["entry"] + exit_price) * fee_rate
-        net_pnl = gross_pnl - fees
-        balance += net_pnl
+            if exit_signal:
+                exit_price = close
+                fees = (position["entry"] + exit_price) * fee_rate
+                net_pnl = gross_pnl - fees
+                balance += net_pnl
 
                 trades.append({
                     "side": position["side"],
@@ -983,7 +978,6 @@ elif position is not None:
                 position = None
 
     return trades, balance
-
 
 
 @app.route("/api/backtest", methods=["POST", "OPTIONS"])
