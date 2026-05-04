@@ -961,6 +961,8 @@ def run_unified_bot_strategy(candles, starting_balance=1000, fee_pct=0.04, slipp
 
     return trades, balance
 
+
+
 @app.route("/api/backtest", methods=["POST", "OPTIONS"])
 @auth_required
 def api_backtest():
