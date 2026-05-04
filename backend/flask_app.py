@@ -1010,9 +1010,12 @@ if exit_signal:
         "reason": position["reason"]
         })
 
-    position = None
+        position = None
 
-        return trades, balance
+        
+        
+        
+    return trades, balance
 
 
 @app.route("/api/backtest", methods=["POST", "OPTIONS"])
