@@ -919,7 +919,7 @@ def get_bias(price):
         bullish_bias = fast_ema and slow_ema and trend_ema and fast_ema > slow_ema and close > trend_ema
         bearish_bias = fast_ema and slow_ema and trend_ema and fast_ema < slow_ema and close < trend_ema
 
-        bias = get_bias(close)
+bias = get_bias(close)
 
 buy_signal = (
     bias == "bullish" and
@@ -935,26 +935,27 @@ sell_signal = (
     bearish_break
 )
 
-        if position is None and buy_signal:
-            entry_price = close * (1 + slippage_rate)
-            position = {
-                "side": "BUY",
-                "entry": entry_price,
-                "time": candles[i][0],
-                "reason": "EMA bullish trend + RSI filter + bullish structure break"
-            }
+    
+if position is None and buy_signal:
+    entry_price = close * (1 + slippage_rate)
+        position = {
+        "side": "BUY",
+        "entry": entry_price,
+        "time": candles[i][0],
+        "reason": "EMA bullish trend + RSI filter + bullish structure break"
+        }
 
-        elif position is None and sell_signal:
-            entry_price = close * (1 - slippage_rate)
-            position = {
-                "side": "SELL",
-                "entry": entry_price,
-                "time": candles[i][0],
-                "reason": "EMA bearish trend + RSI filter + bearish structure break"
-            }
+ elif position is None and sell_signal:
+    entry_price = close * (1 - slippage_rate)
+    position = {
+        "side": "SELL",
+        "entry": entry_price,
+        "time": candles[i][0],
+        "reason": "EMA bearish trend + RSI filter + bearish structure break"
+    }
 
-        elif position is not None:
-            exit_signal = False
+elif position is not None:
+    exit_signal = False
 
             if position["side"] == "BUY":
                 exit_signal = close < slow_ema or current_rsi > 75
