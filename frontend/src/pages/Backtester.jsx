@@ -6,7 +6,7 @@ const SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT"];
 const INTERVALS = ["1m", "5m", "15m", "1h", "4h"];
 const STRATS = [
   { v: "bot", n: "Smart Money (default)" },
-  { v: "smart_money", n: "Smart Money" },
+  { v: "unified_bot", n: "Unified Bot Logic" },
   { v: "ema_rsi", n: "EMA Crossover" },
   { v: "basic", n: "Basic Momentum" },
 ];
@@ -32,6 +32,7 @@ export default function Backtester() {
   setResult(null);
 
   try {
+    console.log("SELECTED STRATEGY:", params.strategy);
     const { data } = await api.post("/backtest", params);
     console.log("BACKTEST RESPONSE:", data);
 
