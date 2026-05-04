@@ -936,14 +936,14 @@ sell_signal = (
 )
 
     
-if position is None and buy_signal:
-    entry_price = close * (1 + slippage_rate)
-    position = {
-        "side": "BUY",
-        "entry": entry_price,
-        "time": candles[i][0],
-        "reason": "EMA bullish trend + RSI filter + bullish structure break"
-        }
+    if position is None and buy_signal:
+        entry_price = close * (1 + slippage_rate)
+        position = {
+            "side": "BUY",
+            "entry": entry_price,
+            "time": candles[i][0],
+            "reason": "EMA bullish trend + RSI filter + bullish structure break"
+            }
 
 elif position is None and sell_signal:
     entry_price = close * (1 - slippage_rate)
@@ -957,18 +957,18 @@ elif position is None and sell_signal:
 elif position is not None:
     exit_signal = False
 
-            if position["side"] == "BUY":
-                exit_signal = close < slow_ema or current_rsi > 75
-                gross_pnl = close - position["entry"]
-            else:
-                exit_signal = close > slow_ema or current_rsi < 25
-                gross_pnl = position["entry"] - close
+     if position["side"] == "BUY":
+        exit_signal = close < slow_ema or current_rsi > 75
+        gross_pnl = close - position["entry"]
+    else:
+        exit_signal = close > slow_ema or current_rsi < 25
+        gross_pnl = position["entry"] - close
 
-            if exit_signal:
-                exit_price = close
-                fees = (position["entry"] + exit_price) * fee_rate
-                net_pnl = gross_pnl - fees
-                balance += net_pnl
+     if exit_signal:
+        exit_price = close
+        fees = (position["entry"] + exit_price) * fee_rate
+        net_pnl = gross_pnl - fees
+        balance += net_pnl
 
                 trades.append({
                     "side": position["side"],
