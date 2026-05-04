@@ -954,8 +954,8 @@ def run_unified_bot_strategy(candles, starting_balance=1000, fee_pct=0.04, slipp
 
         elif position is not None:
             if position["side"] == "BUY":
-                stop_loss = position["entry"] * 0.995
-                take_profit = position["entry"] * 1.01
+                stop_loss = position["entry"] * 0.9975   # -0.25%
+                take_profit = position["entry"] * 1.0075 # +0.75%   
 
                 exit_signal = (
                     close <= stop_loss or
@@ -966,8 +966,8 @@ def run_unified_bot_strategy(candles, starting_balance=1000, fee_pct=0.04, slipp
                 gross_pnl = close - position["entry"]
 
             else:
-                stop_loss = position["entry"] * 1.005
-                take_profit = position["entry"] * 0.99
+                stop_loss = position["entry"] * 1.0025   # -0.25%
+                take_profit = position["entry"] * 0.9925 # +0.75%
 
                 exit_signal = (
                     close >= stop_loss or
