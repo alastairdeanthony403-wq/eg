@@ -27,67 +27,41 @@ export default function Backtester() {
   useEffect(() => { loadHistory(); }, [loadHistory]);
 
   const run = async () => {
-    setRunning(true); setErr(""); setResult(null);
-    try {
-      const { data } = await api.post("/backtest", params);
-      console.log("BACKTEST RESPONSE:", data);
+  setRunning(true);
+  setErr("");
+  setResult(null);
+
+  try {
+    const { data } = await api.post("/backtest", params);
+    console.log("BACKTEST RESPONSE:", data);
+
     const trades = data.trades || [];
-const wins = trades.filter((t) => t.pnl > 0);
-const losses = trades.filter((t) => t.pnl <= 0);
-const pnls = trades.map((t) => t.pnl);
+    const wins = trades.filter((t) => t.pnl > 0);
+    const losses = trades.filter((t) => t.pnl <= 0);
+    const pnls = trades.map((t) => t.pnl);
 
-setResult({
-  summary: {
-    total_trades: data.total_trades || trades.length,
-    net_pnl: data.net_pnl || 0,
-    win_rate: data.win_rate || 0,
-    profit_factor: data.profit_factor || 0,
-    max_drawdown_percent: data.max_drawdown_percent || 0,
-    wins: wins.length,
-    losses: losses.length,
-    best_trade: pnls.length ? Math.max(...pnls) : 0,
-    worst_trade: pnls.length ? Math.min(...pnls) : 0,
-    fees_paid: data.fees_paid || 0,
-    slippage_paid: data.slippage_paid || 0
-  },
-  trades
-});
-  
-
-  const loadRun = async (id) => {
-   try {
-  const { data } = await api.post("/backtest", params);
-
-  const trades = data.trades || [];
-  const wins = trades.filter((t) => Number(t.pnl) > 0);
-  const losses = trades.filter((t) => Number(t.pnl) <= 0);
-  const pnls = trades.map((t) => Number(t.pnl || 0));
-
-  const fixedResult = {
-    summary: {
-      total_trades: Number(data.total_trades || trades.length || 0),
-      net_pnl: Number(data.net_pnl || 0),
-      win_rate: Number(data.win_rate || 0),
-      profit_factor: Number(data.profit_factor || 0),
-      max_drawdown_percent: Number(data.max_drawdown_percent || 0),
-      wins: wins.length,
-      losses: losses.length,
-      best_trade: pnls.length ? Math.max(...pnls) : 0,
-      worst_trade: pnls.length ? Math.min(...pnls) : 0,
-      fees_paid: Number(data.fees_paid || 0),
-      slippage_paid: Number(data.slippage_paid || 0)
-    },
-    trades
-  };
-
-  console.log("BACKTEST FIXED RESULT:", fixedResult);
-  setResult(fixedResult);
-} catch (e) {
-  console.error("backtest failed:", e);
-  setErr(e?.response?.data?.error || "Backtest failed");
-} finally {
-  setRunning(false);
-}
+    setResult({
+      summary: {
+        total_trades: data.total_trades || trades.length,
+        net_pnl: data.net_pnl || 0,
+        win_rate: data.win_rate || 0,
+        profit_factor: data.profit_factor || 0,
+        max_drawdown_percent: data.max_drawdown_percent || 0,
+        wins: wins.length,
+        losses: losses.length,
+        best_trade: pnls.length ? Math.max(...pnls) : 0,
+        worst_trade: pnls.length ? Math.min(...pnls) : 0,
+        fees_paid: data.fees_paid || 0,
+        slippage_paid: data.slippage_paid || 0
+      },
+      trades
+    });
+  } catch (e) {
+    console.error("backtest failed:", e);
+    setErr(e?.response?.data?.error || "Backtest failed");
+  } finally {
+    setRunning(false);
+  }
 };
 
 const toggleAuto = async () => {
@@ -160,7 +134,7 @@ const toggleAuto = async () => {
           <button className="btn w-full mt-2" onClick={toggleAuto}>
             {auto ? "Stop Auto Trading" : "Start Auto Trading"}
           </button>
-          
+
           {err && <div className="text-sm text-[var(--sell)]" data-testid="bt-error">{err}</div>}
         </div>
 |
