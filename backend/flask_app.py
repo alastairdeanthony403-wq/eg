@@ -1008,9 +1008,9 @@ if exit_signal:
         "entry_time": position["time"],
         "exit_time": candles[i][0],
         "reason": position["reason"]
-        })
+    })
 
-        position = None
+    position = None
 
         
         
