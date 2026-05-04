@@ -945,7 +945,7 @@ if position is None and buy_signal:
         "reason": "EMA bullish trend + RSI filter + bullish structure break"
         }
 
- elif position is None and sell_signal:
+elif position is None and sell_signal:
     entry_price = close * (1 - slippage_rate)
     position = {
         "side": "SELL",
