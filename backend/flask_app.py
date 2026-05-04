@@ -938,7 +938,7 @@ sell_signal = (
     
 if position is None and buy_signal:
     entry_price = close * (1 + slippage_rate)
-        position = {
+    position = {
         "side": "BUY",
         "entry": entry_price,
         "time": candles[i][0],
