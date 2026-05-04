@@ -977,8 +977,10 @@ def api_backtest():
     if not candles or len(candles) < 50:
         return jsonify({"error": "Not enough candle data"}), 400
 
-    if strategy == "unified_bot":
-    trades, ending_balance = run_unified_bot_strategy(
+
+
+if strategy == "unified_bot":
+     trades, ending_balance = run_unified_bot_strategy(
         candles,
         starting_balance=sb,
         fee_pct=fee,
