@@ -952,29 +952,30 @@ def run_unified_bot_strategy(candles, starting_balance=1000, fee_pct=0.04, slipp
                 "reason": "HTF bearish bias + EMA trend + RSI filter + bearish structure break"
             }
 
-        elif position is not None:
-            if position["side"] == "BUY":
-                exit_signal = close < slow_ema or current_rsi > 75
-                gross_pnl = close - position["entry"]
-            else:
-                exit_signal = close > slow_ema or current_rsi < 25
-                gross_pnl = position["entry"] - close
+elif position is not None:
+    if position["side"] == "BUY":
+        stop_loss = position["entry"] * 0.995   # -0.5%
+        take_profit = position["entry"] * 1.01  # +1%
 
-            if exit_signal:
-                exit_price = close
-                fees = (position["entry"] + exit_price) * fee_rate
-                net_pnl = gross_pnl - fees
-                balance += net_pnl
+         exit_signal = (
+            close <= stop_loss or
+            close >= take_profit or
+            close < slow_ema
+        )
 
-                trades.append({
-                    "side": position["side"],
-                    "entry": position["entry"],
-                    "exit": exit_price,
-                    "pnl": net_pnl,
-                    "entry_time": position["time"],
-                    "exit_time": candles[i][0],
-                    "reason": position["reason"]
-                })
+        gross_pnl = close - position["entry"]
+
+else:
+    stop_loss = position["entry"] * 1.005
+    take_profit = position["entry"] * 0.99
+
+    exit_signal = (
+        close >= stop_loss or
+        close <= take_profit or
+        close > slow_ema
+    )
+
+    gross_pnl = position["entry"] - close
 
                 position = None
 
