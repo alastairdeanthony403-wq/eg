@@ -969,6 +969,7 @@ def api_backtest():
     data = request.get_json(force=True) or {}
     symbol = str(data.get("symbol", "BTCUSDT")).upper()
     interval = str(data.get("interval", "5m"))
+    strategy = str(data.get("strategy", "bot")).lower()
     limit = max(100, min(int(data.get("limit", 300)), 1000))
     sb = float(data.get("starting_balance", 1000))
     fee = float(data.get("fee_percent", 0.04))
