@@ -996,21 +996,21 @@ if exit_signal:
         else:
             exit_price = close
 
-                fees = (position["entry"] + exit_price) * fee_rate
-                net_pnl = gross_pnl - fees
-                balance += net_pnl
+    fees = (position["entry"] + exit_price) * fee_rate
+    net_pnl = gross_pnl - fees
+    balance += net_pnl
 
-                trades.append({
-                    "side": position["side"],
-                    "entry": position["entry"],
-                    "exit": exit_price,
-                    "pnl": net_pnl,
-                    "entry_time": position["time"],
-                    "exit_time": candles[i][0],
-                    "reason": position["reason"]
-                })
+    trades.append({
+        "side": position["side"],
+        "entry": position["entry"],
+        "exit": exit_price,
+        "pnl": net_pnl,
+        "entry_time": position["time"],
+        "exit_time": candles[i][0],
+        "reason": position["reason"]
+        })
 
-                position = None
+        position = None
 
     return trades, balance
 
