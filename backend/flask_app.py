@@ -887,6 +887,15 @@ def run_unified_bot_strategy(candles, starting_balance=1000, fee_pct=0.04, slipp
     closes = [float(c[4]) for c in candles]
     highs = [float(c[2]) for c in candles]
     lows = [float(c[3]) for c in candles]
+    
+    # 🔥 HIGHER TIMEFRAME BIAS (simple version)
+    htf_ema = ema(closes, 100)
+
+def get_bias(price):
+    if not htf_ema:
+        return None
+        
+    return "bullish" if price > htf_ema else "bearish"
 
     for i in range(50, len(candles)):
         recent_closes = closes[:i]
@@ -910,8 +919,21 @@ def run_unified_bot_strategy(candles, starting_balance=1000, fee_pct=0.04, slipp
         bullish_bias = fast_ema and slow_ema and trend_ema and fast_ema > slow_ema and close > trend_ema
         bearish_bias = fast_ema and slow_ema and trend_ema and fast_ema < slow_ema and close < trend_ema
 
-        buy_signal = bullish_bias and current_rsi and current_rsi < 70 and bullish_break
-        sell_signal = bearish_bias and current_rsi and current_rsi > 30 and bearish_break
+        bias = get_bias(close)
+
+buy_signal = (
+    bias == "bullish" and
+    bullish_bias and
+    current_rsi and current_rsi < 70 and
+    bullish_break
+)
+
+sell_signal = (
+    bias == "bearish" and
+    bearish_bias and
+    current_rsi and current_rsi > 30 and
+    bearish_break
+)
 
         if position is None and buy_signal:
             entry_price = close * (1 + slippage_rate)
