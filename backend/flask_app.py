@@ -1253,7 +1253,9 @@ def run_auto_trading(user_id):
 @app.route("/api/paper/update", methods=["POST", "OPTIONS"])
 @auth_required
 def paper_update():
-    # update existing trades
+    conn = get_conn()
+    c = conn.cursor()
+
     update_open_trades()
 
     # 🔥 AUTO TRADING LOGIC
@@ -1295,7 +1297,10 @@ def paper_update():
     conn.commit()
     conn.close()
 
-    @app.route("/api/paper/status", methods=["GET", "OPTIONS"])
+
+
+
+@app.route("/api/paper/status", methods=["GET", "OPTIONS"])
 @auth_required
 def paper_status():
     return jsonify({
