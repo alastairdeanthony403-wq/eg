@@ -841,6 +841,126 @@ def run_simple_ma_strategy(candles, starting_balance=1000, fee_pct=0.04, slippag
 
     return trades, balance
 
+def ema(values, period):
+    if len(values) < period:
+        return None
+
+    multiplier = 2 / (period + 1)
+    ema_value = sum(values[:period]) / period
+
+    for price in values[period:]:
+        ema_value = (price - ema_value) * multiplier + ema_value
+
+    return ema_value
+
+
+def rsi(values, period=14):
+    if len(values) <= period:
+        return None
+
+    gains = []
+    losses = []
+
+    for i in range(1, len(values)):
+        change = values[i] - values[i - 1]
+        gains.append(max(change, 0))
+        losses.append(abs(min(change, 0)))
+
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period
+
+    if avg_loss == 0:
+        return 100
+
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def run_unified_bot_strategy(candles, starting_balance=1000, fee_pct=0.04, slippage_pct=0.02):
+    trades = []
+    balance = float(starting_balance)
+    position = None
+
+    fee_rate = fee_pct / 100
+    slippage_rate = slippage_pct / 100
+
+    closes = [float(c[4]) for c in candles]
+    highs = [float(c[2]) for c in candles]
+    lows = [float(c[3]) for c in candles]
+
+    for i in range(50, len(candles)):
+        recent_closes = closes[:i]
+        recent_highs = highs[i - 20:i]
+        recent_lows = lows[i - 20:i]
+
+        fast_ema = ema(recent_closes, 9)
+        slow_ema = ema(recent_closes, 21)
+        trend_ema = ema(recent_closes, 50)
+        current_rsi = rsi(recent_closes, 14)
+
+        close = closes[i]
+        previous_close = closes[i - 1]
+
+        recent_high = max(recent_highs)
+        recent_low = min(recent_lows)
+
+        bullish_break = close > recent_high
+        bearish_break = close < recent_low
+
+        bullish_bias = fast_ema and slow_ema and trend_ema and fast_ema > slow_ema and close > trend_ema
+        bearish_bias = fast_ema and slow_ema and trend_ema and fast_ema < slow_ema and close < trend_ema
+
+        buy_signal = bullish_bias and current_rsi and current_rsi < 70 and bullish_break
+        sell_signal = bearish_bias and current_rsi and current_rsi > 30 and bearish_break
+
+        if position is None and buy_signal:
+            entry_price = close * (1 + slippage_rate)
+            position = {
+                "side": "BUY",
+                "entry": entry_price,
+                "time": candles[i][0],
+                "reason": "EMA bullish trend + RSI filter + bullish structure break"
+            }
+
+        elif position is None and sell_signal:
+            entry_price = close * (1 - slippage_rate)
+            position = {
+                "side": "SELL",
+                "entry": entry_price,
+                "time": candles[i][0],
+                "reason": "EMA bearish trend + RSI filter + bearish structure break"
+            }
+
+        elif position is not None:
+            exit_signal = False
+
+            if position["side"] == "BUY":
+                exit_signal = close < slow_ema or current_rsi > 75
+                gross_pnl = close - position["entry"]
+            else:
+                exit_signal = close > slow_ema or current_rsi < 25
+                gross_pnl = position["entry"] - close
+
+            if exit_signal:
+                exit_price = close
+                fees = (position["entry"] + exit_price) * fee_rate
+                net_pnl = gross_pnl - fees
+                balance += net_pnl
+
+                trades.append({
+                    "side": position["side"],
+                    "entry": position["entry"],
+                    "exit": exit_price,
+                    "pnl": net_pnl,
+                    "entry_time": position["time"],
+                    "exit_time": candles[i][0],
+                    "reason": position["reason"]
+                })
+
+                position = None
+
+    return trades, balance
+
 @app.route("/api/backtest", methods=["POST", "OPTIONS"])
 @auth_required
 def api_backtest():
@@ -857,6 +977,14 @@ def api_backtest():
     if not candles or len(candles) < 50:
         return jsonify({"error": "Not enough candle data"}), 400
 
+    if strategy == "unified_bot":
+    trades, ending_balance = run_unified_bot_strategy(
+        candles,
+        starting_balance=sb,
+        fee_pct=fee,
+        slippage_pct=slip
+    )
+else:
     trades, ending_balance = run_simple_ma_strategy(
         candles,
         starting_balance=sb,
