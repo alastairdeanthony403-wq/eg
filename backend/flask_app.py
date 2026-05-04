@@ -957,25 +957,42 @@ def run_unified_bot_strategy(candles, starting_balance=1000, fee_pct=0.04, slipp
                 stop_loss = position["entry"] * 0.995
                 take_profit = position["entry"] * 1.01
 
-    exit_signal = (
-        close <= stop_loss or
-        close >= take_profit or
-        close < slow_ema
-    )
+                exit_signal = (
+                    close <= stop_loss or
+                    close >= take_profit or
+                    close < slow_ema
+                )
 
-    gross_pnl = close - position["entry"]
+                gross_pnl = close - position["entry"]
 
-else:
-    stop_loss = position["entry"] * 1.005
-    take_profit = position["entry"] * 0.99
+            else:
+                stop_loss = position["entry"] * 1.005
+                take_profit = position["entry"] * 0.99
 
-    exit_signal = (
-        close >= stop_loss or
-        close <= take_profit or
-        close > slow_ema
-    )
+                exit_signal = (
+                    close >= stop_loss or
+                    close <= take_profit or
+                    close > slow_ema
+                )
 
-    gross_pnl = position["entry"] - close
+                gross_pnl = position["entry"] - close
+
+            if exit_signal:
+                exit_price = close
+                fees = (position["entry"] + exit_price) * fee_rate
+                net_pnl = gross_pnl - fees
+                balance += net_pnl
+
+                trades.append({
+                    "side": position["side"],
+                    "entry": position["entry"],
+                    "exit": exit_price,
+                    "pnl": net_pnl,
+                    "entry_time": position["time"],
+                    "exit_time": candles[i][0],
+                    "reason": position["reason"]
+                })
+
                 position = None
 
     return trades, balance
