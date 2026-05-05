@@ -929,7 +929,7 @@ def run_unified_bot_strategy(candles, starting_balance=1000, fee_pct=0.04, slipp
         )
 
         
-            sell_signal = False
+        sell_signal = False
 
         if position is None and buy_signal:
             entry_price = close * (1 + slippage_rate)
