@@ -906,10 +906,12 @@ def run_unified_bot_strategy(candles, starting_balance=1000, fee_pct=0.04, slipp
         current_rsi = rsi(recent_closes, 14)
 
         close = closes[i]
+        high = highs[i]
+        low = lows[i]
+
         recent_high = max(recent_highs)
         recent_low = min(recent_lows)
 
-        # 🔥 STRONG BREAK FILTER (avoid weak fake breakouts)
         bullish_break = close > recent_high and (close - recent_high) / recent_high > 0.001
         bearish_break = close < recent_low and (recent_low - close) / recent_low > 0.001
 
@@ -954,68 +956,62 @@ def run_unified_bot_strategy(candles, starting_balance=1000, fee_pct=0.04, slipp
 
         elif position is not None:
             if position["side"] == "BUY":
-                stop_loss = position["entry"] * 0.9975   # -0.25%
-                take_profit = position["entry"] * 1.0075 # +0.75%   
+                stop_loss = position["entry"] * 0.9975
+                take_profit = position["entry"] * 1.0075
 
                 exit_signal = (
-                    close <= stop_loss or
-                    close >= take_profit or
+                    low <= stop_loss or
+                    high >= take_profit or
                     close < slow_ema
                 )
 
                 gross_pnl = close - position["entry"]
 
             else:
-                stop_loss = position["entry"] * 1.0025   # -0.25%
-                take_profit = position["entry"] * 0.9925 # +0.75%
+                stop_loss = position["entry"] * 1.0025
+                take_profit = position["entry"] * 0.9925
 
                 exit_signal = (
-                    close >= stop_loss or
-                    close <= take_profit or
+                    high >= stop_loss or
+                    low <= take_profit or
                     close > slow_ema
                 )
 
                 gross_pnl = position["entry"] - close
 
-if exit_signal:
-    low = float(candles[i][3])
-    high = float(candles[i][2])
+            if exit_signal:
+                if position["side"] == "BUY":
+                    if low <= stop_loss:
+                        exit_price = stop_loss
+                    elif high >= take_profit:
+                        exit_price = take_profit
+                    else:
+                        exit_price = close
+                else:
+                    if high >= stop_loss:
+                        exit_price = stop_loss
+                    elif low <= take_profit:
+                        exit_price = take_profit
+                    else:
+                        exit_price = close
 
-    if position["side"] == "BUY":
-        if low <= stop_loss:
-            exit_price = stop_loss
-        elif high >= take_profit:
-            exit_price = take_profit
-        else:
-            exit_price = close
-    else:
-        if high >= stop_loss:
-            exit_price = stop_loss
-        elif low <= take_profit:
-            exit_price = take_profit
-        else:
-            exit_price = close
+                fees = (position["entry"] + exit_price) * fee_rate
+                net_pnl = gross_pnl - fees
+                balance += net_pnl
 
-    fees = (position["entry"] + exit_price) * fee_rate
-    net_pnl = gross_pnl - fees
-    balance += net_pnl
+                trades.append({
+                    "side": position["side"],
+                    "entry": position["entry"],
+                    "exit": exit_price,
+                    "pnl": net_pnl,
+                    "entry_time": position["time"],
+                    "exit_time": candles[i][0],
+                    "reason": position["reason"]
+                })
 
-    trades.append({
-        "side": position["side"],
-        "entry": position["entry"],
-        "exit": exit_price,
-        "pnl": net_pnl,
-        "entry_time": position["time"],
-        "exit_time": candles[i][0],
-        "reason": position["reason"]
-    })
+                position = None
 
-    position = None
-
-        
-        
     return trades, balance
-
 
 @app.route("/api/backtest", methods=["POST", "OPTIONS"])
 @auth_required
