@@ -1000,7 +1000,7 @@ if exit_signal:
     net_pnl = gross_pnl - fees
     balance += net_pnl
 
-            trades.append({
+        trades.append({
             "side": position["side"],
             "entry": position["entry"],
             "exit": exit_price,
