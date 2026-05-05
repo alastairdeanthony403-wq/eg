@@ -968,13 +968,12 @@ def run_unified_bot_strategy(candles, starting_balance=1000, fee_pct=0.04, slipp
                 gross_pnl = close - position["entry"]
 
             else:
-                stop_loss = position["entry"] * 1.002   # -0.2%
-                take_profit = position["entry"] * 0.996 # +0.4%
+                stop_loss = position["entry"] * 1.002
+                take_profit = position["entry"] * 0.996
 
                 exit_signal = (
                     high >= stop_loss or
-                    low <= take_profit or
-                   
+                    low <= take_profit
                 )
 
                 gross_pnl = position["entry"] - close
