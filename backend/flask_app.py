@@ -928,18 +928,13 @@ def run_unified_bot_strategy(candles, starting_balance=1000, fee_pct=0.04, slipp
             and bullish_break
         )
 
-        sell_signal = (
-            bias == "bearish"
-            and bearish_bias
-            and current_rsi
-            and current_rsi > 30
-            and bearish_break
-        )
+        
+            sell_signal = False
 
         if position is None and buy_signal:
             entry_price = close * (1 + slippage_rate)
             position = {
-                "side": "BUY",
+                "side": "BUY",sell_signal = (
                 "entry": entry_price,
                 "time": candles[i][0],
                 "reason": "HTF bullish bias + EMA trend + RSI filter + bullish structure break"
