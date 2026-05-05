@@ -912,8 +912,8 @@ def run_unified_bot_strategy(candles, starting_balance=1000, fee_pct=0.04, slipp
         recent_high = max(recent_highs)
         recent_low = min(recent_lows)
 
-        bullish_break = close > recent_high and (close - recent_high) / recent_high > 0.001
-        bearish_break = close < recent_low and (recent_low - close) / recent_low > 0.001
+        bullish_break = close > recent_high and (close - recent_high) / recent_high > 0.0004
+        bearish_break = close < recent_low and (recent_low - close) / recent_low > 0.0004
 
         bullish_bias = fast_ema and slow_ema and trend_ema and fast_ema > slow_ema and close > trend_ema
         bearish_bias = fast_ema and slow_ema and trend_ema and fast_ema < slow_ema and close < trend_ema
