@@ -967,7 +967,6 @@ def run_unified_bot_strategy(candles, starting_balance=1000, fee_pct=0.04, slipp
 
                 risk_distance = abs(position["entry"] - stop_loss)
                 size = risk_per_trade / risk_distance if risk_distance else 0
-                gross_pnl = (exit_price - position["entry"]) * size
 
             else:
                 stop_loss = position["entry"] * 1.002
