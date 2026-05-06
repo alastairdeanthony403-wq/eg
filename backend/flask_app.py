@@ -933,13 +933,14 @@ def run_unified_bot_strategy(candles, starting_balance=1000, fee_pct=0.04, slipp
 
         if position is None and buy_signal:
             entry_price = close * (1 + slippage_rate)
+
             position = {
-                "side": "BUY",sell_signal = (
+                "side": "BUY",
                 "entry": entry_price,
                 "time": candles[i][0],
                 "reason": "HTF bullish bias + EMA trend + RSI filter + bullish structure break"
             }
-
+        
         elif position is None and sell_signal:
             entry_price = close * (1 - slippage_rate)
             position = {
@@ -1002,10 +1003,10 @@ def run_unified_bot_strategy(candles, starting_balance=1000, fee_pct=0.04, slipp
                     "exit_time": candles[i][0],
                     "reason": position["reason"]
                 })
-
                 position = None
 
-    return trades, balance
+# 👇 AFTER the loop ends
+                return trades, balance
 
 @app.route("/api/backtest", methods=["POST", "OPTIONS"])
 @auth_required
