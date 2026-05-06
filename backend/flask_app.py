@@ -982,25 +982,7 @@ def run_unified_bot_strategy(candles, starting_balance=1000, fee_pct=0.04, slipp
                 size = risk_per_trade / risk_distance if risk_distance else 0
                 gross_pnl = (position["entry"] - exit_price) * size
 
-            if exit_signal:
-                if position["side"] == "BUY":
-                    if low <= stop_loss:
-                        exit_price = stop_loss
-                    elif high >= take_profit:
-                        exit_price = take_profit
-                    else:
-                        exit_price = close
-                else:
-                    if high >= stop_loss:
-                        exit_price = stop_loss
-                    elif low <= take_profit:
-                        exit_price = take_profit
-                    else:
-                        exit_price = close
-
-                fees = (position["entry"] + exit_price) * fee_rate
-                net_pnl = gross_pnl - fees
-                balance += net_pnl
+            
 
                 trades.append({
                     "side": position["side"],
