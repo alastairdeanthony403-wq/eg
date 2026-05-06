@@ -883,7 +883,8 @@ def run_unified_bot_strategy(candles, starting_balance=1000, fee_pct=0.04, slipp
 
     fee_rate = fee_pct / 100
     slippage_rate = slippage_pct / 100
-
+    risk_per_trade = float(starting_balance) * 0.01
+    
     closes = [float(c[4]) for c in candles]
     highs = [float(c[2]) for c in candles]
     lows = [float(c[3]) for c in candles]
@@ -964,7 +965,9 @@ def run_unified_bot_strategy(candles, starting_balance=1000, fee_pct=0.04, slipp
                 )
             
 
-                gross_pnl = close - position["entry"]
+                risk_distance = abs(position["entry"] - stop_loss)
+                size = risk_per_trade / risk_distance if risk_distance else 0
+                gross_pnl = (exit_price - position["entry"]) * size
 
             else:
                 stop_loss = position["entry"] * 1.002
@@ -975,7 +978,9 @@ def run_unified_bot_strategy(candles, starting_balance=1000, fee_pct=0.04, slipp
                     low <= take_profit
                 )
 
-                gross_pnl = position["entry"] - close
+                risk_distance = abs(stop_loss - position["entry"])
+                size = risk_per_trade / risk_distance if risk_distance else 0
+                gross_pnl = (position["entry"] - exit_price) * size
 
             if exit_signal:
                 if position["side"] == "BUY":
@@ -1055,7 +1060,14 @@ def api_backtest():
     gross_loss = abs(sum(t["pnl"] for t in losses))
     profit_factor = (gross_profit / gross_loss) if gross_loss else 0
 
+    start_ts = candles[0][0]
+    end_ts = candles[-1][0]
+    days = max(1, (end_ts - start_ts) / (1000 * 60 * 60 * 24))
+    trades_per_day = total_trades / days
     return jsonify({
+        "start_time": start_ts,
+        "end_time": end_ts,
+        "trades_per_day": trades_per_day,
         "total_trades": total_trades,
         "net_pnl": net_pnl,
         "win_rate": win_rate,

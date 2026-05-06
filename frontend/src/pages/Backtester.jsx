@@ -43,6 +43,9 @@ export default function Backtester() {
 
     setResult({
       summary: {
+        start_time: data.start_time,
+        end_time: data.end_time,
+        trades_per_day: data.trades_per_day,
         total_trades: data.total_trades || trades.length,
         net_pnl: data.net_pnl || 0,
         win_rate: data.win_rate || 0,
@@ -154,6 +157,14 @@ const toggleAuto = async () => {
 </pre>
               <div className="grid grid-cols-2 md:grid-cols-4 gap-4" data-testid="bt-summary">
                 {[
+                  {
+                  l: "Backtest dates",
+                  v: `${new Date(sm.start_time).toLocaleDateString()} → ${new Date(sm.end_time).toLocaleDateString()}`
+                  },
+                  {
+                  l: "Trades / day",
+                  v: sm.trades_per_day?.toFixed(2)
+                  },
                   { l: "Net PnL", v: `${sm.net_pnl >= 0 ? "+" : ""}$${sm.net_pnl}`, k: sm.net_pnl >= 0 ? "num-pos" : "num-neg" },
                   { l: "Win rate", v: `${sm.win_rate}%` },
                   { l: "Profit factor", v: sm.profit_factor },
