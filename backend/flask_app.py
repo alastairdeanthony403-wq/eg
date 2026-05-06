@@ -908,6 +908,7 @@ def run_unified_bot_strategy(candles, starting_balance=1000, fee_pct=0.04, slipp
         close = closes[i]
         high = highs[i]
         low = lows[i]
+        previous_close = closes[i - 1] 
 
         recent_high = max(recent_highs)
         recent_low = min(recent_lows)
