@@ -995,7 +995,7 @@ def run_unified_bot_strategy(candles, starting_balance=1000, fee_pct=0.04, slipp
                 position = None
 
 # 👇 AFTER the loop ends
-                return trades, balance
+    return trades, balance
 
 @app.route("/api/backtest", methods=["POST", "OPTIONS"])
 @auth_required
