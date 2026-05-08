@@ -1047,7 +1047,7 @@ def api_backtest():
             else:
                 candles = all_candles
         else:
-            candles = fetch_binance_raw(symbol, interval, limit)
+        candles = fetch_binance_raw(symbol, interval, limit)
 
     if not candles or len(candles) < 50:
         return jsonify({"error": "Not enough candle data"}), 400
