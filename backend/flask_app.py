@@ -1029,26 +1029,23 @@ def api_backtest():
         all_candles = fetch_binance_raw(symbol, interval, extra_limit)
 
         if len(all_candles) > limit:
-        import random
-        start_index = random.randint(0, len(all_candles) - limit)
-        candles = all_candles[start_index:start_index + limit]
+            import random
+            start_index = random.randint(0, len(all_candles) - limit)
+            candles = all_candles[start_index:start_index + limit]
+    
+    if random_window:
+        extra_limit = min(1000, limit + 500)
+        all_candles = fetch_binance_raw(symbol, interval, extra_limit)
+
+        if len(all_candles) > limit:
+            import random
+            start_index = random.randint(0, len(all_candles) - limit)
+            candles = all_candles[start_index:start_index + limit]
         else:
             candles = all_candles
-    
     else:
-       if random_window:
-            extra_limit = min(1000, limit + 500)
-            all_candles = fetch_binance_raw(symbol, interval, extra_limit)
-
-            if len(all_candles) > limit:
-                import random
-                start_index = random.randint(0, len(all_candles) - limit)
-                candles = all_candles[start_index:start_index + limit]
-            else:
-                candles = all_candles
-        else:
         candles = fetch_binance_raw(symbol, interval, limit)
-
+    
     if not candles or len(candles) < 50:
         return jsonify({"error": "Not enough candle data"}), 400
 
