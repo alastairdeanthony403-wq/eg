@@ -12,8 +12,18 @@ const STRATS = [
 ];
 
 export default function Backtester() {
-  const [params, setParams] = useState({ symbol: "BTCUSDT", interval: "5m", strategy: "bot",
-    limit: 500, starting_balance: 1000, fee_percent: 0.04, slippage_percent: 0.02 });
+  const [params, setParams] = useState({
+  symbol: "BTCUSDT",
+  interval: "5m",
+  strategy: "bot",
+  limit: 1000,
+  starting_balance: 100000,
+  fee_percent: 0.04,
+  slippage_percent: 0.02,
+  period_days: 1,
+  random_window: true
+});
+
   const [running, setRunning] = useState(false);
   const [result, setResult] = useState(null);
   const [history, setHistory] = useState([]);
@@ -118,6 +128,40 @@ const toggleAuto = async () => {
               {STRATS.map((s) => <option key={s.v} value={s.v}>{s.n}</option>)}
             </select>
           </div>
+
+          <div>
+            <label className="block text-sm mb-2">Test Period</label>
+
+            <select
+              value={params.period_days}
+              onChange={(e) =>
+                setParams({ ...params, period_days: Number(e.target.value) })
+              }
+              className="w-full rounded-xl bg-black/40 border border-white/10 p-3"
+            >
+              <option value={1}>1 Day</option>
+              <option value={3}>3 Days</option>
+              <option value={7}>7 Days</option>
+              <option value={14}>2 Weeks</option>
+              <option value={21}>3 Weeks</option>
+              <option value={30}>1 Month</option>
+            </select>
+          .</div>
+          
+          <div className="flex items-center gap-3">
+            <input
+              type="checkbox"
+              checked={params.random_window}
+              onChange={(e) =>
+                setParams({ ...params, random_window: e.target.checked })
+              }
+            />
+
+            <label className="text-sm">
+              Use random historical dates
+            </label>
+          </div>
+
           {[
             { k: "limit", l: "Candles (100-1000)", t: "number" },
             { k: "starting_balance", l: "Starting balance ($)", t: "number" },

@@ -981,7 +981,10 @@ def run_unified_bot_strategy(candles, starting_balance=1000, fee_pct=0.04, slipp
                 size = risk_per_trade / risk_distance if risk_distance else 0
                 gross_pnl = (position["entry"] - exit_price) * size
 
-            
+                
+                fees = (position["entry"] + exit_price) * fee_rate
+                net_pnl = gross_pnl - fees
+                balance += net_pnl
 
                 trades.append({
                     "side": position["side"],
@@ -1005,11 +1008,46 @@ def api_backtest():
     interval = str(data.get("interval", "5m"))
     strategy = str(data.get("strategy", "bot")).lower()
     limit = max(100, min(int(data.get("limit", 300)), 1000))
+    period_days = max(1, min(int(data.get("period_days", 1)), 30))
+    random_window = bool(data.get("random_window", True))
+    interval_minutes_map = {
+    "1m": 1,
+    "5m": 5,
+    "15m": 15,
+    "1h": 60,
+    "4h": 240
+    }
+
+    interval_minutes = interval_minutes_map.get(interval, 5)
+    limit = max(100, min(int((period_days * 24 * 60) / interval_minutes), 1000))
     sb = float(data.get("starting_balance", 1000))
     fee = float(data.get("fee_percent", 0.04))
     slip = float(data.get("slippage_percent", 0.02))
 
-    candles = fetch_binance_raw(symbol, interval, limit)
+    if random_window:
+        extra_limit = min(1000, limit + 500)
+        all_candles = fetch_binance_raw(symbol, interval, extra_limit)
+
+        if len(all_candles) > limit:
+        import random
+        start_index = random.randint(0, len(all_candles) - limit)
+        candles = all_candles[start_index:start_index + limit]
+        else:
+            candles = all_candles
+    
+    else:
+       if random_window:
+            extra_limit = min(1000, limit + 500)
+            all_candles = fetch_binance_raw(symbol, interval, extra_limit)
+
+            if len(all_candles) > limit:
+                import random
+                start_index = random.randint(0, len(all_candles) - limit)
+                candles = all_candles[start_index:start_index + limit]
+            else:
+                candles = all_candles
+        else:
+            candles = fetch_binance_raw(symbol, interval, limit)
 
     if not candles or len(candles) < 50:
         return jsonify({"error": "Not enough candle data"}), 400
