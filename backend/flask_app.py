@@ -340,6 +340,22 @@ def fetch_binance_raw(symbol="BTCUSDT", interval="5m", limit=500):
     except Exception as fb:
         raise RuntimeError(f"Binance failed ({binance_error}); Coinbase failed ({fb})")
 
+def fetch_binance_range(symbol, interval, start_ms, end_ms, limit=1000):
+    url = "https://api.binance.com/api/v3/klines"
+
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "startTime": int(start_ms),
+        "endTime": int(end_ms),
+        "limit": int(limit)
+    }
+
+    r = requests.get(url, params=params, timeout=10)
+    r.raise_for_status()
+
+    return r.json()
+
 
 def raw_candles_to_df(raw):
     if not raw or len(raw) < 2:
@@ -1024,27 +1040,28 @@ def api_backtest():
     fee = float(data.get("fee_percent", 0.04))
     slip = float(data.get("slippage_percent", 0.02))
 
-    if random_window:
-        extra_limit = min(1000, limit + 500)
-        all_candles = fetch_binance_raw(symbol, interval, extra_limit)
-
-        if len(all_candles) > limit:
-            import random
-            start_index = random.randint(0, len(all_candles) - limit)
-            candles = all_candles[start_index:start_index + limit]
     
-    if random_window:
-        extra_limit = min(1000, limit + 500)
-        all_candles = fetch_binance_raw(symbol, interval, extra_limit)
+    
+    import random
+    from datetime import datetime, timedelta, timezone
 
-        if len(all_candles) > limit:
-            import random
-            start_index = random.randint(0, len(all_candles) - limit)
-            candles = all_candles[start_index:start_index + limit]
-        else:
-            candles = all_candles
+    now = datetime.now(timezone.utc)
+    period_ms = period_days * 24 * 60 * 60 * 1000
+
+    if random_window:
+        earliest = now - timedelta(days=3650)
+        latest_start = now - timedelta(days=period_days + 1)
+
+        random_start = earliest + (latest_start - earliest) * random.random()
+        start_ms = int(random_start.timestamp() * 1000)
+        end_ms = start_ms + period_ms
+
+        candles = fetch_binance_range(symbol, interval, start_ms, end_ms, limit)
     else:
-        candles = fetch_binance_raw(symbol, interval, limit)
+        end_ms = int(now.timestamp() * 1000)
+        start_ms = end_ms - period_ms
+
+        candles = fetch_binance_range(symbol, interval, start_ms, end_ms, limit)
     
     if not candles or len(candles) < 50:
         return jsonify({"error": "Not enough candle data"}), 400
