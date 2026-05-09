@@ -341,7 +341,7 @@ def fetch_binance_raw(symbol="BTCUSDT", interval="5m", limit=500):
         raise RuntimeError(f"Binance failed ({binance_error}); Coinbase failed ({fb})")
 
 def fetch_binance_range(symbol, interval, start_ms, end_ms, limit=1000):
-    url = "https://api.binance.com/api/v3/klines"
+    url = "https://data-api.binance.vision/api/v3/klines"
 
     params = {
         "symbol": symbol,
