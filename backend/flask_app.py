@@ -1050,7 +1050,7 @@ def api_backtest():
     period_ms = period_days * 24 * 60 * 60 * 1000
 
     if random_window:
-        earliest = datetime(2021, 1, 1, tzinfo=timezone.utc)
+        earliest = datetime(2023, 1, 1, tzinfo=timezone.utc)
         latest_start = now - timedelta(days=period_days + 1)
 
         random_start = earliest + (latest_start - earliest) * random.random()
