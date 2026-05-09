@@ -348,7 +348,7 @@ def fetch_binance_range(symbol, interval, start_ms, end_ms, limit=1000):
         "interval": interval,
         "startTime": int(start_ms),
         "endTime": int(end_ms),
-        "limit": int(limit)earliest = now - timedelta(days=3650)
+        "limit": int(limit)
     }
 
     r = requests.get(url, params=params, timeout=10)
