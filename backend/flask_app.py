@@ -348,13 +348,14 @@ def fetch_binance_range(symbol, interval, start_ms, end_ms, limit=1000):
         "interval": interval,
         "startTime": int(start_ms),
         "endTime": int(end_ms),
-        "limit": int(limit)
+        "limit": int(limit)earliest = now - timedelta(days=3650)
     }
 
     r = requests.get(url, params=params, timeout=10)
     r.raise_for_status()
 
     return r.json()
+    
 
 
 def raw_candles_to_df(raw):
@@ -1049,7 +1050,7 @@ def api_backtest():
     period_ms = period_days * 24 * 60 * 60 * 1000
 
     if random_window:
-        earliest = now - timedelta(days=3650)
+        earliest = datetime(2018, 1, 1, tzinfo=timezone.utc)
         latest_start = now - timedelta(days=period_days + 1)
 
         random_start = earliest + (latest_start - earliest) * random.random()
