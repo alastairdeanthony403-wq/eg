@@ -2,7 +2,29 @@ import { useState, useEffect, useCallback } from "react";
 import api from "@/lib/api";
 import { Play, FlaskConical, History } from "lucide-react";
 
-const SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT"];
+const SYMBOLS = [
+  "BTCUSDT",
+  "ETHUSDT",
+  "BNBUSDT",
+  "SOLUSDT",
+
+  "EURUSD",
+  "GBPUSD",
+  "USDJPY",
+  "AUDUSD",
+  "USDCAD",
+
+  "AAPL",
+  "TSLA",
+  "NVDA",
+  "MSFT",
+  "AMZN",
+
+  "XAUUSD",
+  "XAGUSD",
+  "USOIL",
+  "UKOIL"
+];
 const INTERVALS = ["1m", "5m", "15m", "1h", "4h"];
 const STRATS = [
   { v: "bot", n: "Smart Money (default)" },

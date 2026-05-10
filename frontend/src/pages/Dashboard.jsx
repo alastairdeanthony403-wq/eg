@@ -44,7 +44,7 @@ export default function Dashboard() {
   const [active, setActive] = useState("BTCUSDT");
   const [interval, setInterval_] = useState("5m");
   const [loading, setLoading] = useState(true);
-  const [openTrades, setOpenTrades] = useState([]);
+  const [openTrades, setOpenTrades] = useState([])|;
   const [stats, setStats] = useState(null);
 
   const chartRef = useRef(null); const containerRef = useRef(null); const seriesRef = useRef(null);
