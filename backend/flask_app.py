@@ -398,6 +398,9 @@ def fetch_twelvedata_candles(symbol, interval, limit=200):
         "4h": "4h",
         "1d": "1day"
     }
+
+td_interval = interval_map.get(interval, "15min")
+
 forex_format = {
     "EURUSD": "EUR/USD",
     "GBPUSD": "GBP/USD",
@@ -409,8 +412,6 @@ forex_format = {
 }
 
 symbol = forex_format.get(symbol, symbol)
-
-    td_interval = interval_map.get(interval, "15min")
 
     url = "https://api.twelvedata.com/time_series"
 
