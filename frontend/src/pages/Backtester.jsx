@@ -7,24 +7,22 @@ const SYMBOLS = [
   "ETHUSDT",
   "BNBUSDT",
   "SOLUSDT",
-
   "EURUSD",
   "GBPUSD",
   "USDJPY",
   "AUDUSD",
   "USDCAD",
-
   "AAPL",
   "TSLA",
   "NVDA",
   "MSFT",
   "AMZN",
-
   "XAUUSD",
   "XAGUSD",
   "USOIL",
   "UKOIL"
 ];
+
 const INTERVALS = ["1m", "5m", "15m", "1h", "4h"];
 const STRATS = [
   { v: "bot", n: "Smart Money (default)" },
