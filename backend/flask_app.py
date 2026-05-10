@@ -38,8 +38,18 @@ def add_cors_headers(response):
 CORS(app, resources={r"/api/*": {"origins": "*"}}, supports_credentials=True);
 
 # ------------ DEFAULT BOT CONFIG (per-user override stored in DB) ------------
+MARKETS = {
+    "crypto": ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"],
+    "forex": ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD"],
+    "stocks": ["AAPL", "TSLA", "NVDA", "MSFT", "AMZN"],
+    "commodities": ["XAUUSD", "XAGUSD", "USOIL", "UKOIL"]
+}
+
+DEFAULT_MARKET = "forex"
+DEFAULT_SYMBOLS = MARKETS[DEFAULT_MARKET]
+
 DEFAULT_CONFIG = {
-    "symbols": ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT"],
+    "symbols": DEFAULT_SYMBOLS,
     "risk_reward": 2,
     "risk_percent": 1,
     "min_confidence": 75,
@@ -340,6 +350,22 @@ def fetch_binance_raw(symbol="BTCUSDT", interval="5m", limit=500):
     except Exception as fb:
         raise RuntimeError(f"Binance failed ({binance_error}); Coinbase failed ({fb})")
 
+def detect_market(symbol):
+    if symbol.endswith("USDT"):
+        return "crypto"
+
+    forex_pairs = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD"]
+
+    commodities = ["XAUUSD", "XAGUSD", "USOIL", "UKOIL"]
+
+    if symbol in forex_pairs:
+        return "forex"
+
+    if symbol in commodities:
+        return "commodities"
+
+    return "stocks"
+
 def fetch_binance_range(symbol, interval, start_ms, end_ms, limit=1000):
     url = "https://data-api.binance.vision/api/v3/klines"
 
@@ -356,6 +382,59 @@ def fetch_binance_range(symbol, interval, start_ms, end_ms, limit=1000):
 
     return r.json()
     
+def fetch_twelvedata_candles(symbol, interval, limit=200):
+    api_key = os.environ.get("TWELVEDATA_API_KEY")
+
+    if not api_key:
+        print("Missing TWELVEDATA_API_KEY")
+        return []
+
+    interval_map = {
+        "1m": "1min",
+        "5m": "5min",
+        "15m": "15min",
+        "30m": "30min",
+        "1h": "1h",
+        "4h": "4h",
+        "1d": "1day"
+    }
+
+    td_interval = interval_map.get(interval, "15min")
+
+    url = "https://api.twelvedata.com/time_series"
+
+    params = {
+        "symbol": symbol,
+        "interval": td_interval,
+        "outputsize": limit,
+        "apikey": api_key
+    }
+
+    try:
+        r = requests.get(url, params=params, timeout=15)
+        data = r.json()
+
+        if "values" not in data:
+            print("TwelveData error:", data)
+            return []
+
+        candles = []
+
+        for item in reversed(data["values"]):
+            candles.append([
+                int(datetime.fromisoformat(item["datetime"]).timestamp() * 1000),
+                item["open"],
+                item["high"],
+                item["low"],
+                item["close"],
+                item.get("volume", 0)
+            ])
+
+        return candles
+
+    except Exception as e:
+        print("TwelveData fetch error:", e)
+        return []
 
 
 def raw_candles_to_df(raw):
@@ -773,7 +852,7 @@ def signals():
     interval = request.args.get("interval", "1m")
     strategy = request.args.get("strategy", "bot").lower()
     out = []
-    for sym in cfg["symbols"]:
+    for sym in DEFAULT_SYMBOLS:
         s = get_symbol_summary(sym, strategy, interval, cfg)
         if s: out.append(s)
     return jsonify({"signals": out, "last_update": now_str(), "config": cfg})
@@ -1057,12 +1136,22 @@ def api_backtest():
         start_ms = int(random_start.timestamp() * 1000)
         end_ms = start_ms + period_ms
 
-        candles = fetch_binance_range(symbol, interval, start_ms, end_ms, limit)
+        market = detect_market(symbol)
+
+        if market == "crypto":
+            candles = fetch_binance_range(symbol, interval, start_ms, end_ms, limit)
+        else:
+            candles = fetch_twelvedata_candles(symbol, interval, limit)
     else:
         end_ms = int(now.timestamp() * 1000)
         start_ms = end_ms - period_ms
 
-        candles = fetch_binance_range(symbol, interval, start_ms, end_ms, limit)
+        market = detect_market(symbol)
+
+        if market == "crypto":
+            candles = fetch_binance_range(symbol, interval, start_ms, end_ms, limit)
+        else:
+            candles = fetch_twelvedata_candles(symbol, interval, limit)
     
     if not candles or len(candles) < 50:
         return jsonify({"error": "Not enough candle data"}), 400
@@ -1162,7 +1251,7 @@ def update_settings():
         if k in data:
             cfg[k] = data[k]
     if "symbols" in data and isinstance(data["symbols"], list):
-        cfg["symbols"] = [s.upper() for s in data["symbols"] if isinstance(s, str)]
+        DEFAULT_SYMBOLS = [s.upper() for s in data["symbols"] if isinstance(s, str)]
     if "blocked_crypto_hours_utc" in data and isinstance(data["blocked_crypto_hours_utc"], list):
         cfg["blocked_crypto_hours_utc"] = data["blocked_crypto_hours_utc"]
     conn = get_conn()
