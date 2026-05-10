@@ -399,22 +399,21 @@ def fetch_twelvedata_candles(symbol, interval, limit=200):
         "1d": "1day"
     }
 
-td_interval = interval_map.get(interval, "15min")
+    td_interval = interval_map.get(interval, "15min")
 
-forex_format = {
-    "EURUSD": "EUR/USD",
-    "GBPUSD": "GBP/USD",
-    "USDJPY": "USD/JPY",
-    "AUDUSD": "AUD/USD",
-    "USDCAD": "USD/CAD",
-    "XAUUSD": "XAU/USD",
-    "XAGUSD": "XAG/USD"
-}
+    forex_format = {
+        "EURUSD": "EUR/USD",
+        "GBPUSD": "GBP/USD",
+        "USDJPY": "USD/JPY",
+        "AUDUSD": "AUD/USD",
+        "USDCAD": "USD/CAD",
+        "XAUUSD": "XAU/USD",
+        "XAGUSD": "XAG/USD"
+    }
 
-symbol = forex_format.get(symbol, symbol)
+    symbol = forex_format.get(symbol, symbol)
 
     url = "https://api.twelvedata.com/time_series"
-
     params = {
         "symbol": symbol,
         "interval": td_interval,
