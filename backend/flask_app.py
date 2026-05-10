@@ -398,6 +398,17 @@ def fetch_twelvedata_candles(symbol, interval, limit=200):
         "4h": "4h",
         "1d": "1day"
     }
+forex_format = {
+    "EURUSD": "EUR/USD",
+    "GBPUSD": "GBP/USD",
+    "USDJPY": "USD/JPY",
+    "AUDUSD": "AUD/USD",
+    "USDCAD": "USD/CAD",
+    "XAUUSD": "XAU/USD",
+    "XAGUSD": "XAG/USD"
+}
+
+symbol = forex_format.get(symbol, symbol)
 
     td_interval = interval_map.get(interval, "15min")
 
