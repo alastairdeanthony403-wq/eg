@@ -3,7 +3,26 @@ import api from "@/lib/api";
 import { createChart, CandlestickSeries } from "lightweight-charts";
 import { ArrowUpRight, ArrowDownRight, Minus, Zap, RefreshCw, CheckCircle2, XCircle, BookmarkPlus } from "lucide-react";
 
-const SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT"];
+const SYMBOLS = [
+  "BTCUSDT",
+  "ETHUSDT",
+  "BNBUSDT",
+  "SOLUSDT",
+  "EURUSD",
+  "GBPUSD",
+  "USDJPY",
+  "AUDUSD",
+  "USDCAD",
+  "AAPL",
+  "TSLA",
+  "NVDA",
+  "MSFT",
+  "AMZN",
+  "XAUUSD",
+  "XAGUSD",
+  "USOIL",
+  "UKOIL"
+];
 const INTERVALS = ["1m", "5m", "15m", "1h", "4h"];
 
 function SignalCard({ s, active, onClick }) {
@@ -44,7 +63,7 @@ export default function Dashboard() {
   const [active, setActive] = useState("BTCUSDT");
   const [interval, setInterval_] = useState("5m");
   const [loading, setLoading] = useState(true);
-  const [openTrades, setOpenTrades] = useState([])|;
+  const [openTrades, setOpenTrades] = useState([]);
   const [stats, setStats] = useState(null);
 
   const chartRef = useRef(null); const containerRef = useRef(null); const seriesRef = useRef(null);
