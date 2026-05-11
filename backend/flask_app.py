@@ -585,93 +585,77 @@ def fetch_twelvedata_candles(symbol, interval, limit=200,
 
 
 # ─────────────────────────────────────────────
-# [B] TWELVEDATA RANDOM RANGE FETCH
+# NON-CRYPTO BACKTEST DATA STRATEGY
+# ─────────────────────────────────────────────
+# Problem: TwelveData free plan = 8 credits/minute.
+# Signals already use ~14 credits per refresh for non-crypto symbols.
+# Running a backtest on top of that causes 429 rate limit errors.
+#
+# Solution:
+#   1. For backtesting, always use the DAILY interval (1 credit per symbol).
+#      One daily call fetches up to 5000 days of history — no extra credits.
+#   2. Cache the daily result for 30 minutes so repeated backtests are free.
+#   3. The strategy still works on daily candles — the EMA/ADX/RSI signals
+#      are actually MORE reliable on daily than on 5m (less noise).
+#   4. Surface a clear message telling the user this is happening.
 # ─────────────────────────────────────────────
 
-def _random_date_window(market, period_days):
-    """Return (start_date_str, end_date_str) for a random historical window."""
-    earliest   = MARKET_EARLIEST[market]
-    # leave 1 day buffer so we never ask for the future
-    latest_end = datetime.now(timezone.utc) - timedelta(days=1)
-    latest_start = latest_end - timedelta(days=period_days)
-    if latest_start <= earliest:
-        start_dt = earliest
-    else:
-        span_seconds = int((latest_start - earliest).total_seconds())
-        offset       = random.randint(0, span_seconds)
-        start_dt     = earliest + timedelta(seconds=offset)
-    end_dt = start_dt + timedelta(days=period_days)
-    if end_dt > latest_end:
-        end_dt   = latest_end
-        start_dt = max(earliest, end_dt - timedelta(days=period_days))
-    return start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d")
+_backtest_daily_cache = {}  # symbol → candles, long-lived cache
+BACKTEST_DAILY_TTL    = 1800  # 30 minutes
 
 
-def fetch_twelvedata_for_backtest(symbol, interval, period_days,
-                                  random_window=True, max_attempts=2):
+def fetch_non_crypto_backtest_candles(symbol, period_days, random_window=True):
     """
-    [C] Fetch non-crypto candles for backtesting.
-
-    Key change vs previous version:
-    • max_attempts defaulted to 2 (not 3) — each attempt costs ~8 s due to
-      the rate-limiter, so 2 attempts = max 16 s latency.
-    • Rate-limit errors (429) are NOT retried — they propagate immediately with
-      a clear message telling the user to wait 60 s.
-    • Only "thin data" (< 60 candles returned) triggers a second attempt with a
-      different random window.
+    Fetch daily candles for non-crypto backtest via TwelveData.
+    Uses 1d interval → only 1 API credit per call.
+    Cached for 30 min so repeated runs cost nothing.
+    Returns (candles, "1d", start_date, end_date).
     """
-    market = detect_market(symbol)
-    errors = []
-
-    # Upgrade 1m → 5m for non-crypto (TwelveData free plan caps 1m at 800 rows)
-    safe_interval = interval
-    if interval == "1m" and market != "crypto":
-        safe_interval = "5m"
-
-    iv_minutes = {"1m": 1, "5m": 5, "15m": 15, "30m": 30,
-                  "1h": 60, "4h": 240, "1d": 1440}.get(safe_interval, 5)
-    limit = min(5000, (period_days * 24 * 60) // iv_minutes + 10)
-
-    for attempt in range(1, max_attempts + 1):
-        if random_window:
-            start_date, end_date = _random_date_window(market, period_days)
-        else:
-            end_dt     = datetime.now(timezone.utc) - timedelta(days=1)
-            start_dt   = end_dt - timedelta(days=period_days)
-            start_date = start_dt.strftime("%Y-%m-%d")
-            end_date   = end_dt.strftime("%Y-%m-%d")
-
+    # Check cache first — if we already have this symbol's daily data, slice it
+    cached = _cache_get(_backtest_daily_cache, symbol, BACKTEST_DAILY_TTL)
+    if cached is None:
+        # Fetch up to 5 years of daily data in one credit
         try:
-            candles = fetch_twelvedata_candles(
-                symbol, safe_interval,
-                limit=limit,
-                start_date=start_date,
-                end_date=end_date,
-            )
-            if candles and len(candles) >= 60:
-                return candles, safe_interval, start_date, end_date
-            errors.append(
-                f"Attempt {attempt} ({start_date}→{end_date}): "
-                f"only {len(candles)} candles returned (need ≥60)"
-            )
+            candles = fetch_twelvedata_candles(symbol, "1d", limit=1825)
         except RuntimeError as e:
-            msg = str(e)
-            errors.append(f"Attempt {attempt} ({start_date}→{end_date}): {msg}")
-            # Don't retry rate-limit errors — just surface them immediately
-            if "rate limit" in msg.lower() or "429" in msg:
-                raise RuntimeError(
-                    f"TwelveData rate limit hit.\n"
-                    f"The free plan allows only 8 API credits per minute.\n"
-                    f"Please wait ~60 seconds then try again.\n\n"
-                    f"To fix permanently: upgrade your TwelveData plan at "
-                    f"https://twelvedata.com/pricing, or reduce how often the "
-                    f"signals page refreshes."
-                )
+            raise RuntimeError(
+                f"Could not load daily data for {symbol} from TwelveData.\n{e}\n\n"
+                f"Tip: wait 60 seconds for the rate limit to reset, then try again."
+            )
+        if not candles or len(candles) < 30:
+            raise RuntimeError(
+                f"TwelveData returned only {len(candles) if candles else 0} daily "
+                f"candles for {symbol}. The symbol may not be supported on your plan."
+            )
+        _cache_set(_backtest_daily_cache, symbol, candles)
+        cached = candles
 
-    raise RuntimeError(
-        f"Could not fetch enough candles for {symbol} after {max_attempts} attempt(s).\n"
-        + "\n".join(errors)
-    )
+    all_candles = cached
+
+    # Slice a window of period_days from the full history
+    if random_window and len(all_candles) > period_days + 5:
+        max_start = len(all_candles) - period_days - 1
+        start_idx = random.randint(0, max_start)
+    else:
+        start_idx = max(0, len(all_candles) - period_days)
+
+    end_idx = min(start_idx + period_days, len(all_candles))
+    window  = all_candles[start_idx:end_idx]
+
+    if len(window) < 20:
+        raise RuntimeError(
+            f"Not enough daily candles for {symbol} "
+            f"(got {len(window)}, need ≥20). Try a longer period."
+        )
+
+    # Extract date range for display
+    def ms_to_date(ts):
+        return datetime.utcfromtimestamp(int(ts) / 1000).strftime("%Y-%m-%d")
+
+    start_date = ms_to_date(window[0][0])
+    end_date   = ms_to_date(window[-1][0])
+
+    return window, "1d", start_date, end_date
 
 
 # ─────────────────────────────────────────────
@@ -1712,11 +1696,11 @@ def api_backtest():
                 }), 400
 
         else:
-            # Non-crypto: TwelveData with retry
+            # Non-crypto: use TwelveData daily candles (1 credit per symbol,
+            # cached 30 min) to avoid competing with the signals rate limit.
             candles, actual_interval, start_date, end_date = \
-                fetch_twelvedata_for_backtest(
-                    symbol, interval, period_days,
-                    random_window=rand_window, max_attempts=3
+                fetch_non_crypto_backtest_candles(
+                    symbol, period_days, random_window=rand_window
                 )
 
     except RuntimeError as e:

@@ -234,9 +234,14 @@ export default function Backtester() {
             >
               {INTERVALS.map((i) => <option key={i} value={i}>{i}</option>)}
             </select>
-            {market !== "Crypto" && interval === "1m" && (
+            {market !== "Crypto" && (
+              <div className="text-xs text-[var(--accent-2)] mt-1">
+                ℹ Non-crypto uses daily candles to avoid rate limits
+              </div>
+            )}
+            {market === "Crypto" && interval === "1m" && (
               <div className="text-xs text-[var(--warn)] mt-1">
-                ⚠ 1m auto-upgrades to 5m for non-crypto (TwelveData limit)
+                ⚠ 1m auto-upgrades to 5m for non-crypto
               </div>
             )}
           </div>
@@ -270,6 +275,20 @@ export default function Backtester() {
               onChange={(e) => setPeriodDays(Math.max(2, parseInt(e.target.value) || 7))}
               data-testid="bt-period"
             />
+            {/* Warn if unified bot won't have enough candles */}
+            {strategy === "unified_bot" && (() => {
+              const ivMin = {"1m":1,"5m":5,"15m":15,"1h":60,"4h":240}[interval] || 5;
+              const est = Math.floor((periodDays * 24 * 60) / ivMin);
+              if (est < 150) {
+                const minDays = Math.ceil((150 * ivMin) / (24 * 60)) + 1;
+                return (
+                  <div className="text-xs text-[var(--warn)] mt-1">
+                    ⚠ ~{est} candles — need ≥150. Use ≥{minDays}d or a shorter interval.
+                  </div>
+                );
+              }
+              return null;
+            })()}
           </div>
 
           {/* Starting balance */}
