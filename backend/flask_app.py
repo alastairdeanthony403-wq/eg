@@ -1304,29 +1304,35 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                               fee_pct=0.04, slippage_pct=0.02):
 
     # ── Constants ─────────────────────────────────────────────────────────
-    RISK_PER_TRADE  = 0.01    # 1 % of starting_balance, fixed for entire run
-    REWARD_RISK     = 2.5     # TP = 2.5 × SL distance
-    SL_ATR_MULT     = 1.5     # SL = entry ± SL_ATR_MULT × ATR
-    TRAIL_ATR_MULT  = 1.0     # trailing stop trails 1 × ATR behind peak
-    TRAIL_TRIGGER_R = 1.0     # activate trail once +1 R is booked
-    COOLDOWN_BARS   = 3       # bars to skip after any exit
-    ADX_MIN         = 20      # only trade when ADX shows a trend
-    RSI_BUY_LO      = 45      # RSI band for longs (avoid overbought)
-    RSI_BUY_HI      = 68
-    RSI_SELL_LO     = 32      # RSI band for shorts (avoid oversold)
-    RSI_SELL_HI     = 55
-    ATR_PERIOD      = 14
-    RSI_PERIOD      = 14
-    ADX_PERIOD      = 14
-    WARMUP          = 55      # bars needed: max(EMA50, ATR14, ADX ~42)
+    RISK_PER_TRADE   = 0.01    # 1 % of starting_balance risked per trade
+    REWARD_RISK      = 2.5     # TP = 2.5 × SL distance
+    SL_ATR_MULT      = 1.5     # SL = entry ± SL_ATR_MULT × ATR
+    TRAIL_ATR_MULT   = 1.0     # trailing stop trails 1 × ATR behind peak
+    TRAIL_TRIGGER_R  = 1.0     # activate trail once +1 R profit booked
+    COOLDOWN_BARS    = 3       # bars to pause after any exit
+    ADX_MIN          = 22      # only trade in trending markets
+    RSI_BUY_LO       = 45
+    RSI_BUY_HI       = 68
+    RSI_SELL_LO      = 32
+    RSI_SELL_HI      = 55
+    ATR_PERIOD       = 14
+    RSI_PERIOD       = 14
+    ADX_PERIOD       = 14
+    WARMUP           = 55
+    # Notional cap: never put more than 20% of balance into one position.
+    # This bounds leverage regardless of price scale.
+    # e.g. $100k balance → max notional $20k → max 0.22 BTC at $90k.
+    # With fee=0.04% each side: fee = $20k * 0.0008 = $16 (1.6% of $1k risk) ✓
+    MAX_NOTIONAL_FRACTION = 0.20   # 20% of starting_balance per trade
 
-    trades      = []
-    balance     = float(starting_balance)
-    risk_dollar = starting_balance * RISK_PER_TRADE  # fixed
-    fee_rate    = fee_pct    / 100
-    slip_rate   = slippage_pct / 100
-    position    = None
-    cooldown    = 0
+    trades       = []
+    balance      = float(starting_balance)
+    risk_dollar  = starting_balance * RISK_PER_TRADE  # fixed for entire run
+    max_notional = starting_balance * MAX_NOTIONAL_FRACTION
+    fee_rate     = fee_pct    / 100
+    slip_rate    = slippage_pct / 100
+    position     = None
+    cooldown     = 0
 
     if len(candles) < WARMUP + 10:
         return trades, balance
@@ -1335,7 +1341,6 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
     highs  = [float(c[2]) for c in candles]
     lows   = [float(c[3]) for c in candles]
 
-    # Pre-compute indicator series
     ema9  = _ema_series(closes, 9)
     ema21 = _ema_series(closes, 21)
     ema50 = _ema_series(closes, 50)
@@ -1362,23 +1367,21 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
         lo    = lows[i]
         t_str = _ts_to_str(candles[i][0])
 
-        # ── Trend stack ───────────────────────────────────────────────────
         bull_stack = e9 > e21 > e50
         bear_stack = e9 < e21 < e50
         trending   = adx_v >= ADX_MIN
 
         # ── Manage open position ──────────────────────────────────────────
         if position is not None:
-            side        = position["side"]
-            ep          = position["entry"]
-            sl          = position["sl"]
-            tp          = position["tp"]
-            r_dist      = position["r_dist"]
-            trail_act   = position["trail_active"]
-            trail_sl    = position["trail_sl"]
-            peak        = position["peak"]
+            side      = position["side"]
+            ep        = position["entry"]
+            sl        = position["sl"]
+            tp        = position["tp"]
+            r_dist    = position["r_dist"]
+            trail_act = position["trail_active"]
+            trail_sl  = position["trail_sl"]
+            peak      = position["peak"]
 
-            # Update peak price
             if side == "BUY":
                 if hi > peak:
                     peak = hi
@@ -1392,14 +1395,12 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
             exit_reason = None
 
             if side == "BUY":
-                # Activate trailing stop once TRAIL_TRIGGER_R is reached
                 if not trail_act and peak >= ep + r_dist * TRAIL_TRIGGER_R:
                     trail_act = True
                     trail_sl  = peak - atr_v * TRAIL_ATR_MULT
                     position["trail_active"] = True
                     position["trail_sl"]     = trail_sl
 
-                # Advance trail
                 if trail_act:
                     candidate = peak - atr_v * TRAIL_ATR_MULT
                     if candidate > trail_sl:
@@ -1412,8 +1413,6 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                 if lo <= eff_sl:
                     exit_price  = eff_sl
                     exit_reason = "Trailing stop" if trail_act else "Stop loss"
-                    if not trail_act:
-                        cooldown = COOLDOWN_BARS
                 elif hi >= tp:
                     exit_price, exit_reason = tp, "Take profit"
                 elif not trail_act and not bull_stack:
@@ -1438,8 +1437,6 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                 if hi >= eff_sl:
                     exit_price  = eff_sl
                     exit_reason = "Trailing stop" if trail_act else "Stop loss"
-                    if not trail_act:
-                        cooldown = COOLDOWN_BARS
                 elif lo <= tp:
                     exit_price, exit_reason = tp, "Take profit"
                 elif not trail_act and not bear_stack:
@@ -1447,8 +1444,8 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
 
             if exit_price is not None:
                 sz       = position["size"]
-                notional = ep * sz                       # BUG 2 fix: fee on notional
-                fee      = notional * fee_rate * 2       # entry + exit sides
+                notional = ep * sz
+                fee      = notional * fee_rate * 2
                 raw_pnl  = ((exit_price - ep) if side == "BUY"
                             else (ep - exit_price)) * sz
                 net_pnl  = raw_pnl - fee
@@ -1468,9 +1465,9 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                     "trail_used": trail_act,
                 })
                 position = None
-                cooldown = COOLDOWN_BARS   # pause after every exit
+                cooldown = COOLDOWN_BARS
 
-            continue  # skip entry logic this bar
+            continue
 
         # ── Cooldown ──────────────────────────────────────────────────────
         if cooldown > 0:
@@ -1479,19 +1476,23 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
 
         # ── Entry ─────────────────────────────────────────────────────────
         if not trending:
-            continue   # ADX too low — choppy market, skip
+            continue
 
         if bull_stack and RSI_BUY_LO <= rsi_v <= RSI_BUY_HI:
-            sl_dist  = atr_v * SL_ATR_MULT          # BUG 3 fix: ATR-based SL
+            sl_dist  = atr_v * SL_ATR_MULT
             ep       = close * (1 + slip_rate)
             sl_price = ep - sl_dist
             tp_price = ep + sl_dist * REWARD_RISK
-            size     = risk_dollar / sl_dist if sl_dist > 0 else 0
-            if size > 0:
+            # Size: risk 1% of starting balance, but cap notional at MAX_NOTIONAL_MULT×
+            raw_size   = risk_dollar / sl_dist if sl_dist > 0 else 0
+            capped_size = min(raw_size, max_notional / ep) if ep > 0 else raw_size
+            if capped_size > 0:
+                # Recalculate actual risk after capping (may be less than 1%)
+                actual_risk = capped_size * sl_dist
                 position = {
-                    "side": "BUY",  "entry": ep,       "time": t_str,
+                    "side": "BUY",  "entry": ep,        "time": t_str,
                     "sl":   sl_price, "tp":  tp_price,
-                    "r_dist": sl_dist, "size": size,
+                    "r_dist": actual_risk, "size": capped_size,
                     "trail_active": False, "trail_sl": sl_price,
                     "peak": ep,
                 }
@@ -1501,12 +1502,14 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
             ep       = close * (1 - slip_rate)
             sl_price = ep + sl_dist
             tp_price = ep - sl_dist * REWARD_RISK
-            size     = risk_dollar / sl_dist if sl_dist > 0 else 0
-            if size > 0:
+            raw_size    = risk_dollar / sl_dist if sl_dist > 0 else 0
+            capped_size = min(raw_size, max_notional / ep) if ep > 0 else raw_size
+            if capped_size > 0:
+                actual_risk = capped_size * sl_dist
                 position = {
-                    "side": "SELL", "entry": ep,       "time": t_str,
+                    "side": "SELL", "entry": ep,        "time": t_str,
                     "sl":   sl_price, "tp":  tp_price,
-                    "r_dist": sl_dist, "size": size,
+                    "r_dist": actual_risk, "size": capped_size,
                     "trail_active": False, "trail_sl": sl_price,
                     "peak": ep,
                 }
