@@ -31,12 +31,8 @@ function SignalCard({ s, active, onClick }) {
   const isSell = s.signal === "SELL";
   const PillIcon = isBuy ? ArrowUpRight : isSell ? ArrowDownRight : Minus;
 
-  // Format price appropriately — forex pairs are small numbers
-  const priceDisplay = s.price
-    ? s.price < 100
-      ? s.price.toFixed(4)
-      : s.price.toLocaleString()
-    : "—";
+  // [F] Backend now supplies price_display — use it directly if present
+  const priceDisplay = s.price_display || (s.price ? String(s.price) : "—");
 
   return (
     <button
@@ -166,10 +162,19 @@ export default function Dashboard() {
     try { await api.post(`/trades/${id}/close`); loadTrades(); } catch {}
   };
 
-  // Price display helper for the chart panel
-  const formatPrice = (p) => {
+  // Price display helper — matches backend format_price() logic
+  const formatPrice = (p, sym = active) => {
     if (!p) return "—";
-    return p < 100 ? Number(p).toFixed(4) : Number(p).toLocaleString();
+    if (sym?.endsWith("USDT")) {
+      if (p >= 1000) return Number(p).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      if (p >= 1)    return Number(p).toFixed(4);
+      return Number(p).toFixed(6);
+    }
+    if (["EURUSD","GBPUSD","AUDUSD","USDCAD"].includes(sym)) return Number(p).toFixed(5);
+    if (sym === "USDJPY") return Number(p).toFixed(3);
+    if (["XAUUSD","XAGUSD","USOIL","UKOIL"].includes(sym))
+      return p < 100 ? Number(p).toFixed(3) : Number(p).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    return Number(p).toFixed(2);
   };
 
   return (
