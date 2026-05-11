@@ -124,19 +124,19 @@ JWT_ALGO       = "HS256"
 JWT_EXPIRY_DAYS = 7
 
 MARKET_DATA_TTL_SECONDS    = 30
-SUMMARY_TTL_SECONDS        = 60   # cache signals for 1 min — reduces TD calls dramatically
-NON_CRYPTO_CANDLE_TTL      = 300  # cache non-crypto candles for 5 min
+SUMMARY_TTL_SECONDS        = 90   # cache signals for 90 s — gives backtest room to breathe
+NON_CRYPTO_CANDLE_TTL      = 600  # cache non-crypto candles for 10 min
 
 _raw_candle_cache    = {}
 _non_crypto_cache    = {}   # separate long-lived cache for TwelveData responses
 _summary_cache       = {}
 
 # ── TwelveData rate-limiter ──────────────────────────────────────────────────
-# Free plan: 8 credits/minute.  We enforce a minimum 8-second gap between
-# outgoing TD requests so we never fire more than ~7/min even under load.
+# Free plan: 8 credits/minute.  We enforce ≥10 s between outgoing TD requests
+# so we never exceed 6/min even if signals and backtester fire simultaneously.
 _td_lock            = __import__("threading").Lock()
 _td_last_call_time  = 0.0
-TD_MIN_INTERVAL_SEC = 8.0          # seconds between TwelveData HTTP calls
+TD_MIN_INTERVAL_SEC = 10.0        # seconds between TwelveData HTTP calls
 
 
 def _td_rate_limited_get(params, timeout=25):
@@ -1145,137 +1145,371 @@ def run_simple_ma_strategy(candles, starting_balance=1000,
 
 
 # ─────────────────────────────────────────────
-# [D] BACKTEST STRATEGY: UNIFIED BOT (loosened conditions)
+# INDICATOR HELPERS
 # ─────────────────────────────────────────────
 
 def _ema_series(values, period):
-    """Return a list of EMA values (same length as input, None for warm-up)."""
+    """Full EMA series, None for warm-up bars."""
     if len(values) < period:
         return [None] * len(values)
-    multiplier = 2 / (period + 1)
+    mult   = 2 / (period + 1)
     result = [None] * (period - 1)
-    ema_val = sum(values[:period]) / period
-    result.append(ema_val)
+    val    = sum(values[:period]) / period
+    result.append(val)
     for v in values[period:]:
-        ema_val = (v - ema_val) * multiplier + ema_val
-        result.append(ema_val)
+        val = (v - val) * mult + val
+        result.append(val)
     return result
 
 
-def _rsi_value(values, period=14):
-    if len(values) <= period:
-        return None
-    gains, losses = [], []
-    for i in range(1, len(values)):
-        d = values[i] - values[i - 1]
-        gains.append(max(d, 0))
-        losses.append(abs(min(d, 0)))
-    avg_g = sum(gains[-period:]) / period
-    avg_l = sum(losses[-period:]) / period
-    if avg_l == 0:
-        return 100.0
-    return 100 - (100 / (1 + avg_g / avg_l))
+def _atr_series(highs, lows, closes, period=14):
+    """Average True Range (Wilder smoothing), same length as input."""
+    if len(closes) < period + 1:
+        return [None] * len(closes)
+    trs = [None]
+    for i in range(1, len(closes)):
+        trs.append(max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i]  - closes[i - 1]),
+        ))
+    result = [None] * period
+    val    = sum(trs[1:period + 1]) / period
+    result.append(val)
+    for t in trs[period + 1:]:
+        val = (val * (period - 1) + t) / period
+        result.append(val)
+    return result
 
+
+def _rsi_series(values, period=14):
+    """Wilder RSI, same length as input, None for warm-up."""
+    if len(values) <= period:
+        return [None] * len(values)
+    result = [None] * period
+    gains  = [max(values[i] - values[i-1], 0) for i in range(1, len(values))]
+    losses = [max(values[i-1] - values[i], 0) for i in range(1, len(values))]
+    avg_g  = sum(gains[:period])  / period
+    avg_l  = sum(losses[:period]) / period
+    result.append(100 - 100 / (1 + avg_g / avg_l) if avg_l else 100.0)
+    for i in range(period, len(gains)):
+        avg_g = (avg_g * (period - 1) + gains[i])  / period
+        avg_l = (avg_l * (period - 1) + losses[i]) / period
+        result.append(100 - 100 / (1 + avg_g / avg_l) if avg_l else 100.0)
+    return result
+
+
+def _adx_series(highs, lows, closes, period=14):
+    """
+    Average Directional Index — measures trend strength (0-100).
+    Values > 25 indicate a trending market worth trading.
+    """
+    n = len(closes)
+    if n < period * 2 + 1:
+        return [None] * n
+
+    # +DM, -DM, TR
+    plus_dm  = [0.0]
+    minus_dm = [0.0]
+    trs      = [0.0]
+    for i in range(1, n):
+        up   = highs[i]  - highs[i-1]
+        down = lows[i-1] - lows[i]
+        plus_dm.append(up   if (up > down and up > 0)   else 0.0)
+        minus_dm.append(down if (down > up and down > 0) else 0.0)
+        trs.append(max(highs[i]-lows[i],
+                       abs(highs[i]-closes[i-1]),
+                       abs(lows[i] -closes[i-1])))
+
+    # Smooth with Wilder
+    def wilder_smooth(arr, p):
+        out  = [None] * p
+        val  = sum(arr[:p])
+        out.append(val)
+        for v in arr[p:]:
+            val = val - val / p + v
+            out.append(val)
+        return out
+
+    s_tr  = wilder_smooth(trs,      period)
+    s_pdm = wilder_smooth(plus_dm,  period)
+    s_mdm = wilder_smooth(minus_dm, period)
+
+    di_plus  = [None if s_tr[i] is None or s_tr[i] == 0
+                else 100 * s_pdm[i] / s_tr[i] for i in range(n)]
+    di_minus = [None if s_tr[i] is None or s_tr[i] == 0
+                else 100 * s_mdm[i] / s_tr[i] for i in range(n)]
+
+    dx = []
+    for i in range(n):
+        if di_plus[i] is None or di_minus[i] is None:
+            dx.append(None)
+        else:
+            s = di_plus[i] + di_minus[i]
+            dx.append(100 * abs(di_plus[i] - di_minus[i]) / s if s else 0.0)
+
+    # Smooth DX → ADX
+    first_valid = next((i for i, v in enumerate(dx) if v is not None), None)
+    if first_valid is None:
+        return [None] * n
+    adx_out = [None] * (first_valid + period)
+    start   = first_valid + period
+    if start >= n:
+        return [None] * n
+    val = sum(v for v in dx[first_valid:first_valid + period] if v is not None) / period
+    adx_out.append(val)
+    for j in range(start + 1, n):
+        if dx[j] is not None:
+            val = (val * (period - 1) + dx[j]) / period
+        adx_out.append(val)
+    return adx_out[:n]
+
+
+# ─────────────────────────────────────────────
+# UNIFIED BOT STRATEGY  v3
+#
+# What was wrong with v2 and what we fixed
+# ─────────────────────────────────────────────
+# BUG 1 — EMA200 warm-up = 200 bars.  On a 2-day 5m window (576 candles)
+#   the strategy only had 376 bars to trade, and the EMA200 trend hadn't
+#   had time to form a reliable macro direction. Fixed: use EMA50 as the
+#   macro filter (50-bar warm-up) so the strategy works on short windows.
+#
+# BUG 2 — Fee formula was `(ep + exit_price) * size * fee_rate`.
+#   This multiplies two prices × size = price² units, not money.
+#   For BTC at $90k: (90000 + 90000) * size * 0.0004 = 72 per unit, absurd.
+#   Fixed: fee = `notional * fee_rate * 2` where notional = entry_price * size.
+#   Now fees are a realistic ~0.04% of trade value each side.
+#
+# BUG 3 — SL based on `min(recent_lows[-5:])`.  On choppy 5m BTC data the
+#   5 most recent lows are all very close to current price, giving a tiny
+#   r_dist → enormous position size → single loss wipes the account.
+#   Fixed: SL = entry ± 1.5 × ATR (always structurally meaningful and
+#   proportional to actual volatility), with size = risk_dollar / sl_distance.
+#
+# BUG 4 — Entry fires every bar that passes the filter — it re-enters
+#   immediately after a closed trade with no pause to re-assess.
+#   Fixed: mandatory 3-bar cooldown after ANY exit (win or loss).
+#
+# Design principles
+# ─────────────────
+#  • 1 % of starting_balance risked per trade — fixed, never compounds down.
+#  • SL = 1.5 × ATR from entry.  TP = SL_distance × 2.5 (2.5 R:R minimum).
+#  • Trailing stop activates at +1 R, trails at 1 × ATR behind peak price.
+#  • Entry requires: EMA trend stack + ADX > 20 (trending) + RSI zone filter.
+#  • Works on any price scale: size is always risk_dollar / sl_distance.
+# ─────────────────────────────────────────────
 
 def run_unified_bot_strategy(candles, starting_balance=1000,
                               fee_pct=0.04, slippage_pct=0.02):
-    """
-    [D] Unified bot: EMA-trend + RSI filter, both BUY and SELL.
-    Works on any price scale (fees expressed as % not absolute).
-    """
-    trades     = []
-    balance    = float(starting_balance)
-    position   = None
-    risk_pct   = 0.01           # 1 % balance per trade
-    fee_rate   = fee_pct    / 100
-    slip_rate  = slippage_pct / 100
 
-    if len(candles) < 60:
+    # ── Constants ─────────────────────────────────────────────────────────
+    RISK_PER_TRADE  = 0.01    # 1 % of starting_balance, fixed for entire run
+    REWARD_RISK     = 2.5     # TP = 2.5 × SL distance
+    SL_ATR_MULT     = 1.5     # SL = entry ± SL_ATR_MULT × ATR
+    TRAIL_ATR_MULT  = 1.0     # trailing stop trails 1 × ATR behind peak
+    TRAIL_TRIGGER_R = 1.0     # activate trail once +1 R is booked
+    COOLDOWN_BARS   = 3       # bars to skip after any exit
+    ADX_MIN         = 20      # only trade when ADX shows a trend
+    RSI_BUY_LO      = 45      # RSI band for longs (avoid overbought)
+    RSI_BUY_HI      = 68
+    RSI_SELL_LO     = 32      # RSI band for shorts (avoid oversold)
+    RSI_SELL_HI     = 55
+    ATR_PERIOD      = 14
+    RSI_PERIOD      = 14
+    ADX_PERIOD      = 14
+    WARMUP          = 55      # bars needed: max(EMA50, ATR14, ADX ~42)
+
+    trades      = []
+    balance     = float(starting_balance)
+    risk_dollar = starting_balance * RISK_PER_TRADE  # fixed
+    fee_rate    = fee_pct    / 100
+    slip_rate   = slippage_pct / 100
+    position    = None
+    cooldown    = 0
+
+    if len(candles) < WARMUP + 10:
         return trades, balance
 
     closes = [float(c[4]) for c in candles]
     highs  = [float(c[2]) for c in candles]
     lows   = [float(c[3]) for c in candles]
 
+    # Pre-compute indicator series
     ema9  = _ema_series(closes, 9)
     ema21 = _ema_series(closes, 21)
     ema50 = _ema_series(closes, 50)
+    atr   = _atr_series(highs, lows, closes, ATR_PERIOD)
+    rsi   = _rsi_series(closes, RSI_PERIOD)
+    adx   = _adx_series(highs, lows, closes, ADX_PERIOD)
 
-    for i in range(50, len(candles)):
-        e9  = ema9[i];  e9p  = ema9[i - 1]
-        e21 = ema21[i]; e21p = ema21[i - 1]
-        e50 = ema50[i]
-        if any(v is None for v in [e9, e9p, e21, e21p, e50]):
+    for i in range(WARMUP, len(candles)):
+
+        e9    = ema9[i]
+        e21   = ema21[i]
+        e50   = ema50[i]
+        atr_v = atr[i]
+        rsi_v = rsi[i]
+        adx_v = adx[i]
+
+        if any(v is None for v in [e9, e21, e50, atr_v, rsi_v, adx_v]):
+            continue
+        if atr_v <= 0:
             continue
 
-        close  = closes[i]
-        hi     = highs[i]
-        lo     = lows[i]
-        rsi_v  = _rsi_value(closes[:i + 1], 14)
-        t_str  = _ts_to_str(candles[i][0])
+        close = closes[i]
+        hi    = highs[i]
+        lo    = lows[i]
+        t_str = _ts_to_str(candles[i][0])
 
-        bullish = e9 > e21 and close > e50
-        bearish = e9 < e21 and close < e50
-        cross_up   = e9p <= e21p and e9 > e21
-        cross_down = e9p >= e21p and e9 < e21
+        # ── Trend stack ───────────────────────────────────────────────────
+        bull_stack = e9 > e21 > e50
+        bear_stack = e9 < e21 < e50
+        trending   = adx_v >= ADX_MIN
 
-        # ── entry ──
-        if position is None:
-            if cross_up and bullish and rsi_v and rsi_v < 70:
-                ep = close * (1 + slip_rate)
-                position = {
-                    "side": "BUY", "entry": ep, "time": t_str,
-                    "sl": ep * (1 - 0.005), "tp": ep * (1 + 0.010),
-                }
-            elif cross_down and bearish and rsi_v and rsi_v > 30:
-                ep = close * (1 - slip_rate)
-                position = {
-                    "side": "SELL", "entry": ep, "time": t_str,
-                    "sl": ep * (1 + 0.005), "tp": ep * (1 - 0.010),
-                }
+        # ── Manage open position ──────────────────────────────────────────
+        if position is not None:
+            side        = position["side"]
+            ep          = position["entry"]
+            sl          = position["sl"]
+            tp          = position["tp"]
+            r_dist      = position["r_dist"]
+            trail_act   = position["trail_active"]
+            trail_sl    = position["trail_sl"]
+            peak        = position["peak"]
+
+            # Update peak price
+            if side == "BUY":
+                if hi > peak:
+                    peak = hi
+                    position["peak"] = peak
+            else:
+                if lo < peak:
+                    peak = lo
+                    position["peak"] = peak
+
+            exit_price  = None
+            exit_reason = None
+
+            if side == "BUY":
+                # Activate trailing stop once TRAIL_TRIGGER_R is reached
+                if not trail_act and peak >= ep + r_dist * TRAIL_TRIGGER_R:
+                    trail_act = True
+                    trail_sl  = peak - atr_v * TRAIL_ATR_MULT
+                    position["trail_active"] = True
+                    position["trail_sl"]     = trail_sl
+
+                # Advance trail
+                if trail_act:
+                    candidate = peak - atr_v * TRAIL_ATR_MULT
+                    if candidate > trail_sl:
+                        trail_sl = candidate
+                        position["trail_sl"] = trail_sl
+                    eff_sl = trail_sl
+                else:
+                    eff_sl = sl
+
+                if lo <= eff_sl:
+                    exit_price  = eff_sl
+                    exit_reason = "Trailing stop" if trail_act else "Stop loss"
+                    if not trail_act:
+                        cooldown = COOLDOWN_BARS
+                elif hi >= tp:
+                    exit_price, exit_reason = tp, "Take profit"
+                elif not trail_act and not bull_stack:
+                    exit_price, exit_reason = close, "Trend break"
+
+            else:  # SELL
+                if not trail_act and peak <= ep - r_dist * TRAIL_TRIGGER_R:
+                    trail_act = True
+                    trail_sl  = peak + atr_v * TRAIL_ATR_MULT
+                    position["trail_active"] = True
+                    position["trail_sl"]     = trail_sl
+
+                if trail_act:
+                    candidate = peak + atr_v * TRAIL_ATR_MULT
+                    if candidate < trail_sl:
+                        trail_sl = candidate
+                        position["trail_sl"] = trail_sl
+                    eff_sl = trail_sl
+                else:
+                    eff_sl = sl
+
+                if hi >= eff_sl:
+                    exit_price  = eff_sl
+                    exit_reason = "Trailing stop" if trail_act else "Stop loss"
+                    if not trail_act:
+                        cooldown = COOLDOWN_BARS
+                elif lo <= tp:
+                    exit_price, exit_reason = tp, "Take profit"
+                elif not trail_act and not bear_stack:
+                    exit_price, exit_reason = close, "Trend break"
+
+            if exit_price is not None:
+                sz       = position["size"]
+                notional = ep * sz                       # BUG 2 fix: fee on notional
+                fee      = notional * fee_rate * 2       # entry + exit sides
+                raw_pnl  = ((exit_price - ep) if side == "BUY"
+                            else (ep - exit_price)) * sz
+                net_pnl  = raw_pnl - fee
+                balance += net_pnl
+                trades.append({
+                    "side":       side,
+                    "entry":      round(ep,         6),
+                    "exit":       round(exit_price, 6),
+                    "sl":         round(sl,          6),
+                    "tp":         round(tp,          6),
+                    "size":       round(sz,          6),
+                    "r_dist":     round(r_dist,      6),
+                    "entry_time": position["time"],
+                    "exit_time":  t_str,
+                    "pnl":        round(net_pnl, 4),
+                    "reason":     exit_reason,
+                    "trail_used": trail_act,
+                })
+                position = None
+                cooldown = COOLDOWN_BARS   # pause after every exit
+
+            continue  # skip entry logic this bar
+
+        # ── Cooldown ──────────────────────────────────────────────────────
+        if cooldown > 0:
+            cooldown -= 1
             continue
 
-        # ── exit ──
-        side = position["side"]
-        ep   = position["entry"]
-        sl   = position["sl"]
-        tp   = position["tp"]
-        exit_price  = None
-        exit_reason = None
+        # ── Entry ─────────────────────────────────────────────────────────
+        if not trending:
+            continue   # ADX too low — choppy market, skip
 
-        if side == "BUY":
-            if lo <= sl:
-                exit_price, exit_reason = sl,    "Stop loss"
-            elif hi >= tp:
-                exit_price, exit_reason = tp,    "Take profit"
-            elif bearish:
-                exit_price, exit_reason = close, "Trend reversal"
-        else:
-            if hi >= sl:
-                exit_price, exit_reason = sl,    "Stop loss"
-            elif lo <= tp:
-                exit_price, exit_reason = tp,    "Take profit"
-            elif bullish:
-                exit_price, exit_reason = close, "Trend reversal"
+        if bull_stack and RSI_BUY_LO <= rsi_v <= RSI_BUY_HI:
+            sl_dist  = atr_v * SL_ATR_MULT          # BUG 3 fix: ATR-based SL
+            ep       = close * (1 + slip_rate)
+            sl_price = ep - sl_dist
+            tp_price = ep + sl_dist * REWARD_RISK
+            size     = risk_dollar / sl_dist if sl_dist > 0 else 0
+            if size > 0:
+                position = {
+                    "side": "BUY",  "entry": ep,       "time": t_str,
+                    "sl":   sl_price, "tp":  tp_price,
+                    "r_dist": sl_dist, "size": size,
+                    "trail_active": False, "trail_sl": sl_price,
+                    "peak": ep,
+                }
 
-        if exit_price is not None:
-            ret       = ((exit_price - ep) / ep) if side == "BUY" \
-                         else ((ep - exit_price) / ep)
-            risk_amt  = balance * risk_pct
-            gross_pnl = risk_amt * (ret / 0.005)
-            fee       = risk_amt * fee_rate * 2
-            net_pnl   = gross_pnl - fee
-            balance  += net_pnl
-            trades.append({
-                "side":       side,
-                "entry":      round(ep,         6),
-                "exit":       round(exit_price, 6),
-                "entry_time": position["time"],
-                "exit_time":  t_str,
-                "pnl":        round(net_pnl, 4),
-                "reason":     exit_reason,
-            })
-            position = None
+        elif bear_stack and RSI_SELL_LO <= rsi_v <= RSI_SELL_HI:
+            sl_dist  = atr_v * SL_ATR_MULT
+            ep       = close * (1 - slip_rate)
+            sl_price = ep + sl_dist
+            tp_price = ep - sl_dist * REWARD_RISK
+            size     = risk_dollar / sl_dist if sl_dist > 0 else 0
+            if size > 0:
+                position = {
+                    "side": "SELL", "entry": ep,       "time": t_str,
+                    "sl":   sl_price, "tp":  tp_price,
+                    "r_dist": sl_dist, "size": size,
+                    "trail_active": False, "trail_sl": sl_price,
+                    "peak": ep,
+                }
 
     return trades, balance
 
