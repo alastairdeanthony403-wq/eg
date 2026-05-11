@@ -85,10 +85,13 @@ export default function Dashboard() {
   const containerRef = useRef(null);
   const seriesRef    = useRef(null);
 
+  const [signalErrors, setSignalErrors] = useState([]);
+
   const loadSignals = useCallback(async () => {
     try {
       const { data } = await api.get(`/signals?interval=${interval}`);
       setSignals(data.signals || []);
+      setSignalErrors(data.errors  || []);
     } catch (e) {
       console.error("loadSignals failed:", e);
     } finally {
@@ -108,7 +111,9 @@ export default function Dashboard() {
 
   useEffect(() => { loadSignals(); loadTrades(); }, [loadSignals, loadTrades]);
   useEffect(() => {
-    const id = window.setInterval(loadSignals, 15000);
+    // Poll every 60 s — TwelveData free plan is 8 credits/min; 60 s gives the
+    // cache time to warm up before the next refresh hits uncached symbols.
+    const id = window.setInterval(loadSignals, 60000);
     return () => window.clearInterval(id);
   }, [loadSignals]);
 
@@ -226,7 +231,19 @@ export default function Dashboard() {
         </div>
       )}
 
-      {/* signal cards — grouped by market */}
+      {/* rate-limit / API error notice */}
+      {signalErrors.length > 0 && (
+        <div className="panel-flat border border-[var(--warn)] p-3 text-xs text-[var(--warn)] flex items-start gap-2">
+          <span className="shrink-0 mt-0.5">⚠</span>
+          <div>
+            <strong>{signalErrors.length} symbol(s) failed to load: </strong>
+            {signalErrors.map(e => e.symbol).join(", ")}.{" "}
+            {signalErrors.some(e => e.error?.includes("rate limit") || e.error?.includes("429"))
+              ? "TwelveData rate limit hit — prices will refresh automatically in ~60 s."
+              : "Check backend logs for details."}
+          </div>
+        </div>
+      )}
       {MARKET_GROUPS.map(({ label, symbols: groupSyms }) => (
         <div key={label}>
           <div className="section-title mb-3">{label}</div>

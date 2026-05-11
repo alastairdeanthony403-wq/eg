@@ -123,11 +123,34 @@ JWT_SECRET     = os.environ.get("JWT_SECRET", "ai-trading-engine-secret-change-m
 JWT_ALGO       = "HS256"
 JWT_EXPIRY_DAYS = 7
 
-MARKET_DATA_TTL_SECONDS = 30
-SUMMARY_TTL_SECONDS     = 20
+MARKET_DATA_TTL_SECONDS    = 30
+SUMMARY_TTL_SECONDS        = 60   # cache signals for 1 min — reduces TD calls dramatically
+NON_CRYPTO_CANDLE_TTL      = 300  # cache non-crypto candles for 5 min
 
-_raw_candle_cache = {}
-_summary_cache    = {}
+_raw_candle_cache    = {}
+_non_crypto_cache    = {}   # separate long-lived cache for TwelveData responses
+_summary_cache       = {}
+
+# ── TwelveData rate-limiter ──────────────────────────────────────────────────
+# Free plan: 8 credits/minute.  We enforce a minimum 8-second gap between
+# outgoing TD requests so we never fire more than ~7/min even under load.
+_td_lock            = __import__("threading").Lock()
+_td_last_call_time  = 0.0
+TD_MIN_INTERVAL_SEC = 8.0          # seconds between TwelveData HTTP calls
+
+
+def _td_rate_limited_get(params, timeout=25):
+    """Call TwelveData time_series, blocking until the rate-limit gap has passed."""
+    global _td_last_call_time
+    with _td_lock:
+        now     = time.time()
+        elapsed = now - _td_last_call_time
+        if elapsed < TD_MIN_INTERVAL_SEC:
+            time.sleep(TD_MIN_INTERVAL_SEC - elapsed)
+        _td_last_call_time = time.time()
+    r = requests.get("https://api.twelvedata.com/time_series",
+                     params=params, timeout=timeout)
+    return r
 
 BINANCE_BASE_URLS = [
     "https://api.binance.com",
@@ -475,10 +498,12 @@ def _td_symbol(symbol):
 def fetch_twelvedata_candles(symbol, interval, limit=200,
                               start_date=None, end_date=None):
     """
-    [B] Fetch candles from TwelveData.
-    If start_date / end_date (ISO strings "YYYY-MM-DD") are supplied the API
-    will return data for that historical window — enabling random backtesting
-    on non-crypto markets.  Without date params it returns the most recent data.
+    [B] Fetch candles from TwelveData with rate-limiting + long-lived caching.
+
+    Rate limit (free plan): 8 credits/minute.
+    We enforce ≥8 s between outgoing calls via _td_rate_limited_get().
+    Results are cached for NON_CRYPTO_CANDLE_TTL (5 min) so repeated
+    signals refreshes don't cost extra credits.
     """
     api_key = os.environ.get("TWELVEDATA_API_KEY", "")
     if not api_key:
@@ -495,6 +520,13 @@ def fetch_twelvedata_candles(symbol, interval, limit=200,
         )
 
     td_sym = _td_symbol(symbol)
+
+    # Cache key includes date range so backtest windows don't collide with signal fetches
+    nc_key = (symbol, interval, limit, start_date, end_date)
+    cached = _cache_get(_non_crypto_cache, nc_key, NON_CRYPTO_CANDLE_TTL)
+    if cached is not None:
+        return cached
+
     params = {
         "symbol":     td_sym,
         "interval":   td_interval,
@@ -508,8 +540,7 @@ def fetch_twelvedata_candles(symbol, interval, limit=200,
         params["end_date"] = end_date
 
     try:
-        r = requests.get("https://api.twelvedata.com/time_series",
-                         params=params, timeout=20)
+        r    = _td_rate_limited_get(params, timeout=25)
         data = r.json()
     except Exception as e:
         raise RuntimeError(f"TwelveData network error for {symbol}: {e}")
@@ -517,6 +548,12 @@ def fetch_twelvedata_candles(symbol, interval, limit=200,
     if "values" not in data:
         code    = data.get("code", "?")
         message = data.get("message", str(data)[:300])
+        if str(code) == "429":
+            raise RuntimeError(
+                f"TwelveData rate limit hit for {symbol}. "
+                f"The free plan allows 8 API credits/minute. "
+                f"Wait ~60 seconds and try again, or upgrade your TwelveData plan."
+            )
         raise RuntimeError(
             f"TwelveData API error for {symbol} ({td_sym}) [{code}]: {message}"
         )
@@ -542,6 +579,8 @@ def fetch_twelvedata_candles(symbol, interval, limit=200,
             item["close"],
             item.get("volume", 0),
         ])
+
+    _cache_set(_non_crypto_cache, nc_key, candles)
     return candles
 
 
@@ -569,20 +608,29 @@ def _random_date_window(market, period_days):
 
 
 def fetch_twelvedata_for_backtest(symbol, interval, period_days,
-                                  random_window=True, max_attempts=3):
+                                  random_window=True, max_attempts=2):
     """
     [C] Fetch non-crypto candles for backtesting.
-    Tries up to `max_attempts` random date windows; each attempt is logged
-    so the caller can surface a meaningful error if all fail.
+
+    Key change vs previous version:
+    • max_attempts defaulted to 2 (not 3) — each attempt costs ~8 s due to
+      the rate-limiter, so 2 attempts = max 16 s latency.
+    • Rate-limit errors (429) are NOT retried — they propagate immediately with
+      a clear message telling the user to wait 60 s.
+    • Only "thin data" (< 60 candles returned) triggers a second attempt with a
+      different random window.
     """
     market = detect_market(symbol)
     errors = []
 
-    # For very short intervals on the free plan, upgrade to 5m or 15m
-    # to avoid hitting the 800-row outputsize wall on 1m data
+    # Upgrade 1m → 5m for non-crypto (TwelveData free plan caps 1m at 800 rows)
     safe_interval = interval
     if interval == "1m" and market != "crypto":
         safe_interval = "5m"
+
+    iv_minutes = {"1m": 1, "5m": 5, "15m": 15, "30m": 30,
+                  "1h": 60, "4h": 240, "1d": 1440}.get(safe_interval, 5)
+    limit = min(5000, (period_days * 24 * 60) // iv_minutes + 10)
 
     for attempt in range(1, max_attempts + 1):
         if random_window:
@@ -596,10 +644,7 @@ def fetch_twelvedata_for_backtest(symbol, interval, period_days,
         try:
             candles = fetch_twelvedata_candles(
                 symbol, safe_interval,
-                limit=min(5000, period_days * 1440 // {
-                    "1m": 1, "5m": 5, "15m": 15, "30m": 30,
-                    "1h": 60, "4h": 240, "1d": 1440
-                }.get(safe_interval, 5)),
+                limit=limit,
                 start_date=start_date,
                 end_date=end_date,
             )
@@ -607,13 +652,24 @@ def fetch_twelvedata_for_backtest(symbol, interval, period_days,
                 return candles, safe_interval, start_date, end_date
             errors.append(
                 f"Attempt {attempt} ({start_date}→{end_date}): "
-                f"only {len(candles)} candles (need ≥60)"
+                f"only {len(candles)} candles returned (need ≥60)"
             )
-        except Exception as e:
-            errors.append(f"Attempt {attempt} ({start_date}→{end_date}): {e}")
+        except RuntimeError as e:
+            msg = str(e)
+            errors.append(f"Attempt {attempt} ({start_date}→{end_date}): {msg}")
+            # Don't retry rate-limit errors — just surface them immediately
+            if "rate limit" in msg.lower() or "429" in msg:
+                raise RuntimeError(
+                    f"TwelveData rate limit hit.\n"
+                    f"The free plan allows only 8 API credits per minute.\n"
+                    f"Please wait ~60 seconds then try again.\n\n"
+                    f"To fix permanently: upgrade your TwelveData plan at "
+                    f"https://twelvedata.com/pricing, or reduce how often the "
+                    f"signals page refreshes."
+                )
 
     raise RuntimeError(
-        f"Could not fetch enough candles for {symbol} after {max_attempts} attempts.\n"
+        f"Could not fetch enough candles for {symbol} after {max_attempts} attempt(s).\n"
         + "\n".join(errors)
     )
 
@@ -1252,12 +1308,35 @@ def get_symbols():
 @app.route("/api/signals", methods=["GET"])
 @auth_required
 def signals():
-    """[A][E] Signals for all 18 symbols using 5m interval."""
+    """
+    [A][E] Signals for all 18 symbols using 5m interval.
+
+    Rate-limit strategy:
+    - Crypto (Binance) symbols are free to poll — no TD credits used.
+    - Non-crypto symbols are cached for NON_CRYPTO_CANDLE_TTL (5 min).
+      On the first call all 14 non-crypto symbols are fetched sequentially
+      through the rate-limiter (8 s gap each = ~112 s total).
+      On subsequent calls within 5 min the cached data is returned instantly.
+    - The frontend polls every 15 s but most calls hit the cache.
+    """
     cfg      = get_user_config()
     strategy = request.args.get("strategy", "bot").lower()
     out      = []
     errors   = []
+
+    # Return cached summaries without waiting on TD for symbols we already have
+    fresh, needs_fetch = [], []
     for sym in ALL_SYMBOLS:
+        cache_key = (sym, strategy, SIGNALS_INTERVAL)
+        cached = _cache_get(_summary_cache, cache_key, SUMMARY_TTL_SECONDS)
+        if cached is not None:
+            fresh.append(cached)
+        else:
+            needs_fetch.append(sym)
+
+    # Return cached symbols immediately; fetch the rest
+    out.extend(fresh)
+    for sym in needs_fetch:
         try:
             s = get_symbol_summary(sym, strategy, SIGNALS_INTERVAL, cfg)
             if s:
@@ -1266,10 +1345,15 @@ def signals():
                 errors.append({"symbol": sym, "error": "No data returned"})
         except Exception as e:
             errors.append({"symbol": sym, "error": str(e)})
+
+    # Re-sort to the canonical order so the frontend always sees consistent ordering
+    order = {sym: i for i, sym in enumerate(ALL_SYMBOLS)}
+    out.sort(key=lambda s: order.get(s["symbol"], 999))
+
     return jsonify({
         "signals":     out,
         "last_update": now_str(),
-        "errors":      errors,        # surface per-symbol failures to the UI
+        "errors":      errors,
         "config":      cfg,
     })
 
