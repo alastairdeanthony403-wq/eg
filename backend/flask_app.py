@@ -1309,32 +1309,31 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
     """
 
     RISK_PER_TRADE        = 0.01
-    REWARD_RISK           = 2.5     # TP = 2.5R — achievable on intraday
-    SL_ATR_MULT           = 1.5     # SL = 1.5 × ATR
-    TRAIL_ACTIVATE_R      = 1.0     # activate trail at +1R profit
-    TRAIL_ATR_MULT        = 2.0     # FIX A: trail 2×ATR behind peak (was 1.0×)
-                                    # → gives winners room to run vs old 1×ATR
-    COOLDOWN_BARS         = 3
-    ADX_MIN               = 22
-    RSI_BUY_LO            = 48      # slightly tighter — better trend confirmation
-    RSI_BUY_HI            = 65
-    RSI_SELL_LO           = 35
-    RSI_SELL_HI           = 52
+    REWARD_RISK           = 3.0    # 3R target — bigger wins per trade
+    SL_ATR_MULT           = 1.5
+    MIN_SL_ATR_RATIO      = 1.2    # entry only if sl_dist >= 1.2×ATR (filters weak setups)
+    TRAIL_ACTIVATE_R      = 2.0    # trail activates at +2R (was 1R — activated too early)
+    TRAIL_ATR_MULT        = 1.5    # trail 1.5×ATR behind peak
+    COOLDOWN_BARS         = 2
+    ADX_MIN               = 25
+    RSI_BUY_LO            = 45
+    RSI_BUY_HI            = 75
+    RSI_SELL_LO           = 25
+    RSI_SELL_HI           = 55
     ATR_PERIOD            = 14
     RSI_PERIOD            = 14
     ADX_PERIOD            = 14
     WARMUP                = 55
-    MAX_NOTIONAL_FRACTION = 0.20
+    # No notional cap — size = risk_dollar / sl_dist so 1% risk is always fully used
 
-    trades        = []
-    balance       = float(starting_balance)
-    risk_dollar   = starting_balance * RISK_PER_TRADE
-    max_notional  = starting_balance * MAX_NOTIONAL_FRACTION
-    fee_rate      = fee_pct    / 100
-    slip_rate     = slippage_pct / 100
-    position      = None
-    cooldown      = 0
-    daily_loss_day = None   # FIX B: calendar date of last stop-loss
+    trades         = []
+    balance        = float(starting_balance)
+    risk_dollar    = starting_balance * RISK_PER_TRADE  # always full 1%
+    fee_rate       = fee_pct    / 100
+    slip_rate      = slippage_pct / 100
+    position       = None
+    cooldown       = 0
+    daily_loss_day = None
 
     if len(candles) < WARMUP + 10:
         return trades, balance
@@ -1376,6 +1375,9 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
         bull_stack = e9 > e21 > e50
         bear_stack = e9 < e21 < e50
         trending   = adx_v >= ADX_MIN
+        e9_prev    = ema9[i - 1]
+        bull_slope = e9_prev is not None and e9 > e9_prev
+        bear_slope = e9_prev is not None and e9 < e9_prev
 
         # ── Manage open position ──────────────────────────────────────────
         if position is not None:
@@ -1490,36 +1492,40 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
         if not trending:
             continue
 
-        if bull_stack and RSI_BUY_LO <= rsi_v <= RSI_BUY_HI:
-            sl_dist     = atr_v * SL_ATR_MULT
-            ep          = close * (1 + slip_rate)
-            sl_price    = ep - sl_dist
-            tp_price    = ep + sl_dist * REWARD_RISK
-            raw_size    = risk_dollar / sl_dist if sl_dist > 0 else 0
-            capped_size = min(raw_size, max_notional / ep) if ep > 0 else raw_size
-            if capped_size > 0:
+        if bull_stack and bull_slope and RSI_BUY_LO <= rsi_v <= RSI_BUY_HI:
+            sl_dist = atr_v * SL_ATR_MULT
+            # Quality gate: sl_dist must be at least MIN_SL_ATR_RATIO×ATR
+            # Filters out tiny-range candles that aren't real setups
+            if sl_dist < atr_v * MIN_SL_ATR_RATIO:
+                continue
+            ep       = close * (1 + slip_rate)
+            sl_price = ep - sl_dist
+            tp_price = ep + sl_dist * REWARD_RISK
+            size     = risk_dollar / sl_dist if sl_dist > 0 else 0
+            if size > 0:
                 position = {
                     "side": "BUY",  "entry": ep,      "time": t_str,
                     "sl":   sl_price, "tp":  tp_price,
-                    "r_dist": capped_size * sl_dist,
-                    "size": capped_size,
+                    "r_dist": risk_dollar,
+                    "size": size,
                     "trail_active": False, "trail_sl": sl_price,
                     "peak": ep,
                 }
 
-        elif bear_stack and RSI_SELL_LO <= rsi_v <= RSI_SELL_HI:
-            sl_dist     = atr_v * SL_ATR_MULT
-            ep          = close * (1 - slip_rate)
-            sl_price    = ep + sl_dist
-            tp_price    = ep - sl_dist * REWARD_RISK
-            raw_size    = risk_dollar / sl_dist if sl_dist > 0 else 0
-            capped_size = min(raw_size, max_notional / ep) if ep > 0 else raw_size
-            if capped_size > 0:
+        elif bear_stack and bear_slope and RSI_SELL_LO <= rsi_v <= RSI_SELL_HI:
+            sl_dist = atr_v * SL_ATR_MULT
+            if sl_dist < atr_v * MIN_SL_ATR_RATIO:
+                continue
+            ep       = close * (1 - slip_rate)
+            sl_price = ep + sl_dist
+            tp_price = ep - sl_dist * REWARD_RISK
+            size     = risk_dollar / sl_dist if sl_dist > 0 else 0
+            if size > 0:
                 position = {
                     "side": "SELL", "entry": ep,      "time": t_str,
                     "sl":   sl_price, "tp":  tp_price,
-                    "r_dist": capped_size * sl_dist,
-                    "size": capped_size,
+                    "r_dist": risk_dollar,
+                    "size": size,
                     "trail_active": False, "trail_sl": sl_price,
                     "peak": ep,
                 }
