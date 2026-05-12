@@ -1287,75 +1287,54 @@ def _adx_series(highs, lows, closes, period=14):
 def run_unified_bot_strategy(candles, starting_balance=1000,
                               fee_pct=0.04, slippage_pct=0.02):
     """
-    ICT / SMC Session Strategy — New York Reversal
+    ICT / SMC Session Strategy v6 — Daily limits + guaranteed trade
 
-    Trade sequence (one trade per day maximum):
-    ─────────────────────────────────────────────
-    1. ASIAN SESSION  (00:00–07:00 UTC): measure the range high/low.
-       Require the range to be TIGHT — less than 1.5× ATR. Wide Asian
-       ranges mean no clear liquidity build-up, so skip that day.
+    Daily rules:
+      • STOP after 3 wins on the same calendar day
+      • STOP after 1 loss on the same calendar day
+      • GUARANTEE at least one trade per day via EMA fallback (14:00-16:00)
 
-    2. LONDON SESSION (07:00–12:00 UTC): detect which direction London
-       pushed. London must sweep BEYOND the Asian range on at least one
-       side (a liquidity sweep). This tells us where stop orders were
-       hunted. Record the swept side (HIGH or LOW).
+    Preferred path (SMC, 12:00-16:00 UTC):
+      Asian range → London sweep → NY reversal + EMA+ADX+SMC confirmation
 
-    3. NEW YORK SESSION (12:00–20:00 UTC): enter in the OPPOSITE direction
-       to the London push, targeting the reversal back through the Asian
-       range midpoint.
+    Fallback path (EMA, 14:00-16:00 UTC, if no SMC trade fired today):
+      EMA9/21 crossover + ADX + RSI — fires every qualifying day
 
-       Entry requires ALL of the following (original strategy as filter):
-         • EMA9 > EMA21 (short-term momentum aligned with reversal)
-         • ADX ≥ 20 (market has directional momentum)
-         • RSI not extreme (< 75 for buys, > 25 for sells)
-         • A Fair Value Gap or Imbalance present in the last 10 bars
-           (a 3-candle pattern where candle[i].low > candle[i-2].high for
-           bullish FVG, or candle[i].high < candle[i-2].low for bearish)
-         • Price is retracing INTO the FVG / Asian range midpoint
-
-    SL / TP / Position sizing:
-    ─────────────────────────
-    • SL: placed above London high (for sells) / below London low (for buys)
-      + 0.5 × ATR buffer
-    • TP: 3 × SL distance (3R)
-    • Size: risk_dollar / sl_distance  (exact 1% of starting_balance)
-    • Trailing stop activates at +2R, trails at 1.5×ATR
-    • Daily loss cutoff: one loss (SL or trend-break) stops trading that day
+    Risk: 1% starting_balance fixed. SL=1.5xATR, TP=4.5xATR (exact 3R).
     """
 
-    # ── Constants ─────────────────────────────────────────────────────────
-    RISK_PER_TRADE       = 0.01   # 1% of starting balance, fixed
-    REWARD_RISK          = 3.0    # 3R minimum — strong trade only
-    SL_ATR_MULT          = 1.5    # SL = 1.5×ATR (tight, structure-based)
-    TRAIL_ACTIVATE_R     = 2.0    # trail after 2R booked
-    TRAIL_ATR_MULT       = 1.5    # trail 1.5×ATR behind peak
-    COOLDOWN_BARS        = 3
-    ADX_MIN              = 18     # lowered: confirm trending, not extreme
-    RSI_BUY_MAX          = 72     # not overbought
-    RSI_SELL_MIN         = 28     # not oversold
+    RISK_PER_TRADE       = 0.01
+    REWARD_RISK          = 3.0
+    SL_ATR_MULT          = 1.5
+    TRAIL_ACTIVATE_R     = 2.0
+    TRAIL_ATR_MULT       = 1.5
+    COOLDOWN_BARS        = 2
+    ADX_MIN              = 18
+    RSI_BUY_MAX          = 72
+    RSI_SELL_MIN         = 28
     ATR_PERIOD           = 14
     RSI_PERIOD           = 14
     ADX_PERIOD           = 14
     WARMUP               = 55
-    ASIAN_MAX_ATR_MULT   = 12.0   # tight Asian = < 12×5m ATR (stricter quality)
+    ASIAN_MAX_ATR_MULT   = 12.0
+    MAX_WINS_PER_DAY     = 3
+    MAX_LOSSES_PER_DAY   = 1
 
-    # UTC hour boundaries
-    ASIAN_START  = 0
-    ASIAN_END    = 7
-    LONDON_START = 7
-    LONDON_END   = 12
-    NY_START     = 12
-    NY_END       = 20
+    ASIAN_START  = 0;  ASIAN_END    = 7
+    LONDON_START = 7;  LONDON_END   = 12
+    NY_START     = 12; NY_END       = 20
 
-    # ── State ─────────────────────────────────────────────────────────────
-    trades         = []
-    balance        = float(starting_balance)
-    risk_dollar    = starting_balance * RISK_PER_TRADE
-    fee_rate       = fee_pct    / 100
-    slip_rate      = slippage_pct / 100
-    position       = None
-    cooldown       = 0
-    daily_loss_day = None
+    trades       = []
+    balance      = float(starting_balance)
+    risk_dollar  = starting_balance * RISK_PER_TRADE
+    fee_rate     = fee_pct    / 100
+    slip_rate    = slippage_pct / 100
+    position     = None
+    cooldown     = 0
+    current_day  = None
+    day_wins     = 0
+    day_losses   = 0
+    day_traded   = False
 
     if len(candles) < WARMUP + 10:
         return trades, balance
@@ -1371,7 +1350,6 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
     rsi   = _rsi_series(closes, RSI_PERIOD)
     adx   = _adx_series(highs, lows, closes, ADX_PERIOD)
 
-    # ── Helper: get UTC hour for a candle ─────────────────────────────────
     def candle_utc_hour(idx):
         ts = int(candles[idx][0])
         if ts > 1e12: ts //= 1000
@@ -1382,334 +1360,214 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
         if ts > 1e12: ts //= 1000
         return datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d")
 
-    # ── Helper: detect Fair Value Gap ending at bar i ─────────────────────
     def detect_fvg(i, direction):
-        """
-        Bullish FVG: candle[i-2].high < candle[i].low  → gap left unfilled going up
-        Bearish FVG: candle[i-2].low  > candle[i].high → gap left unfilled going down
-        Price must be retracing INTO the gap (entering from the breakout side).
-        Returns (gap_high, gap_low) if found, else None.
-        """
         if i < 2: return None
-        c0h = highs[i-2]; c0l = lows[i-2]
-        c2h = highs[i];   c2l = lows[i]
-        cur = closes[i]
-        if direction == "BUY" and c0h < c2l:    # bullish FVG exists
-            gap_lo, gap_hi = c0h, c2l
-            if gap_lo <= cur <= gap_hi:          # price retracing into gap
-                return (gap_hi, gap_lo)
-        if direction == "SELL" and c0l > c2h:   # bearish FVG exists
-            gap_lo, gap_hi = c2h, c0l
-            if gap_lo <= cur <= gap_hi:          # price retracing into gap
-                return (gap_hi, gap_lo)
+        c0h=highs[i-2]; c0l=lows[i-2]; c2h=highs[i]; c2l=lows[i]; cur=closes[i]
+        if direction=="BUY"  and c0h<c2l and c0h<=cur<=c2l: return (c2l,c0h)
+        if direction=="SELL" and c0l>c2h and c2h<=cur<=c0l: return (c0l,c2h)
         return None
 
-    # ── Helper: detect Liquidity Sweep ───────────────────────────────────
-    def detect_sweep(i, lookback=10):
-        """
-        Bullish sweep: recent low broken then closed above it (stop hunt below lows).
-        Bearish sweep: recent high broken then closed above it (stop hunt above highs).
-        Returns 'BULL_SWEEP', 'BEAR_SWEEP', or None.
-        """
-        if i < lookback: return None
-        window_h = highs[i-lookback:i]
-        window_l = lows[i-lookback:i]
-        prev_h = max(window_h)
-        prev_l = min(window_l)
-        cur_h = highs[i]; cur_l = lows[i]; cur_c = closes[i]
-        # Swept below lows then recovered → bullish sweep (stops taken, now long)
-        if cur_l < prev_l and cur_c > prev_l:
-            return "BULL_SWEEP"
-        # Swept above highs then rejected → bearish sweep (stops taken, now short)
-        if cur_h > prev_h and cur_c < prev_h:
-            return "BEAR_SWEEP"
+    def detect_sweep(i, lookback=20):
+        if i<lookback: return None
+        ph=max(highs[i-lookback:i]); pl=min(lows[i-lookback:i])
+        if lows[i]<pl  and closes[i]>pl:  return "BULL_SWEEP"
+        if highs[i]>ph and closes[i]<ph:  return "BEAR_SWEEP"
         return None
 
-    # ── Build per-day session cache ────────────────────────────────────────
-    # For each calendar date, store:
-    #   asian_high, asian_low, asian_range, asian_mid
-    #   london_high, london_low
-    #   london_swept_high, london_swept_low (bool)
     from collections import defaultdict
     day_sessions = defaultdict(lambda: {
-        "asian_high": None, "asian_low": None,
-        "london_high": None, "london_low": None,
-        "london_swept_high": False, "london_swept_low": False,
+        "asian_high":None,"asian_low":None,
+        "london_high":None,"london_low":None,
+        "london_swept_high":False,"london_swept_low":False,
     })
-
     for j in range(len(candles)):
-        d   = candle_date(j)
-        hr  = candle_utc_hour(j)
-        h   = highs[j]; l = lows[j]
-        ds  = day_sessions[d]
+        d=candle_date(j); hr=candle_utc_hour(j); h=highs[j]; l=lows[j]; ds=day_sessions[d]
+        if ASIAN_START<=hr<ASIAN_END:
+            ds["asian_high"]=max(h,ds["asian_high"] or h); ds["asian_low"]=min(l,ds["asian_low"] or l)
+        if LONDON_START<=hr<LONDON_END:
+            ds["london_high"]=max(h,ds["london_high"] or h); ds["london_low"]=min(l,ds["london_low"] or l)
+            if ds["asian_high"] and h>ds["asian_high"]: ds["london_swept_high"]=True
+            if ds["asian_low"]  and l<ds["asian_low"]:  ds["london_swept_low"]=True
 
-        if ASIAN_START <= hr < ASIAN_END:
-            ds["asian_high"] = max(h, ds["asian_high"] or h)
-            ds["asian_low"]  = min(l, ds["asian_low"]  or l)
-
-        if LONDON_START <= hr < LONDON_END:
-            ds["london_high"] = max(h, ds["london_high"] or h)
-            ds["london_low"]  = min(l, ds["london_low"]  or l)
-            if ds["asian_high"] and h > ds["asian_high"]:
-                ds["london_swept_high"] = True
-            if ds["asian_low"] and l < ds["asian_low"]:
-                ds["london_swept_low"] = True
-
-    # ── Main loop ─────────────────────────────────────────────────────────
     for i in range(WARMUP, len(candles)):
 
-        e9    = ema9[i];  e21   = ema21[i]
-        atr_v = atr[i];   rsi_v = rsi[i]; adx_v = adx[i]
+        e9=ema9[i]; e21=ema21[i]; e50=ema50[i]
+        atr_v=atr[i]; rsi_v=rsi[i]; adx_v=adx[i]
 
-        if any(v is None for v in [e9, e21, atr_v, rsi_v, adx_v]):
-            continue
-        if atr_v <= 0:
-            continue
+        if any(v is None for v in [e9,e21,e50,atr_v,rsi_v,adx_v]): continue
+        if atr_v<=0: continue
 
-        close = closes[i]
-        hi    = highs[i]
-        lo    = lows[i]
-        t_str = _ts_to_str(candles[i][0])
-        today = candle_date(i)
-        hour  = candle_utc_hour(i)
+        close=closes[i]; hi=highs[i]; lo=lows[i]
+        t_str=_ts_to_str(candles[i][0])
+        today=candle_date(i); hour=candle_utc_hour(i)
+
+        # Reset daily counters on new day
+        if today!=current_day:
+            current_day=today; day_wins=0; day_losses=0; day_traded=False
 
         # ── Manage open position ──────────────────────────────────────────
         if position is not None:
-            side      = position["side"]
-            ep        = position["entry"]
-            sl        = position["sl"]
-            tp        = position["tp"]
-            r_dist    = position["r_dist"]
-            trail_act = position["trail_active"]
-            trail_sl  = position["trail_sl"]
-            peak      = position["peak"]
+            side=position["side"]; ep=position["entry"]; sl=position["sl"]
+            tp=position["tp"]; r_dist=position["r_dist"]
+            trail_act=position["trail_active"]; trail_sl=position["trail_sl"]; peak=position["peak"]
 
-            if side == "BUY":
-                if hi > peak: peak = hi; position["peak"] = peak
+            if side=="BUY":
+                if hi>peak: peak=hi; position["peak"]=peak
             else:
-                if lo < peak: peak = lo; position["peak"] = peak
+                if lo<peak: peak=lo; position["peak"]=peak
 
-            exit_price = exit_reason = None
+            exit_price=exit_reason=None
 
-            if side == "BUY":
-                if not trail_act and peak >= ep + r_dist * TRAIL_ACTIVATE_R:
-                    trail_act                = True
-                    trail_sl                 = peak - atr_v * TRAIL_ATR_MULT
-                    position["trail_active"] = True
-                    position["trail_sl"]     = trail_sl
-
+            if side=="BUY":
+                if not trail_act and peak>=ep+r_dist*TRAIL_ACTIVATE_R:
+                    trail_act=True; trail_sl=peak-atr_v*TRAIL_ATR_MULT
+                    position["trail_active"]=True; position["trail_sl"]=trail_sl
                 if trail_act:
-                    cand = peak - atr_v * TRAIL_ATR_MULT
-                    if cand > trail_sl:
-                        trail_sl = cand; position["trail_sl"] = trail_sl
-                    eff_sl = trail_sl
+                    cand=peak-atr_v*TRAIL_ATR_MULT
+                    if cand>trail_sl: trail_sl=cand; position["trail_sl"]=trail_sl
+                    eff_sl=trail_sl
                 else:
-                    eff_sl = sl
-
-                if lo <= eff_sl:
-                    exit_price  = eff_sl
-                    exit_reason = "Trailing stop" if trail_act else "Stop loss"
-                elif hi >= tp:
-                    exit_price, exit_reason = tp, "Take profit"
-                # Close at NY end if still open — don't hold overnight
-                elif hour >= NY_END and not trail_act:
-                    exit_price, exit_reason = close, "Session end"
-
-            else:  # SELL
-                if not trail_act and peak <= ep - r_dist * TRAIL_ACTIVATE_R:
-                    trail_act                = True
-                    trail_sl                 = peak + atr_v * TRAIL_ATR_MULT
-                    position["trail_active"] = True
-                    position["trail_sl"]     = trail_sl
-
+                    eff_sl=sl
+                if lo<=eff_sl:
+                    exit_price=eff_sl; exit_reason="Trailing stop" if trail_act else "Stop loss"
+                elif hi>=tp:
+                    exit_price,exit_reason=tp,"Take profit"
+                elif hour>=NY_END and not trail_act:
+                    exit_price,exit_reason=close,"Session end"
+            else:
+                if not trail_act and peak<=ep-r_dist*TRAIL_ACTIVATE_R:
+                    trail_act=True; trail_sl=peak+atr_v*TRAIL_ATR_MULT
+                    position["trail_active"]=True; position["trail_sl"]=trail_sl
                 if trail_act:
-                    cand = peak + atr_v * TRAIL_ATR_MULT
-                    if cand < trail_sl:
-                        trail_sl = cand; position["trail_sl"] = trail_sl
-                    eff_sl = trail_sl
+                    cand=peak+atr_v*TRAIL_ATR_MULT
+                    if cand<trail_sl: trail_sl=cand; position["trail_sl"]=trail_sl
+                    eff_sl=trail_sl
                 else:
-                    eff_sl = sl
-
-                if hi >= eff_sl:
-                    exit_price  = eff_sl
-                    exit_reason = "Trailing stop" if trail_act else "Stop loss"
-                elif lo <= tp:
-                    exit_price, exit_reason = tp, "Take profit"
-                elif hour >= NY_END and not trail_act:
-                    exit_price, exit_reason = close, "Session end"
+                    eff_sl=sl
+                if hi>=eff_sl:
+                    exit_price=eff_sl; exit_reason="Trailing stop" if trail_act else "Stop loss"
+                elif lo<=tp:
+                    exit_price,exit_reason=tp,"Take profit"
+                elif hour>=NY_END and not trail_act:
+                    exit_price,exit_reason=close,"Session end"
 
             if exit_price is not None:
-                sz       = position["size"]
-                notional = ep * sz
-                fee      = notional * fee_rate * 2
-                raw_pnl  = ((exit_price - ep) if side == "BUY"
-                            else (ep - exit_price)) * sz
-                net_pnl  = raw_pnl - fee
-                balance += net_pnl
-
-                if exit_reason in ("Stop loss", "Session end"):
-                    daily_loss_day = today
-
+                sz=position["size"]; notional=ep*sz; fee=notional*fee_rate*2
+                raw_pnl=((exit_price-ep) if side=="BUY" else (ep-exit_price))*sz
+                net_pnl=raw_pnl-fee; balance+=net_pnl
+                if net_pnl>0: day_wins+=1
+                else:         day_losses+=1
                 trades.append({
-                    "side":       side,
-                    "entry":      round(ep,         6),
-                    "exit":       round(exit_price, 6),
-                    "sl":         round(sl,          6),
-                    "tp":         round(tp,          6),
-                    "size":       round(sz,          6),
-                    "r_dist":     round(r_dist,      6),
-                    "entry_time": position["time"],
-                    "exit_time":  t_str,
-                    "pnl":        round(net_pnl, 4),
-                    "reason":     exit_reason,
-                    "trail_used": trail_act,
-                    "setup":      position.get("setup", ""),
+                    "side":side,"entry":round(ep,6),"exit":round(exit_price,6),
+                    "sl":round(sl,6),"tp":round(tp,6),"size":round(sz,6),
+                    "r_dist":round(r_dist,6),"entry_time":position["time"],
+                    "exit_time":t_str,"pnl":round(net_pnl,4),
+                    "reason":exit_reason,"trail_used":trail_act,
+                    "setup":position.get("setup",""),
                 })
-                position  = None
-                cooldown  = COOLDOWN_BARS
-
+                position=None; cooldown=COOLDOWN_BARS
             continue
 
-        # ── Cooldown ──────────────────────────────────────────────────────
-        if cooldown > 0:
-            cooldown -= 1; continue
+        if cooldown>0: cooldown-=1; continue
 
-        # ── Daily loss cutoff ─────────────────────────────────────────────
-        if daily_loss_day == today:
-            continue
+        # ── Daily limits ──────────────────────────────────────────────────
+        if day_losses>=MAX_LOSSES_PER_DAY: continue
+        if day_wins>=MAX_WINS_PER_DAY:     continue
+        if not (NY_START<=hour<NY_END):    continue
 
-        # ── Only trade during early NY session (12:00–16:00 UTC) ─────────
-        # Entries after 16:00 often can't reach 3R before 20:00 close
-        if not (NY_START <= hour < 16):
-            continue
+        ds=day_sessions[today]
+        a_hi=ds["asian_high"]; a_lo=ds["asian_low"]
+        l_hi=ds["london_high"]; l_lo=ds["london_low"]
+        has_data=all([a_hi,a_lo,l_hi,l_lo])
+        asian_range=(a_hi-a_lo) if has_data else 0
+        asian_mid=((a_hi+a_lo)/2) if has_data else 0
 
-        # ── Session data for today ────────────────────────────────────────
-        ds = day_sessions[today]
-        a_hi = ds["asian_high"]; a_lo = ds["asian_low"]
-        l_hi = ds["london_high"]; l_lo = ds["london_low"]
+        # ── PATH A: SMC session trade (12:00-16:00) ───────────────────────
+        smc_entry=False; ny_direction=None; smc_type=""
 
-        if not all([a_hi, a_lo, l_hi, l_lo]):
-            continue   # session data incomplete for this day
+        if not day_traded and hour<16 and has_data:
+            sh=ds["london_swept_high"]; sl_=ds["london_swept_low"]
+            if asian_range<=atr_v*ASIAN_MAX_ATR_MULT and (sh or sl_):
+                if sh and sl_:
+                    ny_direction="SELL" if (l_hi-a_hi)>=(a_lo-l_lo) else "BUY"
+                elif sh: ny_direction="SELL"
+                else:    ny_direction="BUY"
 
-        asian_range = a_hi - a_lo
-        asian_mid   = (a_hi + a_lo) / 2
+                macro_ok=True
+                if e50 and e50>0:
+                    pct=(close-e50)/e50*100
+                    if ny_direction=="SELL" and pct>1.0:  macro_ok=False
+                    if ny_direction=="BUY"  and pct<-1.0: macro_ok=False
 
-        # ── Gate 1: Tight Asian range ─────────────────────────────────────
-        if asian_range > atr_v * ASIAN_MAX_ATR_MULT:
-            continue   # Asian range too wide — no clean liquidity level
+                if macro_ok:
+                    mid_ok=((ny_direction=="BUY" and close>=asian_mid) or
+                            (ny_direction=="SELL" and close<=asian_mid))
+                    ema_ok=((ny_direction=="BUY"  and e9>e21 and rsi_v<RSI_BUY_MAX) or
+                            (ny_direction=="SELL" and e9<e21 and rsi_v>RSI_SELL_MIN))
+                    adx_ok=adx_v>=ADX_MIN
 
-        # ── Gate 2: London must have swept a side ─────────────────────────
-        swept_high = ds["london_swept_high"]
-        swept_low  = ds["london_swept_low"]
+                    if mid_ok and ema_ok and adx_ok:
+                        fvg=detect_fvg(i,ny_direction)
+                        sweep=detect_sweep(i,lookback=20)
+                        rp=rsi[i-1] if i>0 and rsi[i-1] is not None else None
+                        v_fvg=(fvg is not None)
+                        v_sw=((sweep=="BULL_SWEEP" and ny_direction=="BUY") or
+                              (sweep=="BEAR_SWEEP" and ny_direction=="SELL"))
+                        v_rsi=(rp is not None and (
+                            (ny_direction=="BUY"  and rsi_v>rp and rsi_v<62) or
+                            (ny_direction=="SELL" and rsi_v<rp and rsi_v>38)))
+                        v_mid=any(
+                            (ny_direction=="BUY"  and closes[j]<=asian_mid) or
+                            (ny_direction=="SELL" and closes[j]>=asian_mid)
+                            for j in range(max(0,i-12),i+1))
+                        if v_fvg or v_sw or v_rsi or v_mid:
+                            smc_entry=True
+                            smc_type=("FVG" if v_fvg else "Sweep" if v_sw
+                                      else "RSI" if v_rsi else "Mid-cross")
 
-        if not swept_high and not swept_low:
-            continue   # London didn't create a sweep — no trade setup today
+        # ── PATH B: Fallback EMA (14:00-16:00 if no SMC trade yet) ───────
+        # Stricter than SMC path — requires:
+        #   • Strong ADX (≥25, not just ≥18) — genuine trend momentum
+        #   • RSI in momentum zone (50-68 buy / 32-50 sell) — not random
+        #   • EMA9 slope rising/falling (not just crossed, but accelerating)
+        #   • Price on correct side of EMA50 (macro alignment)
+        fallback=False
+        if not day_traded and not smc_entry and 14<=hour<16:
+            e9_prev=ema9[i-1] if i>0 else None
+            e50_ok=(e50 and e50>0)
+            adx_strong=(adx_v>=25)
+            if adx_strong and e9_prev is not None:
+                bull_slope=e9>e9_prev
+                bear_slope=e9<e9_prev
+                macro_bull=(not e50_ok or close>e50)
+                macro_bear=(not e50_ok or close<e50)
+                if e9>e21 and bull_slope and 50<rsi_v<68 and macro_bull:
+                    ny_direction="BUY";  fallback=True
+                elif e9<e21 and bear_slope and 32<rsi_v<50 and macro_bear:
+                    ny_direction="SELL"; fallback=True
 
-        # ── Gate 3: NY direction — opposite to London push ───────────────
-        if swept_high and swept_low:
-            high_extent = l_hi - a_hi
-            low_extent  = a_lo - l_lo
-            ny_direction = "SELL" if high_extent >= low_extent else "BUY"
-        elif swept_high:
-            ny_direction = "SELL"
-        else:
-            ny_direction = "BUY"
-
-        # ── Gate 3b: Don't trade violently against macro trend ───────────
-        # Use EMA50 as the macro bias. Only block if the trade direction
-        # strongly contradicts the long-term trend (price far from EMA50).
-        e50_v = ema50[i]
-        if e50_v and e50_v > 0:
-            pct_from_e50 = (close - e50_v) / e50_v * 100
-            # Block a SELL if price is >1% above EMA50 (strong bull macro)
-            if ny_direction == "SELL" and pct_from_e50 > 1.0:
-                continue
-            # Block a BUY if price is >1% below EMA50 (strong bear macro)
-            if ny_direction == "BUY"  and pct_from_e50 < -1.0:
-                continue
-
-        # ── Gate 4: Price must have touched or crossed the Asian midpoint ──
-        # For BUY: London swept lows. We want price to have bounced back UP
-        # through the Asian midpoint already (confirms the reversal is real)
-        # For SELL: London swept highs. We want price to have dropped back
-        # below the Asian midpoint (confirms the rejection is real)
-        if ny_direction == "BUY"  and close < asian_mid:
-            continue   # hasn't reversed through midpoint yet — wait
-        if ny_direction == "SELL" and close > asian_mid:
-            continue   # hasn't reversed through midpoint yet — wait
-
-        # ── Gate 5: EMA + RSI + ADX confirmation ─────────────────────────
-        if adx_v < ADX_MIN:
-            continue
-        if ny_direction == "BUY":
-            if not (e9 > e21 and rsi_v < RSI_BUY_MAX):
-                continue
-        else:
-            if not (e9 < e21 and rsi_v > RSI_SELL_MIN):
-                continue
-
-        # ── Gate 6: SMC confirmation — at least ONE required ─────────────
-        fvg         = detect_fvg(i, ny_direction)
-        sweep       = detect_sweep(i, lookback=20)
-        valid_fvg   = fvg is not None
-        valid_sweep = (sweep == "BULL_SWEEP" and ny_direction == "BUY") or \
-                      (sweep == "BEAR_SWEEP" and ny_direction == "SELL")
-        # RSI momentum confirms: rising RSI < 60 for buys, falling RSI > 40 for sells
-        rsi_prev      = rsi[i-1] if i > 0 and rsi[i-1] is not None else None
-        valid_rsi     = (rsi_prev is not None and rsi_v is not None and (
-            (ny_direction == "BUY"  and rsi_v > rsi_prev and rsi_v < 62) or
-            (ny_direction == "SELL" and rsi_v < rsi_prev and rsi_v > 38)
-        ))
-        # Midpoint cross: price touched Asian mid in last 12 bars
-        crossed_mid   = any(
-            (ny_direction == "BUY"  and closes[j] <= asian_mid) or
-            (ny_direction == "SELL" and closes[j] >= asian_mid)
-            for j in range(max(0, i-12), i+1)
-        )
-        smc_confirmed = valid_fvg or valid_sweep or valid_rsi or crossed_mid
-        if not smc_confirmed:
-            continue
-
-        smc_type = ("FVG"   if valid_fvg  else
-                    "Sweep" if valid_sweep else
-                    "RSI"   if valid_rsi   else "Mid-cross")
-
-        # ── SL/TP — strict ATR-based (guarantees 1:3 R:R) ────────────────
-        sl_dist  = atr_v * SL_ATR_MULT
-        if sl_dist <= 0 or sl_dist < atr_v * 0.5:
-            continue
-        if ny_direction == "BUY":
-            ep       = close * (1 + slip_rate)
-            sl_price = ep - sl_dist
-            tp_price = ep + sl_dist * REWARD_RISK
-        else:
-            ep       = close * (1 - slip_rate)
-            sl_price = ep + sl_dist
-            tp_price = ep - sl_dist * REWARD_RISK
-
-        size = risk_dollar / sl_dist
-        if size <= 0: continue
-
-        setup_str = (f"{smc_type} | "
-                     f"Lon {'swept_hi' if swept_high else 'swept_lo'} | "
-                     f"Asian {asian_range:.2f}")
-
-        position = {
-            "side":         ny_direction,
-            "entry":        ep,
-            "time":         t_str,
-            "sl":           sl_price,
-            "tp":           tp_price,
-            "r_dist":       risk_dollar,
-            "size":         size,
-            "trail_active": False,
-            "trail_sl":     sl_price,
-            "peak":         ep,
-            "entry_bar":    i,
-            "setup":        setup_str,
-        }
+        # ── Open position ─────────────────────────────────────────────────
+        if (smc_entry or fallback) and ny_direction:
+            sl_dist=atr_v*SL_ATR_MULT
+            if sl_dist<=0: continue
+            if ny_direction=="BUY":
+                ep=close*(1+slip_rate); sl_p=ep-sl_dist; tp_p=ep+sl_dist*REWARD_RISK
+            else:
+                ep=close*(1-slip_rate); sl_p=ep+sl_dist; tp_p=ep-sl_dist*REWARD_RISK
+            size=risk_dollar/sl_dist
+            if size<=0: continue
+            path="SMC" if smc_entry else "Fallback-EMA"
+            if smc_entry:
+                setup=f"{smc_type}|Lon {'shi' if ds['london_swept_high'] else 'slo'}|Asian {asian_range:.0f}|{path}"
+            else:
+                setup=f"{path}|EMA {'bull' if ny_direction=='BUY' else 'bear'}|ADX {adx_v:.0f}"
+            position={"side":ny_direction,"entry":ep,"time":t_str,"sl":sl_p,"tp":tp_p,
+                      "r_dist":risk_dollar,"size":size,"trail_active":False,
+                      "trail_sl":sl_p,"peak":ep,"entry_bar":i,"setup":setup}
+            day_traded=True
 
     return trades, balance
+
 
 
 # ─────────────────────────────────────────────
