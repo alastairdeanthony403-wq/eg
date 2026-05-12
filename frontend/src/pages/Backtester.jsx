@@ -10,7 +10,7 @@ import {
 const MARKET_GROUPS = {
   Crypto:      ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"],
   Forex:       ["EURUSD",  "GBPUSD",  "USDJPY",  "AUDUSD",  "USDCAD"],
-  Stocks:      ["AAPL",    "TSLA",    "NVDA",    "MSFT",    "AMZN"],
+  Stocks:      ["AAPL",    "TSLA",    "NVDA",    "MSFT",    "AMZN", "SPY"],
   Commodities: ["XAUUSD",  "XAGUSD",  "USOIL",   "UKOIL"],
 };
 
@@ -19,8 +19,14 @@ const ALL_SYMBOLS = Object.values(MARKET_GROUPS).flat();
 
 const INTERVALS   = ["1m", "5m", "15m", "1h", "4h"];
 const STRATEGIES  = [
-  { value: "unified_bot", label: "Unified Bot (EMA + RSI)" },
-  { value: "simple_ma",   label: "Simple MA Crossover" },
+  { value: "unified_bot", label: "Unified Bot (SMC Session)",
+    desc: "ICT/SMC — Asian range, London sweep, NY reversal. Daily limits: 3 wins max, 1 loss max." },
+  { value: "orb_0dte",    label: "0DTE Opening Range Breakout",
+    desc: "SPY options simulation. Mon/Wed/Fri only. 5-min ORB with +100% TP / -50% SL. 2% risk." },
+  { value: "vwap_ema",    label: "VWAP + EMA Trend",
+    desc: "9/21 EMA cross after 10:30 ET, VWAP support/resistance filter. 2-part scaling: 50% at 75% ADR, trail remainder at 1×ATR. 2% risk." },
+  { value: "simple_ma",   label: "Simple MA Crossover",
+    desc: "10/30 SMA crossover baseline strategy." },
 ];
 
 // ── Price formatter matching backend format_price() ─────────────────────────
@@ -259,6 +265,19 @@ export default function Backtester() {
                 <option key={s.value} value={s.value}>{s.label}</option>
               ))}
             </select>
+            <div className="text-xs text-[var(--text-dim)] mt-1">
+              {STRATEGIES.find(s => s.value === strategy)?.desc}
+            </div>
+            {strategy === "orb_0dte" && market !== "Stocks" && (
+              <div className="text-xs text-[var(--warn)] mt-1">
+                ⚠ ORB is designed for SPY — select SPY from Stocks
+              </div>
+            )}
+            {strategy === "vwap_ema" && (
+              <div className="text-xs text-[var(--accent-2)] mt-1">
+                ℹ Best with 5m interval and stock symbols (SPY, AAPL, TSLA)
+              </div>
+            )}
           </div>
 
           {/* Period */}
@@ -492,13 +511,13 @@ export default function Backtester() {
           </p>
           <div className="mt-6 grid sm:grid-cols-2 gap-3 max-w-lg mx-auto text-left text-xs text-[var(--text-dim)]">
             {[
-              ["Crypto",      "Real Binance candle history back to 2020"],
-              ["Forex",       "EUR/USD, GBP/USD, USD/JPY, AUD/USD, USD/CAD"],
-              ["Stocks",      "AAPL, TSLA, NVDA, MSFT, AMZN (TwelveData)"],
-              ["Commodities", "Gold, Silver, WTI Oil, Brent Oil"],
-            ].map(([mkt, desc]) => (
-              <div key={mkt} className="panel-flat p-3 rounded-lg">
-                <div className="font-semibold text-[var(--text)] mb-1">{mkt}</div>
+              ["Unified Bot (SMC)",        "Asian range + London sweep + NY reversal. 1 loss = stop. 3 wins = stop."],
+              ["0DTE ORB",                 "SPY options. Mon/Wed/Fri. 5-min opening range breakout. +100% TP / -50% SL."],
+              ["VWAP + EMA Trend",         "9/21 EMA cross after 10:30 ET + VWAP filter. 2-part scale-out with trail."],
+              ["Simple MA",               "10/30 SMA crossover baseline. Works on all markets."],
+            ].map(([strat, desc]) => (
+              <div key={strat} className="panel-flat p-3 rounded-lg">
+                <div className="font-semibold text-[var(--text)] mb-1">{strat}</div>
                 {desc}
               </div>
             ))}

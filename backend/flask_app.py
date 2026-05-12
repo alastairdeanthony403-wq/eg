@@ -65,7 +65,7 @@ CORS(app, resources={r"/api/*": {"origins": "*"}}, supports_credentials=True)
 MARKETS = {
     "crypto":      ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"],
     "forex":       ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD"],
-    "stocks":      ["AAPL", "TSLA", "NVDA", "MSFT", "AMZN"],
+    "stocks":      ["AAPL", "TSLA", "NVDA", "MSFT", "AMZN", "SPY"],
     "commodities": ["XAUUSD", "XAGUSD", "USOIL", "UKOIL"],
 }
 
@@ -1023,6 +1023,521 @@ def _ts_to_str(ts):
 
 
 # ─────────────────────────────────────────────
+# SHARED INDICATOR HELPERS (used by new strategies)
+# ─────────────────────────────────────────────
+
+def _adr_series(daily_highs, daily_lows, period=10):
+    """
+    10-period Average Daily Range.
+    Inputs are parallel lists of daily high/low values (one per trading day).
+    Returns a list of the same length; first `period-1` values are None.
+    """
+    if len(daily_highs) < period:
+        return [None] * len(daily_highs)
+    ranges = [daily_highs[j] - daily_lows[j] for j in range(len(daily_highs))]
+    result = [None] * (period - 1)
+    for i in range(period - 1, len(ranges)):
+        result.append(sum(ranges[i - period + 1: i + 1]) / period)
+    return result
+
+
+def _vwap_series(candles):
+    """
+    Intraday VWAP that resets at the start of each calendar day.
+    Candles: standard [ts_ms, open, high, low, close, volume] list.
+    Returns list of VWAP values (same length).
+    No lookahead — uses only completed bars.
+    """
+    from datetime import datetime, timezone as _tz
+
+    def _date(ts):
+        t = int(ts)
+        if t > 1e12: t //= 1000
+        return datetime.utcfromtimestamp(t).strftime("%Y-%m-%d")
+
+    result = []
+    cum_tpv = 0.0
+    cum_vol  = 0.0
+    cur_day  = None
+
+    for c in candles:
+        d   = _date(c[0])
+        hi  = float(c[2]); lo = float(c[3]); cl = float(c[4])
+        vol = float(c[5]) if float(c[5]) > 0 else 1.0
+        tp  = (hi + lo + cl) / 3.0
+        if d != cur_day:
+            cur_day = d; cum_tpv = 0.0; cum_vol = 0.0
+        cum_tpv += tp * vol
+        cum_vol  += vol
+        result.append(cum_tpv / cum_vol)
+
+    return result
+
+
+def _candle_et_hour_minute(ts_ms):
+    """Return (hour, minute) in US/Eastern time for a candle timestamp."""
+    from datetime import datetime, timezone as _tz, timedelta as _td
+    ts = int(ts_ms)
+    if ts > 1e12: ts //= 1000
+    utc_dt = datetime.utcfromtimestamp(ts)
+    # ET = UTC-5 (EST) or UTC-4 (EDT). Approximate: use UTC-4 Apr-Oct, UTC-5 otherwise.
+    month = utc_dt.month
+    offset = -4 if 4 <= month <= 10 else -5
+    et_dt  = utc_dt + _td(hours=offset)
+    return et_dt.hour, et_dt.minute, et_dt.weekday()   # weekday: 0=Mon
+
+
+def _candle_et_hm(ts_ms):
+    """Return (hour*100 + minute) integer in ET for easy comparison."""
+    h, m, _ = _candle_et_hour_minute(ts_ms)
+    return h * 100 + m
+
+
+# ─────────────────────────────────────────────
+# STRATEGY: 0DTE Opening Range Breakout (ORB)
+#
+# Instrument:  SPY or any stock symbol (simulates 0DTE ATM options)
+# Timeframe:   5-minute bars (or 1-minute, auto-adapts)
+# Opening range: first bar(s) covering 09:30–09:35 ET
+# Entry:       Break above 5-min high → simulated CALL (+side)
+#              Break below 5-min low  → simulated PUT  (-side)
+# Only trades: Mondays, Wednesdays, Fridays
+# PnL model:   Options premium ~0.5% of underlying per $1 move.
+#              TP = +100% of option price, SL = -50% of option price.
+#              Time stop: 15:30 ET force-close.
+# Risk:        2% of account per trade (spec requirement).
+# ─────────────────────────────────────────────
+
+def run_orb_strategy(candles, starting_balance=1000,
+                     fee_pct=0.04, slippage_pct=0.02):
+    """
+    0DTE Opening Range Breakout — SPY options simulation.
+
+    No overlap with unified_bot / simple_ma: those strategies use
+    EMA/ADX session-based logic. This uses pure price-structure
+    (opening range) on equity options with fixed +100%/-50% targets.
+
+    PnL is modelled as:
+      option_premium  ≈ ATR_5m × 0.5   (rough ATM premium estimate)
+      position_size   = risk_dollar / (option_premium × 0.50)
+                        (stop = 50% of premium = risk_dollar)
+      win  = +100% premium × size
+      loss =  -50% premium × size
+    """
+    RISK_PCT        = 0.02   # 2% per trade (spec)
+    TP_PCT          = 1.00   # +100% of option price
+    SL_PCT          = 0.50   # -50%  of option price
+    TIME_STOP_ET    = 1530   # 15:30 ET
+    OPEN_RANGE_MINS = 5
+    TRADE_DAYS      = {0, 2, 4}   # Mon=0 Wed=2 Fri=4
+
+    trades  = []
+    balance = float(starting_balance)
+
+    if len(candles) < 10:
+        return trades, balance
+
+    # Group candles by ET date
+    from collections import defaultdict
+    day_candles = defaultdict(list)
+    for c in candles:
+        ts = int(c[0]); ts_s = ts // 1000 if ts > 1e12 else ts
+        from datetime import datetime as _dt
+        from datetime import timezone as _tz
+        utc = _dt.utcfromtimestamp(ts_s)
+        month = utc.month
+        offset = -4 if 4 <= month <= 10 else -5
+        import datetime as _dtmod
+        et = utc + _dtmod.timedelta(hours=offset)
+        day_key = et.strftime("%Y-%m-%d")
+        wd = et.weekday()
+        day_candles[day_key].append((c, et.hour, et.minute, wd))
+
+    for day_key in sorted(day_candles.keys()):
+        bars = day_candles[day_key]
+        if not bars:
+            continue
+
+        # Only Mon/Wed/Fri
+        weekday = bars[0][3]
+        if weekday not in TRADE_DAYS:
+            continue
+
+        # Build opening range (09:30–09:35 ET)
+        or_bars = [(c, h, m) for c, h, m, _ in bars
+                   if h == 9 and 30 <= m < 30 + OPEN_RANGE_MINS]
+        if not or_bars:
+            continue
+
+        or_high = max(float(b[0][2]) for b in or_bars)
+        or_low  = min(float(b[0][3]) for b in or_bars)
+        if or_high <= or_low:
+            continue
+
+        # Estimate ATM option premium ≈ half the opening range
+        option_premium = (or_high - or_low) * 0.5
+        if option_premium <= 0:
+            continue
+
+        risk_dollar = balance * RISK_PCT
+        # size such that a 50% move in premium = risk_dollar
+        size = risk_dollar / (option_premium * SL_PCT)
+
+        # Find breakout bar after 09:35 ET, before 15:30 ET
+        position = None
+        day_traded = False
+
+        for c, hr, mn, _ in bars:
+            hm = hr * 100 + mn
+            if hm < 935:
+                continue   # still in opening range
+            if hm >= TIME_STOP_ET and position is None:
+                break      # past time stop with no trade
+
+            price = float(c[4])   # close of this bar
+            hi    = float(c[2])
+            lo    = float(c[3])
+            t_str = _ts_to_str(c[0])
+
+            # Force-close at time stop
+            if hm >= TIME_STOP_ET and position is not None:
+                ep   = position["entry_price"]
+                side = position["side"]
+                prem = position["premium"]
+                raw_ret = (price - ep) / ep if side == "BUY" else (ep - price) / ep
+                opt_pnl = raw_ret / (or_high - or_low) * prem * size if (or_high - or_low) > 0 else 0
+                opt_pnl = max(opt_pnl, -prem * SL_PCT * size)
+                fee     = risk_dollar * fee_pct / 100 * 2
+                net_pnl = opt_pnl - fee
+                balance += net_pnl
+                trades.append({
+                    "side":       side,
+                    "entry":      round(ep, 4),
+                    "exit":       round(price, 4),
+                    "entry_time": position["time"],
+                    "exit_time":  t_str,
+                    "pnl":        round(net_pnl, 4),
+                    "reason":     "Time stop",
+                    "setup":      f"ORB | OR {or_low:.2f}-{or_high:.2f}",
+                })
+                position = None
+                break
+
+            if position is None and not day_traded:
+                # Entry on breakout (use close of bar, no lookahead)
+                if price > or_high:
+                    ep = price * (1 + slippage_pct / 100)
+                    position = {"side": "BUY", "entry_price": ep,
+                                "premium": option_premium, "time": t_str}
+                    day_traded = True
+                elif price < or_low:
+                    ep = price * (1 - slippage_pct / 100)
+                    position = {"side": "SELL", "entry_price": ep,
+                                "premium": option_premium, "time": t_str}
+                    day_traded = True
+
+            elif position is not None:
+                side = position["side"]
+                ep   = position["entry_price"]
+                prem = position["premium"]
+                # Model option PnL: proportional to underlying move / premium
+                underlying_move = (price - ep) if side == "BUY" else (ep - price)
+                opt_pnl_pct = underlying_move / prem   # as fraction of premium
+                # TP: +100% of premium
+                if opt_pnl_pct >= TP_PCT:
+                    net_pnl = prem * TP_PCT * size - risk_dollar * fee_pct / 100 * 2
+                    balance += net_pnl
+                    trades.append({
+                        "side":       side,
+                        "entry":      round(ep, 4),
+                        "exit":       round(price, 4),
+                        "entry_time": position["time"],
+                        "exit_time":  t_str,
+                        "pnl":        round(net_pnl, 4),
+                        "reason":     "Take profit (+100%)",
+                        "setup":      f"ORB | OR {or_low:.2f}-{or_high:.2f}",
+                    })
+                    position = None
+                # SL: -50% of premium
+                elif opt_pnl_pct <= -SL_PCT:
+                    net_pnl = -(prem * SL_PCT * size) - risk_dollar * fee_pct / 100 * 2
+                    balance += net_pnl
+                    trades.append({
+                        "side":       side,
+                        "entry":      round(ep, 4),
+                        "exit":       round(price, 4),
+                        "entry_time": position["time"],
+                        "exit_time":  t_str,
+                        "pnl":        round(net_pnl, 4),
+                        "reason":     "Stop loss (-50%)",
+                        "setup":      f"ORB | OR {or_low:.2f}-{or_high:.2f}",
+                    })
+                    position = None
+
+    return trades, balance
+
+
+# ─────────────────────────────────────────────
+# STRATEGY: VWAP + EMA Trend
+#
+# Indicators: 9 EMA, 21 EMA, VWAP (intraday, resets daily)
+# Entry:      After 10:30 ET. 9/21 EMA crossover where:
+#               - Long:  price > VWAP (VWAP acting as support)
+#               - Short: price < VWAP (VWAP acting as resistance)
+# Risk:       2% of account per trade
+# SL:         50% of 10-period ADR from entry
+# Scale-out:  Sell 50% at 75% of ADR from entry (Normal Lite target)
+#             Trail remainder at 1×ATR once first target hit
+# No overlap with unified_bot: unified_bot uses session/London sweep logic.
+#   This strategy uses intraday VWAP support/resistance — fundamentally different.
+# ─────────────────────────────────────────────
+
+def run_vwap_ema_strategy(candles, starting_balance=1000,
+                           fee_pct=0.04, slippage_pct=0.02):
+    """
+    VWAP + 9/21 EMA Trend with 2-part scaling.
+
+    Differences from unified_bot (no duplication):
+      • Uses VWAP as dynamic support/resistance filter (new)
+      • Entries only after 10:30 ET (time-of-day filter, not session-based)
+      • 2-part exit: 50% off at 75% of ADR, trail remainder at 1×ATR (new)
+      • ADR-based stop (Average Daily Range), not ATR-based (new)
+      • 2% risk (vs unified_bot 1%)
+
+    Compatible with 1-minute bars (as specified). Works on 5m too.
+    No lookahead: all indicators computed on completed bars.
+    """
+    RISK_PCT        = 0.02   # 2% per trade
+    ENTRY_AFTER_ET  = 1030   # 10:30 ET earliest entry
+    CLOSE_ET        = 1600   # 16:00 ET force-close
+    ADR_PERIOD      = 10
+    EMA_FAST        = 9
+    EMA_SLOW        = 21
+    ADR_SL_MULT     = 0.50   # SL = 50% of ADR
+    ADR_TP1_MULT    = 0.75   # First target = 75% of ADR
+    TRAIL_ATR_MULT  = 1.0    # Trail remainder at 1×ATR
+
+    trades  = []
+    balance = float(starting_balance)
+
+    if len(candles) < max(EMA_SLOW, ADR_PERIOD * 2) + 5:
+        return trades, balance
+
+    closes = [float(c[4]) for c in candles]
+    highs  = [float(c[2]) for c in candles]
+    lows   = [float(c[3]) for c in candles]
+
+    ema9_s  = _ema_series(closes, EMA_FAST)
+    ema21_s = _ema_series(closes, EMA_SLOW)
+    vwap_s  = _vwap_series(candles)
+    atr_s   = _atr_series(highs, lows, closes, 14)
+
+    # Build daily high/low for ADR computation
+    from collections import defaultdict
+    day_hl = defaultdict(lambda: {"h": None, "l": None})
+    dates_in_order = []
+
+    def bar_date(idx):
+        ts = int(candles[idx][0])
+        if ts > 1e12: ts //= 1000
+        from datetime import datetime as _dt
+        utc = _dt.utcfromtimestamp(ts)
+        month = utc.month
+        off = -4 if 4 <= month <= 10 else -5
+        import datetime as _dtmod
+        et = utc + _dtmod.timedelta(hours=off)
+        return et.strftime("%Y-%m-%d")
+
+    for j in range(len(candles)):
+        d  = bar_date(j)
+        h  = highs[j]; l = lows[j]
+        dh = day_hl[d]
+        dh["h"] = max(h, dh["h"] or h)
+        dh["l"] = min(l, dh["l"] or l)
+        if not dates_in_order or dates_in_order[-1] != d:
+            dates_in_order.append(d)
+
+    # ADR per day (computed on prior 10 completed days, no lookahead)
+    daily_ranges = [(day_hl[d]["h"] - day_hl[d]["l"]) for d in dates_in_order]
+    daily_adr    = {}
+    for k, d in enumerate(dates_in_order):
+        if k >= ADR_PERIOD:
+            daily_adr[d] = sum(daily_ranges[k - ADR_PERIOD: k]) / ADR_PERIOD
+        else:
+            daily_adr[d] = None
+
+    # Main loop
+    position     = None
+    current_day  = None
+    day_traded   = False
+
+    for i in range(EMA_SLOW + 1, len(candles)):
+        e9  = ema9_s[i];   e9p  = ema9_s[i-1]
+        e21 = ema21_s[i];  e21p = ema21_s[i-1]
+        vwap = vwap_s[i]
+        atr_v = atr_s[i]
+
+        if any(v is None for v in [e9, e9p, e21, e21p, vwap, atr_v]):
+            continue
+
+        close = closes[i]; hi = highs[i]; lo = lows[i]
+        t_str = _ts_to_str(candles[i][0])
+        d     = bar_date(i)
+        hm    = _candle_et_hm(candles[i][0])
+
+        if d != current_day:
+            current_day = d; day_traded = False
+
+        adr = daily_adr.get(d)
+
+        # Force-close at 16:00 ET
+        if position is not None and hm >= CLOSE_ET:
+            side = position["side"]; ep = position["entry"]
+            raw_pnl = ((close - ep) if side == "BUY" else (ep - close)) * position["size"]
+            fee = ep * position["size"] * fee_pct / 100 * 2
+            net = raw_pnl - fee
+            balance += net
+            trades.append({
+                "side":       side,
+                "entry":      round(ep, 6),
+                "exit":       round(close, 6),
+                "entry_time": position["time"],
+                "exit_time":  t_str,
+                "pnl":        round(net, 4),
+                "reason":     "Force close",
+                "setup":      position.get("setup", ""),
+            })
+            position = None; day_traded = False
+            continue
+
+        # ── Manage open position ──────────────────────────────────────────
+        if position is not None:
+            side    = position["side"]
+            ep      = position["entry"]
+            sl      = position["sl"]
+            tp1     = position["tp1"]
+            tp1_hit = position["tp1_hit"]
+            trail_sl = position["trail_sl"]
+            sz_full  = position["size"]
+            sz_rem   = position["size_rem"]
+            peak     = position["peak"]
+
+            if side == "BUY":
+                if hi > peak: peak = hi; position["peak"] = peak
+            else:
+                if lo < peak: peak = lo; position["peak"] = peak
+
+            # Advance trail stop
+            if tp1_hit:
+                if side == "BUY":
+                    candidate = peak - atr_v * TRAIL_ATR_MULT
+                    if candidate > trail_sl: trail_sl = candidate; position["trail_sl"] = trail_sl
+                else:
+                    candidate = peak + atr_v * TRAIL_ATR_MULT
+                    if candidate < trail_sl: trail_sl = candidate; position["trail_sl"] = trail_sl
+
+            eff_sl = trail_sl if tp1_hit else sl
+
+            # First target (75% ADR): close 50% of position
+            if not tp1_hit:
+                if (side == "BUY" and hi >= tp1) or (side == "SELL" and lo <= tp1):
+                    partial_sz   = sz_full - sz_rem          # 50% already exiting
+                    raw_pnl_p1   = ((tp1 - ep) if side == "BUY" else (ep - tp1)) * partial_sz
+                    fee_p1       = ep * partial_sz * fee_pct / 100 * 2
+                    net_p1       = raw_pnl_p1 - fee_p1
+                    balance     += net_p1
+                    position["tp1_hit"] = True
+                    position["trail_sl"] = ep  # move stop to breakeven
+                    trail_sl    = ep
+                    trades.append({
+                        "side":       side,
+                        "entry":      round(ep, 6),
+                        "exit":       round(tp1, 6),
+                        "entry_time": position["time"],
+                        "exit_time":  t_str,
+                        "pnl":        round(net_p1, 4),
+                        "reason":     "Target 1 (75% ADR) — 50% closed",
+                        "setup":      position.get("setup", ""),
+                    })
+                    continue
+
+            # Full exit: stop loss or trail
+            exit_price = exit_reason = None
+            if side == "BUY":
+                if lo <= eff_sl:
+                    exit_price  = eff_sl
+                    exit_reason = "Trailing stop" if tp1_hit else "Stop loss"
+            else:
+                if hi >= eff_sl:
+                    exit_price  = eff_sl
+                    exit_reason = "Trailing stop" if tp1_hit else "Stop loss"
+
+            if exit_price is not None:
+                raw_pnl = ((exit_price - ep) if side == "BUY" else (ep - exit_price)) * sz_rem
+                fee     = ep * sz_rem * fee_pct / 100 * 2
+                net     = raw_pnl - fee
+                balance += net
+                trades.append({
+                    "side":       side,
+                    "entry":      round(ep, 6),
+                    "exit":       round(exit_price, 6),
+                    "entry_time": position["time"],
+                    "exit_time":  t_str,
+                    "pnl":        round(net, 4),
+                    "reason":     exit_reason + " (remainder)",
+                    "setup":      position.get("setup", ""),
+                })
+                position = None
+            continue
+
+        # ── Entry ─────────────────────────────────────────────────────────
+        if day_traded or adr is None or hm < ENTRY_AFTER_ET:
+            continue
+
+        cross_up   = e9p <= e21p and e9 > e21
+        cross_down = e9p >= e21p and e9 < e21
+
+        side = None
+        if cross_up   and close > vwap:   side = "BUY"
+        elif cross_down and close < vwap: side = "SELL"
+
+        if side is None:
+            continue
+
+        # SL = 50% ADR, TP1 = 75% ADR
+        sl_dist  = adr * ADR_SL_MULT
+        tp1_dist = adr * ADR_TP1_MULT
+        if sl_dist <= 0:
+            continue
+
+        risk_dollar = balance * RISK_PCT
+        size        = risk_dollar / sl_dist
+        if size <= 0:
+            continue
+
+        ep = close * (1 + slippage_pct/100) if side == "BUY" else close * (1 - slippage_pct/100)
+        sl_price  = ep - sl_dist  if side == "BUY" else ep + sl_dist
+        tp1_price = ep + tp1_dist if side == "BUY" else ep - tp1_dist
+
+        position = {
+            "side":     side,
+            "entry":    ep,
+            "time":     t_str,
+            "sl":       sl_price,
+            "tp1":      tp1_price,
+            "tp1_hit":  False,
+            "trail_sl": sl_price,
+            "peak":     ep,
+            "size":     size,
+            "size_rem": size * 0.50,   # 50% stays after first target
+            "setup":    f"VWAP+EMA | {'above' if side=='BUY' else 'below'} VWAP | ADR {adr:.4f}",
+        }
+        day_traded = True
+
+    return trades, balance
+
+
+# ─────────────────────────────────────────────
 # [D] BACKTEST STRATEGY: SIMPLE MA (percentage-based PnL)
 # ─────────────────────────────────────────────
 
@@ -1783,6 +2298,10 @@ def api_backtest():
     try:
         if strategy == "unified_bot":
             trades, ending_balance = run_unified_bot_strategy(candles, sb, fee_pct, slip_pct)
+        elif strategy == "orb_0dte":
+            trades, ending_balance = run_orb_strategy(candles, sb, fee_pct, slip_pct)
+        elif strategy == "vwap_ema":
+            trades, ending_balance = run_vwap_ema_strategy(candles, sb, fee_pct, slip_pct)
         else:
             trades, ending_balance = run_simple_ma_strategy(candles, sb, fee_pct, slip_pct)
     except Exception as e:
