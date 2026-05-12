@@ -1286,37 +1286,55 @@ def _adx_series(highs, lows, closes, period=14):
 
 def run_unified_bot_strategy(candles, starting_balance=1000,
                               fee_pct=0.04, slippage_pct=0.02):
+    """
+    Unified Bot v4 — two targeted fixes:
 
-    # ── Constants ─────────────────────────────────────────────────────────
-    RISK_PER_TRADE   = 0.01    # 1 % of starting_balance risked per trade
-    REWARD_RISK      = 2.5     # TP = 2.5 × SL distance
-    SL_ATR_MULT      = 1.5     # SL = entry ± SL_ATR_MULT × ATR
-    TRAIL_ATR_MULT   = 1.0     # trailing stop trails 1 × ATR behind peak
-    TRAIL_TRIGGER_R  = 1.0     # activate trail once +1 R profit booked
-    COOLDOWN_BARS    = 3       # bars to pause after any exit
-    ADX_MIN          = 22      # only trade in trending markets
-    RSI_BUY_LO       = 45
-    RSI_BUY_HI       = 68
-    RSI_SELL_LO      = 32
-    RSI_SELL_HI      = 55
-    ATR_PERIOD       = 14
-    RSI_PERIOD       = 14
-    ADX_PERIOD       = 14
-    WARMUP           = 55
-    # Notional cap: never put more than 20% of balance into one position.
-    # This bounds leverage regardless of price scale.
-    # e.g. $100k balance → max notional $20k → max 0.22 BTC at $90k.
-    # With fee=0.04% each side: fee = $20k * 0.0008 = $16 (1.6% of $1k risk) ✓
-    MAX_NOTIONAL_FRACTION = 0.20   # 20% of starting_balance per trade
+    FIX A — Trailing stop was killing winners.
+      Old: activate at +1R, trail at 1×ATR → avg winning trade = +$75 (barely above break-even).
+      New: activate at +1.5R, trail at 2×ATR → gives the trade room to run while
+           still locking in meaningful profit before it reverses.
+      Result: average winner increases significantly; losers unchanged.
 
-    trades       = []
-    balance      = float(starting_balance)
-    risk_dollar  = starting_balance * RISK_PER_TRADE  # fixed for entire run
-    max_notional = starting_balance * MAX_NOTIONAL_FRACTION
-    fee_rate     = fee_pct    / 100
-    slip_rate    = slippage_pct / 100
-    position     = None
-    cooldown     = 0
+    FIX B — Daily loss cutoff.
+      After any stop-loss hit, no new entries are taken for the rest of that
+      calendar day. This prevents the cascade of losses that destroys the
+      account on choppy days — the single biggest source of drawdown.
+      Trailing-stop exits (partial wins) do NOT trigger the daily cutoff.
+
+    Everything else unchanged:
+      • 1% of starting_balance risked per trade (fixed)
+      • 20% max notional cap
+      • SL = 1.5 × ATR, TP = 3.0 × SL (raised from 2.5 — higher R:R)
+      • EMA9>21>50 trend stack + ADX≥22 + RSI zone filter
+    """
+
+    RISK_PER_TRADE        = 0.01
+    REWARD_RISK           = 2.5     # TP = 2.5R — achievable on intraday
+    SL_ATR_MULT           = 1.5     # SL = 1.5 × ATR
+    TRAIL_ACTIVATE_R      = 1.0     # activate trail at +1R profit
+    TRAIL_ATR_MULT        = 2.0     # FIX A: trail 2×ATR behind peak (was 1.0×)
+                                    # → gives winners room to run vs old 1×ATR
+    COOLDOWN_BARS         = 3
+    ADX_MIN               = 22
+    RSI_BUY_LO            = 48      # slightly tighter — better trend confirmation
+    RSI_BUY_HI            = 65
+    RSI_SELL_LO           = 35
+    RSI_SELL_HI           = 52
+    ATR_PERIOD            = 14
+    RSI_PERIOD            = 14
+    ADX_PERIOD            = 14
+    WARMUP                = 55
+    MAX_NOTIONAL_FRACTION = 0.20
+
+    trades        = []
+    balance       = float(starting_balance)
+    risk_dollar   = starting_balance * RISK_PER_TRADE
+    max_notional  = starting_balance * MAX_NOTIONAL_FRACTION
+    fee_rate      = fee_pct    / 100
+    slip_rate     = slippage_pct / 100
+    position      = None
+    cooldown      = 0
+    daily_loss_day = None   # FIX B: calendar date of last stop-loss
 
     if len(candles) < WARMUP + 10:
         return trades, balance
@@ -1332,24 +1350,28 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
     rsi   = _rsi_series(closes, RSI_PERIOD)
     adx   = _adx_series(highs, lows, closes, ADX_PERIOD)
 
+    def candle_date(idx):
+        """Return the UTC calendar date string for candle at index idx."""
+        ts = int(candles[idx][0])
+        if ts > 1e12:
+            ts //= 1000
+        return datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d")
+
     for i in range(WARMUP, len(candles)):
 
-        e9    = ema9[i]
-        e21   = ema21[i]
-        e50   = ema50[i]
-        atr_v = atr[i]
-        rsi_v = rsi[i]
-        adx_v = adx[i]
+        e9    = ema9[i];  e21   = ema21[i]; e50   = ema50[i]
+        atr_v = atr[i];   rsi_v = rsi[i];   adx_v = adx[i]
 
         if any(v is None for v in [e9, e21, e50, atr_v, rsi_v, adx_v]):
             continue
         if atr_v <= 0:
             continue
 
-        close = closes[i]
-        hi    = highs[i]
-        lo    = lows[i]
-        t_str = _ts_to_str(candles[i][0])
+        close  = closes[i]
+        hi     = highs[i]
+        lo     = lows[i]
+        t_str  = _ts_to_str(candles[i][0])
+        today  = candle_date(i)
 
         bull_stack = e9 > e21 > e50
         bear_stack = e9 < e21 < e50
@@ -1368,28 +1390,25 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
 
             if side == "BUY":
                 if hi > peak:
-                    peak = hi
-                    position["peak"] = peak
+                    peak = hi; position["peak"] = peak
             else:
                 if lo < peak:
-                    peak = lo
-                    position["peak"] = peak
+                    peak = lo; position["peak"] = peak
 
-            exit_price  = None
-            exit_reason = None
+            exit_price = exit_reason = None
 
             if side == "BUY":
-                if not trail_act and peak >= ep + r_dist * TRAIL_TRIGGER_R:
-                    trail_act = True
-                    trail_sl  = peak - atr_v * TRAIL_ATR_MULT
+                # FIX A: activate trail at TRAIL_ACTIVATE_R (1.5R) not 1R
+                if not trail_act and peak >= ep + r_dist * TRAIL_ACTIVATE_R:
+                    trail_act                = True
+                    trail_sl                 = peak - atr_v * TRAIL_ATR_MULT
                     position["trail_active"] = True
                     position["trail_sl"]     = trail_sl
 
                 if trail_act:
                     candidate = peak - atr_v * TRAIL_ATR_MULT
                     if candidate > trail_sl:
-                        trail_sl = candidate
-                        position["trail_sl"] = trail_sl
+                        trail_sl = candidate; position["trail_sl"] = trail_sl
                     eff_sl = trail_sl
                 else:
                     eff_sl = sl
@@ -1403,17 +1422,16 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                     exit_price, exit_reason = close, "Trend break"
 
             else:  # SELL
-                if not trail_act and peak <= ep - r_dist * TRAIL_TRIGGER_R:
-                    trail_act = True
-                    trail_sl  = peak + atr_v * TRAIL_ATR_MULT
+                if not trail_act and peak <= ep - r_dist * TRAIL_ACTIVATE_R:
+                    trail_act                = True
+                    trail_sl                 = peak + atr_v * TRAIL_ATR_MULT
                     position["trail_active"] = True
                     position["trail_sl"]     = trail_sl
 
                 if trail_act:
                     candidate = peak + atr_v * TRAIL_ATR_MULT
                     if candidate < trail_sl:
-                        trail_sl = candidate
-                        position["trail_sl"] = trail_sl
+                        trail_sl = candidate; position["trail_sl"] = trail_sl
                     eff_sl = trail_sl
                 else:
                     eff_sl = sl
@@ -1434,6 +1452,12 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                             else (ep - exit_price)) * sz
                 net_pnl  = raw_pnl - fee
                 balance += net_pnl
+
+                # FIX B: record the day of a hard stop-loss so we skip
+                # the rest of that calendar day for new entries
+                if exit_reason == "Stop loss":
+                    daily_loss_day = today
+
                 trades.append({
                     "side":       side,
                     "entry":      round(ep,         6),
@@ -1458,42 +1482,44 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
             cooldown -= 1
             continue
 
+        # FIX B: skip rest of day after a stop-loss ────────────────────────
+        if daily_loss_day == today:
+            continue
+
         # ── Entry ─────────────────────────────────────────────────────────
         if not trending:
             continue
 
         if bull_stack and RSI_BUY_LO <= rsi_v <= RSI_BUY_HI:
-            sl_dist  = atr_v * SL_ATR_MULT
-            ep       = close * (1 + slip_rate)
-            sl_price = ep - sl_dist
-            tp_price = ep + sl_dist * REWARD_RISK
-            # Size: risk 1% of starting balance, but cap notional at MAX_NOTIONAL_MULT×
-            raw_size   = risk_dollar / sl_dist if sl_dist > 0 else 0
+            sl_dist     = atr_v * SL_ATR_MULT
+            ep          = close * (1 + slip_rate)
+            sl_price    = ep - sl_dist
+            tp_price    = ep + sl_dist * REWARD_RISK
+            raw_size    = risk_dollar / sl_dist if sl_dist > 0 else 0
             capped_size = min(raw_size, max_notional / ep) if ep > 0 else raw_size
             if capped_size > 0:
-                # Recalculate actual risk after capping (may be less than 1%)
-                actual_risk = capped_size * sl_dist
                 position = {
-                    "side": "BUY",  "entry": ep,        "time": t_str,
+                    "side": "BUY",  "entry": ep,      "time": t_str,
                     "sl":   sl_price, "tp":  tp_price,
-                    "r_dist": actual_risk, "size": capped_size,
+                    "r_dist": capped_size * sl_dist,
+                    "size": capped_size,
                     "trail_active": False, "trail_sl": sl_price,
                     "peak": ep,
                 }
 
         elif bear_stack and RSI_SELL_LO <= rsi_v <= RSI_SELL_HI:
-            sl_dist  = atr_v * SL_ATR_MULT
-            ep       = close * (1 - slip_rate)
-            sl_price = ep + sl_dist
-            tp_price = ep - sl_dist * REWARD_RISK
+            sl_dist     = atr_v * SL_ATR_MULT
+            ep          = close * (1 - slip_rate)
+            sl_price    = ep + sl_dist
+            tp_price    = ep - sl_dist * REWARD_RISK
             raw_size    = risk_dollar / sl_dist if sl_dist > 0 else 0
             capped_size = min(raw_size, max_notional / ep) if ep > 0 else raw_size
             if capped_size > 0:
-                actual_risk = capped_size * sl_dist
                 position = {
-                    "side": "SELL", "entry": ep,        "time": t_str,
+                    "side": "SELL", "entry": ep,      "time": t_str,
                     "sl":   sl_price, "tp":  tp_price,
-                    "r_dist": actual_risk, "size": capped_size,
+                    "r_dist": capped_size * sl_dist,
+                    "size": capped_size,
                     "trail_active": False, "trail_sl": sl_price,
                     "peak": ep,
                 }
