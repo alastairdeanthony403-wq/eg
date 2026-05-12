@@ -1324,20 +1324,20 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
     """
 
     # ── Constants ─────────────────────────────────────────────────────────
-    RISK_PER_TRADE       = 0.01
-    REWARD_RISK          = 3.0
-    SL_ATR_BUFFER        = 0.5   # buffer beyond London extreme for SL
-    TRAIL_ACTIVATE_R     = 2.0
-    TRAIL_ATR_MULT       = 1.5
+    RISK_PER_TRADE       = 0.01   # 1% of starting balance, fixed
+    REWARD_RISK          = 3.0    # 3R minimum — strong trade only
+    SL_ATR_MULT          = 1.5    # SL = 1.5×ATR (tight, structure-based)
+    TRAIL_ACTIVATE_R     = 2.0    # trail after 2R booked
+    TRAIL_ATR_MULT       = 1.5    # trail 1.5×ATR behind peak
     COOLDOWN_BARS        = 3
-    ADX_MIN              = 20
-    RSI_BUY_MAX          = 75
-    RSI_SELL_MIN         = 25
+    ADX_MIN              = 18     # lowered: confirm trending, not extreme
+    RSI_BUY_MAX          = 72     # not overbought
+    RSI_SELL_MIN         = 28     # not oversold
     ATR_PERIOD           = 14
     RSI_PERIOD           = 14
     ADX_PERIOD           = 14
     WARMUP               = 55
-    ASIAN_MAX_ATR_MULT   = 20.0  # Asian range < 20×5m-ATR ≈ tight daily range
+    ASIAN_MAX_ATR_MULT   = 12.0   # tight Asian = < 12×5m ATR (stricter quality)
 
     # UTC hour boundaries
     ASIAN_START  = 0
@@ -1366,6 +1366,7 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
 
     ema9  = _ema_series(closes, 9)
     ema21 = _ema_series(closes, 21)
+    ema50 = _ema_series(closes, 50)
     atr   = _atr_series(highs, lows, closes, ATR_PERIOD)
     rsi   = _rsi_series(closes, RSI_PERIOD)
     adx   = _adx_series(highs, lows, closes, ADX_PERIOD)
@@ -1604,9 +1605,7 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
         if not swept_high and not swept_low:
             continue   # London didn't create a sweep — no trade setup today
 
-        # ── Gate 3: Determine NY direction (opposite to London push) ──────
-        # London swept highs → NY should reverse DOWN (sell)
-        # London swept lows  → NY should reverse UP  (buy)
+        # ── Gate 3: NY direction — opposite to London push ───────────────
         if swept_high and swept_low:
             high_extent = l_hi - a_hi
             low_extent  = a_lo - l_lo
@@ -1616,18 +1615,18 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
         else:
             ny_direction = "BUY"
 
-        # ── Gate 3b: Macro trend alignment ───────────────────────────────
-        # Don't fade a strong macro trend — only take reversals that agree
-        # with or are neutral to the prevailing EMA direction.
-        # This prevents taking SELL signals all month in a bull market.
-        e21_prev = ema21[i-1] if i > 0 else None
-        macro_bull = e9 > e21 and (e21_prev is None or e21 >= e21_prev)
-        macro_bear = e9 < e21 and (e21_prev is None or e21 <= e21_prev)
-
-        if ny_direction == "SELL" and macro_bull:
-            continue   # Don't short a confirmed bull trend
-        if ny_direction == "BUY"  and macro_bear:
-            continue   # Don't long a confirmed bear trend
+        # ── Gate 3b: Don't trade violently against macro trend ───────────
+        # Use EMA50 as the macro bias. Only block if the trade direction
+        # strongly contradicts the long-term trend (price far from EMA50).
+        e50_v = ema50[i]
+        if e50_v and e50_v > 0:
+            pct_from_e50 = (close - e50_v) / e50_v * 100
+            # Block a SELL if price is >1% above EMA50 (strong bull macro)
+            if ny_direction == "SELL" and pct_from_e50 > 1.0:
+                continue
+            # Block a BUY if price is >1% below EMA50 (strong bear macro)
+            if ny_direction == "BUY"  and pct_from_e50 < -1.0:
+                continue
 
         # ── Gate 4: Price must have touched or crossed the Asian midpoint ──
         # For BUY: London swept lows. We want price to have bounced back UP
@@ -1649,55 +1648,51 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
             if not (e9 < e21 and rsi_v > RSI_SELL_MIN):
                 continue
 
-        # ── Gate 6: FVG or Liquidity Sweep confirmation ───────────────────
-        # FVG: any gap in last 20 bars aligned with trade direction
-        # Sweep: liquidity taken in last 20 bars aligned with direction
-        fvg   = detect_fvg(i, ny_direction)
-        sweep = detect_sweep(i, lookback=20)
+        # ── Gate 6: SMC confirmation — at least ONE required ─────────────
+        fvg         = detect_fvg(i, ny_direction)
+        sweep       = detect_sweep(i, lookback=20)
         valid_fvg   = fvg is not None
         valid_sweep = (sweep == "BULL_SWEEP" and ny_direction == "BUY") or \
                       (sweep == "BEAR_SWEEP" and ny_direction == "SELL")
-        # Also accept if price crossed the Asian midpoint recently (imbalance fill)
-        recent_closes = closes[max(0,i-8):i+1]
-        crossed_mid = any(
-            (ny_direction == "BUY"  and c <= asian_mid) or
-            (ny_direction == "SELL" and c >= asian_mid)
-            for c in recent_closes
+        # RSI momentum confirms: rising RSI < 60 for buys, falling RSI > 40 for sells
+        rsi_prev      = rsi[i-1] if i > 0 and rsi[i-1] is not None else None
+        valid_rsi     = (rsi_prev is not None and rsi_v is not None and (
+            (ny_direction == "BUY"  and rsi_v > rsi_prev and rsi_v < 62) or
+            (ny_direction == "SELL" and rsi_v < rsi_prev and rsi_v > 38)
+        ))
+        # Midpoint cross: price touched Asian mid in last 12 bars
+        crossed_mid   = any(
+            (ny_direction == "BUY"  and closes[j] <= asian_mid) or
+            (ny_direction == "SELL" and closes[j] >= asian_mid)
+            for j in range(max(0, i-12), i+1)
         )
-        smc_confirmed = valid_fvg or valid_sweep or crossed_mid
+        smc_confirmed = valid_fvg or valid_sweep or valid_rsi or crossed_mid
         if not smc_confirmed:
             continue
 
-        # ── Compute SL/TP — use tighter of London extreme or 2×ATR ──────
-        if ny_direction == "BUY":
-            # SL: below London low + buffer, but cap at 2×ATR so it's not excessive
-            structural_sl = l_lo - atr_v * SL_ATR_BUFFER
-            atr_sl        = close * (1 + slip_rate) - atr_v * 2.0
-            sl_price      = max(structural_sl, atr_sl)   # tighter of the two
-            ep            = close * (1 + slip_rate)
-            sl_dist       = ep - sl_price
-            if sl_dist <= 0: continue
-            tp_price      = ep + sl_dist * REWARD_RISK
-        else:
-            structural_sl = l_hi + atr_v * SL_ATR_BUFFER
-            atr_sl        = close * (1 - slip_rate) + atr_v * 2.0
-            sl_price      = min(structural_sl, atr_sl)   # tighter of the two
-            ep            = close * (1 - slip_rate)
-            sl_dist       = sl_price - ep
-            if sl_dist <= 0: continue
-            tp_price      = ep - sl_dist * REWARD_RISK
+        smc_type = ("FVG"   if valid_fvg  else
+                    "Sweep" if valid_sweep else
+                    "RSI"   if valid_rsi   else "Mid-cross")
 
-        # Safety: SL must be at least 0.5×ATR away (not noise-level)
-        if sl_dist < atr_v * 0.5:
+        # ── SL/TP — strict ATR-based (guarantees 1:3 R:R) ────────────────
+        sl_dist  = atr_v * SL_ATR_MULT
+        if sl_dist <= 0 or sl_dist < atr_v * 0.5:
             continue
+        if ny_direction == "BUY":
+            ep       = close * (1 + slip_rate)
+            sl_price = ep - sl_dist
+            tp_price = ep + sl_dist * REWARD_RISK
+        else:
+            ep       = close * (1 - slip_rate)
+            sl_price = ep + sl_dist
+            tp_price = ep - sl_dist * REWARD_RISK
 
         size = risk_dollar / sl_dist
         if size <= 0: continue
 
-        smc_type  = "FVG" if valid_fvg else ("Sweep" if valid_sweep else "Mid-cross")
         setup_str = (f"{smc_type} | "
-                     f"London {'swept_hi' if swept_high else 'swept_lo'} | "
-                     f"Asian rng {asian_range:.2f}")
+                     f"Lon {'swept_hi' if swept_high else 'swept_lo'} | "
+                     f"Asian {asian_range:.2f}")
 
         position = {
             "side":         ny_direction,
