@@ -1309,13 +1309,14 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
     """
 
     RISK_PER_TRADE        = 0.01
-    REWARD_RISK           = 3.0    # 3R target — bigger wins per trade
+    REWARD_RISK           = 3.0
     SL_ATR_MULT           = 1.5
-    MIN_SL_ATR_RATIO      = 1.2    # entry only if sl_dist >= 1.2×ATR (filters weak setups)
-    TRAIL_ACTIVATE_R      = 2.0    # trail activates at +2R (was 1R — activated too early)
-    TRAIL_ATR_MULT        = 1.5    # trail 1.5×ATR behind peak
-    COOLDOWN_BARS         = 2
-    ADX_MIN               = 25
+    MIN_SL_ATR_RATIO      = 1.2
+    TRAIL_ACTIVATE_R      = 2.0
+    TRAIL_ATR_MULT        = 1.5
+    COOLDOWN_BARS         = 3      # raised from 2 — more breathing room after any exit
+    ADX_MIN               = 28     # raised from 25 — filters out the choppy FTX-era markets
+    MIN_HOLD_BARS         = 6      # must hold at least 6 bars (30 min on 5m) before trend-break exit
     RSI_BUY_LO            = 45
     RSI_BUY_HI            = 75
     RSI_SELL_LO           = 25
@@ -1421,7 +1422,8 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                 elif hi >= tp:
                     exit_price, exit_reason = tp, "Take profit"
                 elif not trail_act and not bull_stack:
-                    exit_price, exit_reason = close, "Trend break"
+                    if i - position.get("entry_bar", 0) >= MIN_HOLD_BARS:
+                        exit_price, exit_reason = close, "Trend break"
 
             else:  # SELL
                 if not trail_act and peak <= ep - r_dist * TRAIL_ACTIVATE_R:
@@ -1444,7 +1446,8 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                 elif lo <= tp:
                     exit_price, exit_reason = tp, "Take profit"
                 elif not trail_act and not bear_stack:
-                    exit_price, exit_reason = close, "Trend break"
+                    if i - position.get("entry_bar", 0) >= MIN_HOLD_BARS:
+                        exit_price, exit_reason = close, "Trend break"
 
             if exit_price is not None:
                 sz       = position["size"]
@@ -1455,9 +1458,7 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                 net_pnl  = raw_pnl - fee
                 balance += net_pnl
 
-                # FIX B: record the day of a hard stop-loss so we skip
-                # the rest of that calendar day for new entries
-                if exit_reason == "Stop loss":
+                if exit_reason == "Stop loss" or exit_reason == "Trend break":
                     daily_loss_day = today
 
                 trades.append({
@@ -1510,6 +1511,7 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                     "size": size,
                     "trail_active": False, "trail_sl": sl_price,
                     "peak": ep,
+                    "entry_bar": i,
                 }
 
         elif bear_stack and bear_slope and RSI_SELL_LO <= rsi_v <= RSI_SELL_HI:
@@ -1528,6 +1530,7 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                     "size": size,
                     "trail_active": False, "trail_sl": sl_price,
                     "peak": ep,
+                    "entry_bar": i,
                 }
 
     return trades, balance
