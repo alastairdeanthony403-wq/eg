@@ -78,11 +78,25 @@ ALL_SYMBOLS = (
 
 # TwelveData symbol name map (their API uses different identifiers)
 TD_SYMBOL_MAP = {
-    "EURUSD": "EUR/USD",  "GBPUSD": "GBP/USD",  "USDJPY": "USD/JPY",
-    "AUDUSD": "AUD/USD",  "USDCAD": "USD/CAD",
-    "XAUUSD": "XAU/USD",  "XAGUSD": "XAG/USD",
-    "USOIL":  "WTI/USD",  "UKOIL":  "BRENT/USD",
-    # stocks pass through as-is
+    # Forex — slash-separated pairs
+    "EURUSD": "EUR/USD", "GBPUSD": "GBP/USD", "USDJPY": "USD/JPY",
+    "AUDUSD": "AUD/USD", "USDCAD": "USD/CAD",
+    # Commodities — TwelveData correct identifiers
+    "XAUUSD": "XAU/USD",   # Gold spot
+    "XAGUSD": "XAG/USD",   # Silver spot
+    "USOIL":  "WTI/USD",   # WTI Crude (TwelveData accepts this)
+    "UKOIL":  "BRENT/USD", # Brent Crude
+    # Stocks — pass through as-is (TwelveData uses normal tickers)
+    "AAPL": "AAPL", "TSLA": "TSLA", "NVDA": "NVDA",
+    "MSFT": "MSFT", "AMZN": "AMZN", "SPY":  "SPY",
+}
+
+# Fallback symbols to try if primary fails (TwelveData has multiple identifiers)
+TD_SYMBOL_FALLBACKS = {
+    "USOIL":  ["WTI/USD", "USOIL", "CL1!"],
+    "UKOIL":  ["BRENT/USD", "UKOIL", "BRN1!"],
+    "XAGUSD": ["XAG/USD", "XAGUSD"],
+    "XAUUSD": ["XAU/USD", "XAUUSD"],
 }
 
 # TwelveData interval map
@@ -498,90 +512,106 @@ def _td_symbol(symbol):
 def fetch_twelvedata_candles(symbol, interval, limit=200,
                               start_date=None, end_date=None):
     """
-    [B] Fetch candles from TwelveData with rate-limiting + long-lived caching.
-
-    Rate limit (free plan): 8 credits/minute.
-    We enforce ≥8 s between outgoing calls via _td_rate_limited_get().
-    Results are cached for NON_CRYPTO_CANDLE_TTL (5 min) so repeated
-    signals refreshes don't cost extra credits.
+    Fetch candles from TwelveData with rate-limiting + long-lived caching.
+    Tries fallback symbols if the primary fails (e.g. USOIL → WTI/USD → USOIL).
+    Ensures all OHLCV values are converted to float.
     """
     api_key = os.environ.get("TWELVEDATA_API_KEY", "")
     if not api_key:
         raise RuntimeError(
-            "TWELVEDATA_API_KEY env variable is not set. "
+            "TWELVEDATA_API_KEY is not set. "
             "Add it to your Render environment variables."
         )
 
     td_interval = TD_INTERVAL_MAP.get(interval)
     if not td_interval:
-        raise RuntimeError(
-            f"TwelveData does not support interval '{interval}'. "
-            f"Supported: {list(TD_INTERVAL_MAP.keys())}"
-        )
+        # Auto-upgrade 1m to 5m for non-crypto on free plan
+        if interval == "1m":
+            td_interval = "5min"
+        else:
+            raise RuntimeError(
+                f"TwelveData does not support interval '{interval}'. "
+                f"Supported: {list(TD_INTERVAL_MAP.keys())}"
+            )
 
-    td_sym = _td_symbol(symbol)
+    # Build list of symbols to try
+    primary  = TD_SYMBOL_MAP.get(symbol, symbol)
+    fallback = TD_SYMBOL_FALLBACKS.get(symbol, [])
+    symbols_to_try = [primary] + [s for s in fallback if s != primary]
 
-    # Cache key includes date range so backtest windows don't collide with signal fetches
+    # Cache key
     nc_key = (symbol, interval, limit, start_date, end_date)
     cached = _cache_get(_non_crypto_cache, nc_key, NON_CRYPTO_CANDLE_TTL)
     if cached is not None:
         return cached
 
-    params = {
-        "symbol":     td_sym,
-        "interval":   td_interval,
-        "outputsize": min(limit, 5000),
-        "apikey":     api_key,
-        "format":     "JSON",
-    }
-    if start_date:
-        params["start_date"] = start_date
-    if end_date:
-        params["end_date"] = end_date
+    last_error = None
+    for td_sym in symbols_to_try:
+        params = {
+            "symbol":     td_sym,
+            "interval":   td_interval,
+            "outputsize": min(limit, 5000),
+            "apikey":     api_key,
+            "format":     "JSON",
+        }
+        if start_date:
+            params["start_date"] = start_date
+        if end_date:
+            params["end_date"] = end_date
 
-    try:
-        r    = _td_rate_limited_get(params, timeout=25)
-        data = r.json()
-    except Exception as e:
-        raise RuntimeError(f"TwelveData network error for {symbol}: {e}")
-
-    if "values" not in data:
-        code    = data.get("code", "?")
-        message = data.get("message", str(data)[:300])
-        if str(code) == "429":
-            raise RuntimeError(
-                f"TwelveData rate limit hit for {symbol}. "
-                f"The free plan allows 8 API credits/minute. "
-                f"Wait ~60 seconds and try again, or upgrade your TwelveData plan."
-            )
-        raise RuntimeError(
-            f"TwelveData API error for {symbol} ({td_sym}) [{code}]: {message}"
-        )
-
-    values = data["values"]
-    if not values:
-        raise RuntimeError(
-            f"TwelveData returned 0 candles for {symbol} "
-            f"(interval={interval}, start={start_date}, end={end_date})"
-        )
-
-    candles = []
-    for item in reversed(values):          # TwelveData returns newest-first
         try:
-            ts = int(datetime.fromisoformat(item["datetime"]).timestamp() * 1000)
-        except Exception:
+            r    = _td_rate_limited_get(params, timeout=25)
+            data = r.json()
+        except Exception as e:
+            last_error = f"Network error for {td_sym}: {e}"
             continue
-        candles.append([
-            ts,
-            item["open"],
-            item["high"],
-            item["low"],
-            item["close"],
-            item.get("volume", 0),
-        ])
 
-    _cache_set(_non_crypto_cache, nc_key, candles)
-    return candles
+        if "values" not in data:
+            code    = data.get("code", "?")
+            message = data.get("message", str(data)[:200])
+            if str(code) == "429":
+                raise RuntimeError(
+                    f"TwelveData rate limit hit for {symbol}. "
+                    f"Free plan: 8 credits/minute. Wait ~60 s and retry."
+                )
+            last_error = f"TwelveData [{code}] for {td_sym}: {message}"
+            continue   # try next fallback symbol
+
+        values = data["values"]
+        if not values:
+            last_error = f"TwelveData returned 0 candles for {td_sym}"
+            continue
+
+        candles = []
+        for item in reversed(values):   # TwelveData returns newest-first
+            try:
+                ts = int(datetime.fromisoformat(item["datetime"]).timestamp() * 1000)
+            except Exception:
+                continue
+            try:
+                o   = float(item["open"])
+                h   = float(item["high"])
+                lo_ = float(item["low"])
+                c   = float(item["close"])
+                vol = float(item.get("volume") or 0)
+            except (TypeError, ValueError):
+                continue
+            # Skip candles with zero or invalid prices
+            if c <= 0 or h <= 0 or lo_ <= 0:
+                continue
+            candles.append([ts, str(o), str(h), str(lo_), str(c), str(vol)])
+
+        if candles:
+            _cache_set(_non_crypto_cache, nc_key, candles)
+            return candles
+
+        last_error = f"All {len(values)} candles from {td_sym} had invalid prices"
+
+    # All symbols tried and failed
+    raise RuntimeError(
+        f"Could not fetch candles for {symbol} from TwelveData "
+        f"(tried: {symbols_to_try}). Last error: {last_error}"
+    )
 
 
 # ─────────────────────────────────────────────
@@ -956,24 +986,28 @@ def get_symbol_summary(symbol, strategy="bot", interval=SIGNALS_INTERVAL, cfg=No
     if cached is not None:
         return cached
 
-    # [A] Use 5m for signals — much more reliable on TwelveData free tier
     fetch_iv = SIGNALS_INTERVAL
     df = fetch_df_for_symbol(symbol, fetch_iv, 200)
     if df is None:
         return None
 
-    higher_df = fetch_df_for_symbol(symbol, get_higher_timeframe(fetch_iv), 100)
-    ev        = evaluate_bot_window(df, strategy, symbol, fetch_iv, higher_df, cfg)
+    # Only fetch higher TF for crypto (free TwelveData plan: 8 credits/min)
+    # Non-crypto higher TF would double the credits used per symbol
+    market = detect_market(symbol)
+    if market == "crypto":
+        higher_df = fetch_df_for_symbol(symbol, get_higher_timeframe(fetch_iv), 100)
+    else:
+        higher_df = None   # saves 14 credits per signal refresh
 
-    prev  = float(df.iloc[-2]["close"]) if len(df) > 1 else float(df.iloc[-1]["close"])
-    last  = float(df.iloc[-1]["close"])
-    chg   = ((last - prev) / prev * 100) if prev else 0
+    ev     = evaluate_bot_window(df, strategy, symbol, fetch_iv, higher_df, cfg)
+    prev   = float(df.iloc[-2]["close"]) if len(df) > 1 else float(df.iloc[-1]["close"])
+    last   = float(df.iloc[-1]["close"])
+    chg    = ((last - prev) / prev * 100) if prev else 0
     levels = calculate_trade_levels(df, ev["signal"], cfg.get("risk_reward", 2))
 
     return _cache_set(_summary_cache, cache_key, {
         "symbol":          symbol,
-        "market":          detect_market(symbol),
-        # [F] both raw and display-ready price
+        "market":          market,
         "price":           round(last, 6),
         "price_display":   format_price(last, symbol),
         "live_price":      round(last, 6),
@@ -1802,42 +1836,53 @@ def _adx_series(highs, lows, closes, period=14):
 def run_unified_bot_strategy(candles, starting_balance=1000,
                               fee_pct=0.04, slippage_pct=0.02):
     """
-    ICT / SMC Session Strategy v6 — Daily limits + guaranteed trade
+    ICT / SMC Strategy v7 — works on both intraday (5m) and daily candles.
 
-    Daily rules:
-      • STOP after 3 wins on the same calendar day
-      • STOP after 1 loss on the same calendar day
-      • GUARANTEE at least one trade per day via EMA fallback (14:00-16:00)
+    KEY FIX: When candles are daily (interval detected by timestamp gap ≥ 20h),
+    the session hour gates (Asian/London/NY) are disabled. The strategy falls
+    back to pure EMA+ADX+RSI trend-following on daily bars, which is the correct
+    approach since session logic only makes sense on intraday data.
 
-    Preferred path (SMC, 12:00-16:00 UTC):
-      Asian range → London sweep → NY reversal + EMA+ADX+SMC confirmation
+    Daily limits:
+      • STOP after 3 wins per day
+      • STOP after 1 loss per day
 
-    Fallback path (EMA, 14:00-16:00 UTC, if no SMC trade fired today):
-      EMA9/21 crossover + ADX + RSI — fires every qualifying day
+    Intraday path (5m bars):
+      SMC: Asian range → London sweep → NY reversal
+      Fallback: EMA+ADX at 14:00–16:00 UTC if no SMC trade
 
-    Risk: 1% starting_balance fixed. SL=1.5xATR, TP=4.5xATR (exact 3R).
+    Daily-candle path:
+      Pure EMA9>21>50 + ADX≥20 + RSI zone + ATR stop
+      One trade per daily bar, max 1 loss / 3 wins
+
+    Risk: 1% of starting_balance, fixed. SL=1.5×ATR, TP=3R (4.5×ATR).
+    Breakeven: move SL to entry after +1R.
+    Trail: activate at +1.5R, trail 1.5×ATR behind peak.
     """
 
-    RISK_PER_TRADE       = 0.01
-    REWARD_RISK          = 3.0
-    SL_ATR_MULT          = 1.5
-    TRAIL_ACTIVATE_R     = 2.0
-    TRAIL_ATR_MULT       = 1.5
-    COOLDOWN_BARS        = 2
-    ADX_MIN              = 18
-    RSI_BUY_MAX          = 72
-    RSI_SELL_MIN         = 28
-    ATR_PERIOD           = 14
-    RSI_PERIOD           = 14
-    ADX_PERIOD           = 14
-    WARMUP               = 55
-    ASIAN_MAX_ATR_MULT   = 12.0
-    MAX_WINS_PER_DAY     = 3
-    MAX_LOSSES_PER_DAY   = 1
+    RISK_PER_TRADE    = 0.01
+    REWARD_RISK       = 3.0
+    SL_ATR_MULT       = 1.5
+    BREAKEVEN_R       = 1.0    # move SL to entry after 1R
+    TRAIL_ACTIVATE_R  = 1.5    # activate trail at 1.5R (was 2.0 — too far)
+    TRAIL_ATR_MULT    = 1.5
+    COOLDOWN_BARS     = 2
+    ADX_MIN           = 18
+    RSI_BUY_LO        = 40     # widened from 48 — was blocking too many entries
+    RSI_BUY_HI        = 75
+    RSI_SELL_LO       = 25
+    RSI_SELL_HI       = 60     # widened from 52
+    ATR_PERIOD        = 14
+    RSI_PERIOD        = 14
+    ADX_PERIOD        = 14
+    WARMUP            = 55
+    ASIAN_MAX_ATR_MULT = 15.0  # relaxed from 12 — less filtering
+    MAX_WINS_PER_DAY  = 3
+    MAX_LOSSES_PER_DAY = 1
 
-    ASIAN_START  = 0;  ASIAN_END    = 7
-    LONDON_START = 7;  LONDON_END   = 12
-    NY_START     = 12; NY_END       = 20
+    ASIAN_START  = 0;  ASIAN_END   = 7
+    LONDON_START = 7;  LONDON_END  = 12
+    NY_START     = 12; NY_END      = 20
 
     trades       = []
     balance      = float(starting_balance)
@@ -1851,12 +1896,19 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
     day_losses   = 0
     day_traded   = False
 
-    if len(candles) < WARMUP + 10:
+    if len(candles) < WARMUP + 5:
         return trades, balance
 
     closes = [float(c[4]) for c in candles]
     highs  = [float(c[2]) for c in candles]
     lows   = [float(c[3]) for c in candles]
+
+    # ── Detect if candles are daily (gap ≥ 20 hours between bars) ────────
+    if len(candles) >= 2:
+        gap_ms    = int(candles[1][0]) - int(candles[0][0])
+        is_daily  = gap_ms >= 20 * 3600 * 1000
+    else:
+        is_daily  = False
 
     ema9  = _ema_series(closes, 9)
     ema21 = _ema_series(closes, 21)
@@ -1878,46 +1930,50 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
     def detect_fvg(i, direction):
         if i < 2: return None
         c0h=highs[i-2]; c0l=lows[i-2]; c2h=highs[i]; c2l=lows[i]; cur=closes[i]
-        if direction=="BUY"  and c0h<c2l and c0h<=cur<=c2l: return (c2l,c0h)
-        if direction=="SELL" and c0l>c2h and c2h<=cur<=c0l: return (c0l,c2h)
+        if direction=="BUY"  and c0h<c2l: return True   # gap exists (relaxed: don't need price IN gap)
+        if direction=="SELL" and c0l>c2h: return True
         return None
 
-    def detect_sweep(i, lookback=20):
-        if i<lookback: return None
+    def detect_sweep(i, lookback=10):   # reduced from 20 — more recent sweeps
+        if i < lookback: return None
         ph=max(highs[i-lookback:i]); pl=min(lows[i-lookback:i])
         if lows[i]<pl  and closes[i]>pl:  return "BULL_SWEEP"
         if highs[i]>ph and closes[i]<ph:  return "BEAR_SWEEP"
         return None
 
+    # ── Session cache (only used for intraday) ────────────────────────────
     from collections import defaultdict
     day_sessions = defaultdict(lambda: {
         "asian_high":None,"asian_low":None,
         "london_high":None,"london_low":None,
         "london_swept_high":False,"london_swept_low":False,
     })
-    for j in range(len(candles)):
-        d=candle_date(j); hr=candle_utc_hour(j); h=highs[j]; l=lows[j]; ds=day_sessions[d]
-        if ASIAN_START<=hr<ASIAN_END:
-            ds["asian_high"]=max(h,ds["asian_high"] or h); ds["asian_low"]=min(l,ds["asian_low"] or l)
-        if LONDON_START<=hr<LONDON_END:
-            ds["london_high"]=max(h,ds["london_high"] or h); ds["london_low"]=min(l,ds["london_low"] or l)
-            if ds["asian_high"] and h>ds["asian_high"]: ds["london_swept_high"]=True
-            if ds["asian_low"]  and l<ds["asian_low"]:  ds["london_swept_low"]=True
+    if not is_daily:
+        for j in range(len(candles)):
+            d=candle_date(j); hr=candle_utc_hour(j); h=highs[j]; l=lows[j]; ds=day_sessions[d]
+            if ASIAN_START<=hr<ASIAN_END:
+                ds["asian_high"]=max(h,ds["asian_high"] or h); ds["asian_low"]=min(l,ds["asian_low"] or l)
+            if LONDON_START<=hr<LONDON_END:
+                ds["london_high"]=max(h,ds["london_high"] or h); ds["london_low"]=min(l,ds["london_low"] or l)
+                if ds["asian_high"] and h>ds["asian_high"]: ds["london_swept_high"]=True
+                if ds["asian_low"]  and l<ds["asian_low"]:  ds["london_swept_low"]=True
 
+    # ── Main loop ─────────────────────────────────────────────────────────
     for i in range(WARMUP, len(candles)):
 
         e9=ema9[i]; e21=ema21[i]; e50=ema50[i]
         atr_v=atr[i]; rsi_v=rsi[i]; adx_v=adx[i]
 
         if any(v is None for v in [e9,e21,e50,atr_v,rsi_v,adx_v]): continue
-        if atr_v<=0: continue
+        if atr_v <= 0: continue
 
         close=closes[i]; hi=highs[i]; lo=lows[i]
         t_str=_ts_to_str(candles[i][0])
-        today=candle_date(i); hour=candle_utc_hour(i)
+        today=candle_date(i)
+        hour=candle_utc_hour(i) if not is_daily else 12  # treat daily bars as mid-day
 
-        # Reset daily counters on new day
-        if today!=current_day:
+        # Reset daily counters
+        if today != current_day:
             current_day=today; day_wins=0; day_losses=0; day_traded=False
 
         # ── Manage open position ──────────────────────────────────────────
@@ -1925,11 +1981,19 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
             side=position["side"]; ep=position["entry"]; sl=position["sl"]
             tp=position["tp"]; r_dist=position["r_dist"]
             trail_act=position["trail_active"]; trail_sl=position["trail_sl"]; peak=position["peak"]
+            be_moved=position.get("be_moved", False)
 
             if side=="BUY":
                 if hi>peak: peak=hi; position["peak"]=peak
             else:
                 if lo<peak: peak=lo; position["peak"]=peak
+
+            # Move SL to breakeven after +1R
+            if not be_moved:
+                if side=="BUY"  and peak >= ep + r_dist * BREAKEVEN_R:
+                    position["sl"] = ep; sl = ep; position["be_moved"] = True
+                elif side=="SELL" and peak <= ep - r_dist * BREAKEVEN_R:
+                    position["sl"] = ep; sl = ep; position["be_moved"] = True
 
             exit_price=exit_reason=None
 
@@ -1947,7 +2011,7 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                     exit_price=eff_sl; exit_reason="Trailing stop" if trail_act else "Stop loss"
                 elif hi>=tp:
                     exit_price,exit_reason=tp,"Take profit"
-                elif hour>=NY_END and not trail_act:
+                elif not is_daily and hour>=NY_END and not trail_act:
                     exit_price,exit_reason=close,"Session end"
             else:
                 if not trail_act and peak<=ep-r_dist*TRAIL_ACTIVATE_R:
@@ -1963,7 +2027,7 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                     exit_price=eff_sl; exit_reason="Trailing stop" if trail_act else "Stop loss"
                 elif lo<=tp:
                     exit_price,exit_reason=tp,"Take profit"
-                elif hour>=NY_END and not trail_act:
+                elif not is_daily and hour>=NY_END and not trail_act:
                     exit_price,exit_reason=close,"Session end"
 
             if exit_price is not None:
@@ -1984,101 +2048,113 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
             continue
 
         if cooldown>0: cooldown-=1; continue
-
-        # ── Daily limits ──────────────────────────────────────────────────
         if day_losses>=MAX_LOSSES_PER_DAY: continue
         if day_wins>=MAX_WINS_PER_DAY:     continue
-        if not (NY_START<=hour<NY_END):    continue
+        if day_traded: continue            # one entry attempt per day
 
-        ds=day_sessions[today]
-        a_hi=ds["asian_high"]; a_lo=ds["asian_low"]
-        l_hi=ds["london_high"]; l_lo=ds["london_low"]
-        has_data=all([a_hi,a_lo,l_hi,l_lo])
-        asian_range=(a_hi-a_lo) if has_data else 0
-        asian_mid=((a_hi+a_lo)/2) if has_data else 0
-
-        # ── PATH A: SMC session trade (12:00-16:00) ───────────────────────
+        # ── PATH A: SMC session trade (intraday only, 12:00-16:00) ───────
         smc_entry=False; ny_direction=None; smc_type=""
 
-        if not day_traded and hour<16 and has_data:
-            sh=ds["london_swept_high"]; sl_=ds["london_swept_low"]
-            if asian_range<=atr_v*ASIAN_MAX_ATR_MULT and (sh or sl_):
-                if sh and sl_:
-                    ny_direction="SELL" if (l_hi-a_hi)>=(a_lo-l_lo) else "BUY"
-                elif sh: ny_direction="SELL"
-                else:    ny_direction="BUY"
+        if not is_daily and NY_START<=hour<16:
+            ds=day_sessions[today]
+            a_hi=ds["asian_high"]; a_lo=ds["asian_low"]
+            l_hi=ds["london_high"]; l_lo=ds["london_low"]
+            has_data=all([a_hi,a_lo,l_hi,l_lo])
+            asian_range=(a_hi-a_lo) if has_data else 0
+            asian_mid=((a_hi+a_lo)/2) if has_data else 0
 
-                macro_ok=True
-                if e50 and e50>0:
-                    pct=(close-e50)/e50*100
-                    if ny_direction=="SELL" and pct>1.0:  macro_ok=False
-                    if ny_direction=="BUY"  and pct<-1.0: macro_ok=False
+            if has_data:
+                sh=ds["london_swept_high"]; sl_=ds["london_swept_low"]
+                if asian_range<=atr_v*ASIAN_MAX_ATR_MULT and (sh or sl_):
+                    if sh and sl_:
+                        ny_direction="SELL" if (l_hi-a_hi)>=(a_lo-l_lo) else "BUY"
+                    elif sh: ny_direction="SELL"
+                    else:    ny_direction="BUY"
 
-                if macro_ok:
-                    mid_ok=((ny_direction=="BUY" and close>=asian_mid) or
-                            (ny_direction=="SELL" and close<=asian_mid))
-                    ema_ok=((ny_direction=="BUY"  and e9>e21 and rsi_v<RSI_BUY_MAX) or
-                            (ny_direction=="SELL" and e9<e21 and rsi_v>RSI_SELL_MIN))
-                    adx_ok=adx_v>=ADX_MIN
+                    macro_ok=True
+                    if e50 and e50>0:
+                        pct=(close-e50)/e50*100
+                        if ny_direction=="SELL" and pct>1.5:  macro_ok=False  # relaxed from 1.0
+                        if ny_direction=="BUY"  and pct<-1.5: macro_ok=False
 
-                    if mid_ok and ema_ok and adx_ok:
-                        fvg=detect_fvg(i,ny_direction)
-                        sweep=detect_sweep(i,lookback=20)
-                        rp=rsi[i-1] if i>0 and rsi[i-1] is not None else None
-                        v_fvg=(fvg is not None)
-                        v_sw=((sweep=="BULL_SWEEP" and ny_direction=="BUY") or
-                              (sweep=="BEAR_SWEEP" and ny_direction=="SELL"))
-                        v_rsi=(rp is not None and (
-                            (ny_direction=="BUY"  and rsi_v>rp and rsi_v<62) or
-                            (ny_direction=="SELL" and rsi_v<rp and rsi_v>38)))
-                        v_mid=any(
-                            (ny_direction=="BUY"  and closes[j]<=asian_mid) or
-                            (ny_direction=="SELL" and closes[j]>=asian_mid)
-                            for j in range(max(0,i-12),i+1))
-                        if v_fvg or v_sw or v_rsi or v_mid:
-                            smc_entry=True
-                            smc_type=("FVG" if v_fvg else "Sweep" if v_sw
-                                      else "RSI" if v_rsi else "Mid-cross")
+                    if macro_ok:
+                        mid_ok=((ny_direction=="BUY" and close>=asian_mid) or
+                                (ny_direction=="SELL" and close<=asian_mid))
+                        ema_ok=((ny_direction=="BUY"  and e9>e21 and rsi_v<RSI_BUY_HI) or
+                                (ny_direction=="SELL" and e9<e21 and rsi_v>RSI_SELL_LO))
+                        adx_ok=adx_v>=ADX_MIN
 
-        # ── PATH B: Fallback EMA (14:00-16:00 if no SMC trade yet) ───────
-        # Stricter than SMC path — requires:
-        #   • Strong ADX (≥25, not just ≥18) — genuine trend momentum
-        #   • RSI in momentum zone (50-68 buy / 32-50 sell) — not random
-        #   • EMA9 slope rising/falling (not just crossed, but accelerating)
-        #   • Price on correct side of EMA50 (macro alignment)
+                        if mid_ok and ema_ok and adx_ok:
+                            fvg=detect_fvg(i,ny_direction)
+                            sweep=detect_sweep(i,lookback=10)
+                            rp=rsi[i-1] if i>0 and rsi[i-1] is not None else None
+                            v_fvg=(fvg is not None)
+                            v_sw=((sweep=="BULL_SWEEP" and ny_direction=="BUY") or
+                                  (sweep=="BEAR_SWEEP" and ny_direction=="SELL"))
+                            v_rsi=(rp is not None and (
+                                (ny_direction=="BUY"  and rsi_v>rp and rsi_v<70) or
+                                (ny_direction=="SELL" and rsi_v<rp and rsi_v>30)))
+                            v_mid=any(
+                                (ny_direction=="BUY"  and closes[j]<=asian_mid) or
+                                (ny_direction=="SELL" and closes[j]>=asian_mid)
+                                for j in range(max(0,i-15),i+1))  # widened from 12
+                            if v_fvg or v_sw or v_rsi or v_mid:
+                                smc_entry=True
+                                smc_type=("FVG" if v_fvg else "Sweep" if v_sw
+                                          else "RSI" if v_rsi else "Mid-cross")
+
+        # ── PATH B: Fallback EMA — works for BOTH intraday AND daily ─────
+        # For intraday: only fires 14:00-16:00 if no SMC trade
+        # For daily:    fires on any bar with quality EMA+ADX+RSI setup
         fallback=False
-        if not day_traded and not smc_entry and 14<=hour<16:
+        intraday_fallback_window = (not is_daily and not smc_entry and 14<=hour<16)
+        daily_fallback_window    = (is_daily and not smc_entry)
+
+        if intraday_fallback_window or daily_fallback_window:
             e9_prev=ema9[i-1] if i>0 else None
-            e50_ok=(e50 and e50>0)
-            adx_strong=(adx_v>=25)
-            if adx_strong and e9_prev is not None:
+            adx_ok_fb=(adx_v>=(22 if is_daily else 25))  # slightly looser for daily
+            if adx_ok_fb and e9_prev is not None:
                 bull_slope=e9>e9_prev
                 bear_slope=e9<e9_prev
-                macro_bull=(not e50_ok or close>e50)
-                macro_bear=(not e50_ok or close<e50)
-                if e9>e21 and bull_slope and 50<rsi_v<68 and macro_bull:
+                e50_ok=(e50 and e50>0)
+                macro_bull=(not e50_ok or close>=e50)
+                macro_bear=(not e50_ok or close<=e50)
+                # Widened RSI bands vs previous version
+                if (e9>e21 and bull_slope and RSI_BUY_LO<rsi_v<RSI_BUY_HI
+                        and macro_bull):
                     ny_direction="BUY";  fallback=True
-                elif e9<e21 and bear_slope and 32<rsi_v<50 and macro_bear:
+                elif (e9<e21 and bear_slope and RSI_SELL_LO<rsi_v<RSI_SELL_HI
+                        and macro_bear):
                     ny_direction="SELL"; fallback=True
 
         # ── Open position ─────────────────────────────────────────────────
         if (smc_entry or fallback) and ny_direction:
             sl_dist=atr_v*SL_ATR_MULT
+            # Minimum SL distance: at least 0.1% of price (avoids noise stops)
+            min_sl=close*0.001
+            sl_dist=max(sl_dist, min_sl)
             if sl_dist<=0: continue
+
             if ny_direction=="BUY":
                 ep=close*(1+slip_rate); sl_p=ep-sl_dist; tp_p=ep+sl_dist*REWARD_RISK
             else:
                 ep=close*(1-slip_rate); sl_p=ep+sl_dist; tp_p=ep-sl_dist*REWARD_RISK
+
             size=risk_dollar/sl_dist
             if size<=0: continue
-            path="SMC" if smc_entry else "Fallback-EMA"
+
+            path="SMC" if smc_entry else ("Daily-EMA" if is_daily else "Fallback-EMA")
             if smc_entry:
-                setup=f"{smc_type}|Lon {'shi' if ds['london_swept_high'] else 'slo'}|Asian {asian_range:.0f}|{path}"
+                ds=day_sessions[today]
+                setup=(f"{smc_type}|Lon {'shi' if ds['london_swept_high'] else 'slo'}|{path}")
             else:
-                setup=f"{path}|EMA {'bull' if ny_direction=='BUY' else 'bear'}|ADX {adx_v:.0f}"
+                setup=(f"{path}|EMA {'bull' if ny_direction=='BUY' else 'bear'}"
+                       f"|ADX {adx_v:.0f}|RSI {rsi_v:.0f}")
+
             position={"side":ny_direction,"entry":ep,"time":t_str,"sl":sl_p,"tp":tp_p,
                       "r_dist":risk_dollar,"size":size,"trail_active":False,
-                      "trail_sl":sl_p,"peak":ep,"entry_bar":i,"setup":setup}
+                      "trail_sl":sl_p,"peak":ep,"entry_bar":i,"setup":setup,
+                      "be_moved":False}
             day_traded=True
 
     return trades, balance
