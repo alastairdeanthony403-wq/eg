@@ -1400,12 +1400,6 @@ def run_vwap_ema_strategy(candles, starting_balance=1000,
         else:
             daily_adr[d] = None
 
-    # FIX: pre-compute a global ATR-based ADR fallback so that the strategy can
-    # fire on short backtest windows (< ADR_PERIOD complete ET days).
-    # Without this, any backtest shorter than 10 trading days produces zero trades.
-    _all_ranges = [r for r in daily_ranges if r > 0]
-    _adr_fallback = sum(_all_ranges) / len(_all_ranges) if _all_ranges else None
-
     # Main loop
     position     = None
     current_day  = None
@@ -1428,7 +1422,7 @@ def run_vwap_ema_strategy(candles, starting_balance=1000,
         if d != current_day:
             current_day = d; day_traded = False
 
-        adr = daily_adr.get(d) or _adr_fallback   # fall back to global mean when < ADR_PERIOD days
+        adr = daily_adr.get(d)
 
         # Force-close at 16:00 ET
         if position is not None and hm >= CLOSE_ET:
@@ -1513,15 +1507,10 @@ def run_vwap_ema_strategy(candles, starting_balance=1000,
                     exit_reason = "Trailing stop" if tp1_hit else "Stop loss"
 
             if exit_price is not None:
-                # BUG FIX: before TP1 is hit, the full position must be closed.
-                # sz_rem is the 50% remainder kept AFTER a partial TP1 exit.
-                # Using sz_rem when tp1_hit=False would silently abandon half the trade.
-                close_sz = sz_rem if tp1_hit else sz_full
-                raw_pnl  = ((exit_price - ep) if side == "BUY" else (ep - exit_price)) * close_sz
-                fee      = ep * close_sz * fee_pct / 100 * 2
-                net      = raw_pnl - fee
+                raw_pnl = ((exit_price - ep) if side == "BUY" else (ep - exit_price)) * sz_rem
+                fee     = ep * sz_rem * fee_pct / 100 * 2
+                net     = raw_pnl - fee
                 balance += net
-                reason_suffix = " (remainder)" if tp1_hit else ""
                 trades.append({
                     "side":       side,
                     "entry":      round(ep, 6),
@@ -1529,7 +1518,7 @@ def run_vwap_ema_strategy(candles, starting_balance=1000,
                     "entry_time": position["time"],
                     "exit_time":  t_str,
                     "pnl":        round(net, 4),
-                    "reason":     exit_reason + reason_suffix,
+                    "reason":     exit_reason + " (remainder)",
                     "setup":      position.get("setup", ""),
                 })
                 position = None
