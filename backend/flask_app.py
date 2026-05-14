@@ -2,21 +2,23 @@
 AI Trading Engine — Flask backend
 Routes are mounted under /api.
 
-Fixes in this version
-─────────────────────
-[A] TwelveData candles: use 5m (not 1m) for signals — free tier supports it reliably.
-[B] TwelveData range fetch: new fetch_twelvedata_range() picks a random historical
-    window using the `start_date` / `end_date` query params supported by TwelveData.
-[C] Backtester for non-crypto: retry up to 3 random date windows if one is thin.
-[D] Backtester strategies:
-      • run_simple_ma_strategy — fixed PnL scaling (use percentage return, not raw diff)
-      • run_unified_bot_strategy — loosened entry conditions so it produces trades in
-        short windows; added short-side entries; fixed fee formula for small prices.
-[E] /api/signals: fetch with 5m interval → higher hit-rate on TwelveData free tier.
-[F] Price display: always return both `price` (raw) and `price_display` (pre-formatted
-    string) so the frontend can just show `price_display` without guessing decimals.
+Data sources
+────────────
+Crypto          : Binance REST API (Coinbase fallback)
+Forex / Stocks
+/ Commodities   : Polygon.io REST API (/v2/aggs) — single unified key: POLYGON_API_KEY
+
+Key fixes in this version
+─────────────────────────
+[A] Replaced TwelveData with Polygon.io for all non-crypto data.
+[B] Backtester for non-crypto uses Polygon daily bars (1825-day history, 30-min cache).
+[C] Backtester prepends 80 warmup bars so strategies can initialise on short windows.
+[D] run_simple_ma_strategy — fixed PnL scaling (percentage return, not raw price diff).
+[E] run_unified_bot_strategy — London no-acceptance filter, 3-candle FVG, FVG entry,
+    sweep depth gate, NY window extended to 17:00 GMT.
+[F] Price display: returns both `price` and `price_display` for the frontend.
 [G] /api/backtest: descriptive error messages at every failure point.
-[H] Symbols endpoint now also returns market membership so the frontend can group them.
+[H] Symbols endpoint returns market membership for frontend grouping.
 """
 
 from flask import Flask, jsonify, request, g
@@ -76,33 +78,40 @@ ALL_SYMBOLS = (
     + MARKETS["commodities"]
 )
 
-# TwelveData symbol name map (their API uses different identifiers)
-TD_SYMBOL_MAP = {
-    # Forex — slash-separated pairs
-    "EURUSD": "EUR/USD", "GBPUSD": "GBP/USD", "USDJPY": "USD/JPY",
-    "AUDUSD": "AUD/USD", "USDCAD": "USD/CAD",
-    # Commodities — TwelveData correct identifiers
-    "XAUUSD": "XAU/USD",   # Gold spot
-    "XAGUSD": "XAG/USD",   # Silver spot
-    "USOIL":  "WTI/USD",   # WTI Crude (TwelveData accepts this)
-    "UKOIL":  "BRENT/USD", # Brent Crude
-    # Stocks — pass through as-is (TwelveData uses normal tickers)
+# Polygon.io ticker map — translates internal symbols to Polygon API tickers.
+# Forex + metals use the "C:" prefix (Polygon Forex/FX endpoint).
+# Oil uses liquid ETF proxies available on all Polygon plans (USO = WTI, BNO = Brent).
+# Stocks pass through directly.
+POLYGON_SYMBOL_MAP = {
+    # Forex
+    "EURUSD": "C:EURUSD", "GBPUSD": "C:GBPUSD", "USDJPY": "C:USDJPY",
+    "AUDUSD": "C:AUDUSD", "USDCAD": "C:USDCAD",
+    # Metals (available via Polygon FX endpoint with C: prefix)
+    "XAUUSD": "C:XAUUSD",   # Gold spot
+    "XAGUSD": "C:XAGUSD",   # Silver spot
+    # Oil — ETF proxies available on all Polygon plans
+    "USOIL":  "USO",         # United States Oil Fund (WTI)
+    "UKOIL":  "BNO",         # iPath S&P GSCI Crude Oil ETF (Brent)
+    # Stocks
     "AAPL": "AAPL", "TSLA": "TSLA", "NVDA": "NVDA",
     "MSFT": "MSFT", "AMZN": "AMZN", "SPY":  "SPY",
 }
 
-# Fallback symbols to try if primary fails (TwelveData has multiple identifiers)
-TD_SYMBOL_FALLBACKS = {
-    "USOIL":  ["WTI/USD", "USOIL", "CL1!"],
-    "UKOIL":  ["BRENT/USD", "UKOIL", "BRN1!"],
-    "XAGUSD": ["XAG/USD", "XAGUSD"],
-    "XAUUSD": ["XAU/USD", "XAUUSD"],
+# Interval → (multiplier, timespan) for Polygon /v2/aggs
+POLYGON_INTERVAL_MAP = {
+    "1m":  (1,  "minute"),
+    "5m":  (5,  "minute"),
+    "15m": (15, "minute"),
+    "30m": (30, "minute"),
+    "1h":  (1,  "hour"),
+    "4h":  (4,  "hour"),
+    "1d":  (1,  "day"),
 }
 
-# TwelveData interval map
-TD_INTERVAL_MAP = {
-    "1m": "1min", "5m": "5min", "15m": "15min",
-    "30m": "30min", "1h": "1h", "4h": "4h", "1d": "1day",
+# Approximate ms per bar — used to compute the from/to window
+_POLYGON_INTERVAL_MS = {
+    "1m": 60_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000,
+    "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000,
 }
 
 # [A] Signals always use 5m — much better TwelveData hit rate on the free tier
@@ -142,29 +151,28 @@ SUMMARY_TTL_SECONDS        = 90   # cache signals for 90 s — gives backtest ro
 NON_CRYPTO_CANDLE_TTL      = 600  # cache non-crypto candles for 10 min
 
 _raw_candle_cache    = {}
-_non_crypto_cache    = {}   # separate long-lived cache for TwelveData responses
+_non_crypto_cache    = {}   # separate long-lived cache for Polygon.io responses
 _summary_cache       = {}
 
-# ── TwelveData rate-limiter ──────────────────────────────────────────────────
-# Free plan: 8 credits/minute.  We enforce ≥10 s between outgoing TD requests
-# so we never exceed 6/min even if signals and backtester fire simultaneously.
-_td_lock            = __import__("threading").Lock()
-_td_last_call_time  = 0.0
-TD_MIN_INTERVAL_SEC = 10.0        # seconds between TwelveData HTTP calls
+# ── Polygon.io rate-limiter ──────────────────────────────────────────────────
+# Free plan: 5 calls/minute.  Starter+: unlimited.
+# We enforce ≥12 s between requests to stay safely inside free-plan limits.
+# On paid plans, set POLYGON_RATE_LIMIT_SECS=0 in env to disable the delay.
+_polygon_lock          = __import__("threading").Lock()
+_polygon_last_call_ts  = 0.0
+POLYGON_RATE_LIMIT_SECS = float(os.environ.get("POLYGON_RATE_LIMIT_SECS", "12"))
 
 
-def _td_rate_limited_get(params, timeout=25):
-    """Call TwelveData time_series, blocking until the rate-limit gap has passed."""
-    global _td_last_call_time
-    with _td_lock:
-        now     = time.time()
-        elapsed = now - _td_last_call_time
-        if elapsed < TD_MIN_INTERVAL_SEC:
-            time.sleep(TD_MIN_INTERVAL_SEC - elapsed)
-        _td_last_call_time = time.time()
-    r = requests.get("https://api.twelvedata.com/time_series",
-                     params=params, timeout=timeout)
-    return r
+def _polygon_get(url, params, timeout=25):
+    """GET a Polygon.io URL, rate-limited to POLYGON_RATE_LIMIT_SECS between calls."""
+    global _polygon_last_call_ts
+    if POLYGON_RATE_LIMIT_SECS > 0:
+        with _polygon_lock:
+            elapsed = time.time() - _polygon_last_call_ts
+            if elapsed < POLYGON_RATE_LIMIT_SECS:
+                time.sleep(POLYGON_RATE_LIMIT_SECS - elapsed)
+            _polygon_last_call_ts = time.time()
+    return requests.get(url, params=params, timeout=timeout)
 
 BINANCE_BASE_URLS = [
     "https://api.binance.com",
@@ -502,141 +510,129 @@ def fetch_binance_range(symbol, interval, start_ms, end_ms, limit=1000):
 
 
 # ─────────────────────────────────────────────
-# TWELVEDATA (FOREX / STOCKS / COMMODITIES)
+# POLYGON.IO (FOREX / STOCKS / COMMODITIES)
 # ─────────────────────────────────────────────
 
-def _td_symbol(symbol):
-    return TD_SYMBOL_MAP.get(symbol, symbol)
-
-
-def fetch_twelvedata_candles(symbol, interval, limit=200,
-                              start_date=None, end_date=None):
+def fetch_polygon_candles(symbol, interval, limit=200):
     """
-    Fetch candles from TwelveData with rate-limiting + long-lived caching.
-    Tries fallback symbols if the primary fails (e.g. USOIL → WTI/USD → USOIL).
-    Ensures all OHLCV values are converted to float.
+    Fetch OHLCV candles from Polygon.io for any non-crypto symbol.
+
+    Endpoint: /v2/aggs/ticker/{ticker}/range/{multiplier}/{timespan}/{from}/{to}
+
+    Symbol routing:
+      Forex / metals  →  C:EURUSD, C:XAUUSD, etc.
+      Stocks          →  AAPL, TSLA, SPY, etc.
+      Oil (USO/BNO)   →  stock ETF tickers available on all plans
+
+    Returns list of [ts_ms, open, high, low, close, volume] as strings,
+    oldest-first, matching the same format as fetch_binance_raw().
     """
-    api_key = os.environ.get("TWELVEDATA_API_KEY", "")
+    api_key = os.environ.get("POLYGON_API_KEY", "")
     if not api_key:
         raise RuntimeError(
-            "TWELVEDATA_API_KEY is not set. "
+            "POLYGON_API_KEY is not set. "
             "Add it to your Render environment variables."
         )
 
-    td_interval = TD_INTERVAL_MAP.get(interval)
-    if not td_interval:
-        # Auto-upgrade 1m to 5m for non-crypto on free plan
+    interval_cfg = POLYGON_INTERVAL_MAP.get(interval)
+    if not interval_cfg:
+        # Auto-upgrade 1m → 5m for non-crypto to reduce API load
         if interval == "1m":
-            td_interval = "5min"
+            interval_cfg = POLYGON_INTERVAL_MAP["5m"]
         else:
             raise RuntimeError(
-                f"TwelveData does not support interval '{interval}'. "
-                f"Supported: {list(TD_INTERVAL_MAP.keys())}"
+                f"Polygon does not support interval '{interval}'. "
+                f"Supported: {list(POLYGON_INTERVAL_MAP.keys())}"
             )
+    multiplier, timespan = interval_cfg
 
-    # Build list of symbols to try
-    primary  = TD_SYMBOL_MAP.get(symbol, symbol)
-    fallback = TD_SYMBOL_FALLBACKS.get(symbol, [])
-    symbols_to_try = [primary] + [s for s in fallback if s != primary]
+    ticker = POLYGON_SYMBOL_MAP.get(symbol, symbol)
 
-    # Cache key
-    nc_key = (symbol, interval, limit, start_date, end_date)
+    # Cache check
+    nc_key = (symbol, interval, limit)
     cached = _cache_get(_non_crypto_cache, nc_key, NON_CRYPTO_CANDLE_TTL)
     if cached is not None:
         return cached
 
-    last_error = None
-    for td_sym in symbols_to_try:
-        params = {
-            "symbol":     td_sym,
-            "interval":   td_interval,
-            "outputsize": min(limit, 5000),
-            "apikey":     api_key,
-            "format":     "JSON",
-        }
-        if start_date:
-            params["start_date"] = start_date
-        if end_date:
-            params["end_date"] = end_date
+    # Compute from/to window — request enough history to fill `limit` bars,
+    # with a 3× buffer to account for weekends and market closures.
+    bar_ms   = _POLYGON_INTERVAL_MS.get(interval, 300_000)
+    now_ms   = int(time.time() * 1000)
+    from_ms  = now_ms - int(bar_ms * limit * 3)
+    from_dt  = datetime.utcfromtimestamp(from_ms / 1000).strftime("%Y-%m-%d")
+    to_dt    = datetime.utcfromtimestamp(now_ms   / 1000).strftime("%Y-%m-%d")
 
+    url    = (f"https://api.polygon.io/v2/aggs/ticker/{ticker}"
+              f"/range/{multiplier}/{timespan}/{from_dt}/{to_dt}")
+    params = {
+        "adjusted": "true",
+        "sort":     "asc",
+        "limit":    min(limit * 3, 50000),   # Polygon max per page
+        "apiKey":   api_key,
+    }
+
+    try:
+        r    = _polygon_get(url, params, timeout=25)
+        data = r.json()
+    except Exception as e:
+        raise RuntimeError(f"Polygon network error for {symbol} ({ticker}): {e}")
+
+    status = data.get("status", "")
+    if status in ("ERROR", "NOT_AUTHORIZED", "DELAYED"):
+        raise RuntimeError(
+            f"Polygon error for {symbol} ({ticker}): "
+            f"{data.get('error', data.get('message', status))}"
+        )
+
+    results = data.get("results") or []
+    if not results:
+        raise RuntimeError(
+            f"Polygon returned 0 bars for {symbol} ({ticker}). "
+            f"Check that the symbol is supported on your plan and markets are not closed."
+        )
+
+    candles = []
+    for bar in results:
         try:
-            r    = _td_rate_limited_get(params, timeout=25)
-            data = r.json()
-        except Exception as e:
-            last_error = f"Network error for {td_sym}: {e}"
+            ts  = int(bar["t"])
+            o   = float(bar["o"])
+            h   = float(bar["h"])
+            lo_ = float(bar["l"])
+            c   = float(bar["c"])
+            vol = float(bar.get("v") or 0)
+        except (KeyError, TypeError, ValueError):
             continue
-
-        if "values" not in data:
-            code    = data.get("code", "?")
-            message = data.get("message", str(data)[:200])
-            if str(code) == "429":
-                raise RuntimeError(
-                    f"TwelveData rate limit hit for {symbol}. "
-                    f"Free plan: 8 credits/minute. Wait ~60 s and retry."
-                )
-            last_error = f"TwelveData [{code}] for {td_sym}: {message}"
-            continue   # try next fallback symbol
-
-        values = data["values"]
-        if not values:
-            last_error = f"TwelveData returned 0 candles for {td_sym}"
+        if c <= 0 or h <= 0 or lo_ <= 0:
             continue
+        candles.append([ts, str(o), str(h), str(lo_), str(c), str(vol)])
 
-        candles = []
-        for item in reversed(values):   # TwelveData returns newest-first
-            try:
-                ts = int(datetime.fromisoformat(item["datetime"]).timestamp() * 1000)
-            except Exception:
-                continue
-            try:
-                o   = float(item["open"])
-                h   = float(item["high"])
-                lo_ = float(item["low"])
-                c   = float(item["close"])
-                vol = float(item.get("volume") or 0)
-            except (TypeError, ValueError):
-                continue
-            # Skip candles with zero or invalid prices
-            if c <= 0 or h <= 0 or lo_ <= 0:
-                continue
-            candles.append([ts, str(o), str(h), str(lo_), str(c), str(vol)])
+    # Keep only the most recent `limit` bars
+    candles = candles[-limit:]
 
-        if candles:
-            _cache_set(_non_crypto_cache, nc_key, candles)
-            return candles
+    if not candles:
+        raise RuntimeError(
+            f"Polygon returned bars for {symbol} but all had invalid prices."
+        )
 
-        last_error = f"All {len(values)} candles from {td_sym} had invalid prices"
-
-    # All symbols tried and failed
-    raise RuntimeError(
-        f"Could not fetch candles for {symbol} from TwelveData "
-        f"(tried: {symbols_to_try}). Last error: {last_error}"
-    )
+    _cache_set(_non_crypto_cache, nc_key, candles)
+    return candles
 
 
 # ─────────────────────────────────────────────
-# NON-CRYPTO BACKTEST DATA STRATEGY
+# NON-CRYPTO BACKTEST DATA (Polygon daily bars)
 # ─────────────────────────────────────────────
-# Problem: TwelveData free plan = 8 credits/minute.
-# Signals already use ~14 credits per refresh for non-crypto symbols.
-# Running a backtest on top of that causes 429 rate limit errors.
-#
-# Solution:
-#   1. For backtesting, always use the DAILY interval (1 credit per symbol).
-#      One daily call fetches up to 5000 days of history — no extra credits.
-#   2. Cache the daily result for 30 minutes so repeated backtests are free.
-#   3. The strategy still works on daily candles — the EMA/ADX/RSI signals
-#      are actually MORE reliable on daily than on 5m (less noise).
-#   4. Surface a clear message telling the user this is happening.
+# Polygon free plan has no per-minute credit limit (unlike TwelveData),
+# so we can request daily bars freely. We still cache for 30 min to avoid
+# hammering the API on repeated backtest runs.
 # ─────────────────────────────────────────────
 
-_backtest_daily_cache = {}  # symbol → candles, long-lived cache
+_backtest_daily_cache = {}
 BACKTEST_DAILY_TTL    = 1800  # 30 minutes
 
 
 def fetch_non_crypto_backtest_candles(symbol, period_days, random_window=True):
     """
-    Fetch daily candles for non-crypto backtest via TwelveData.
+    Fetch daily candles for non-crypto backtest via Polygon.io.
     Uses 1d interval → only 1 API credit per call.
     Cached for 30 min so repeated runs cost nothing.
     Returns (candles, "1d", start_date, end_date).
@@ -646,15 +642,15 @@ def fetch_non_crypto_backtest_candles(symbol, period_days, random_window=True):
     if cached is None:
         # Fetch up to 5 years of daily data in one credit
         try:
-            candles = fetch_twelvedata_candles(symbol, "1d", limit=1825)
+            candles = fetch_polygon_candles(symbol, "1d", limit=1825)
         except RuntimeError as e:
             raise RuntimeError(
-                f"Could not load daily data for {symbol} from TwelveData.\n{e}\n\n"
-                f"Tip: wait 60 seconds for the rate limit to reset, then try again."
+                f"Could not load daily data for {symbol} from Polygon.io.\n{e}\n\n"
+                f"Check that POLYGON_API_KEY is set and the symbol is supported on your plan."
             )
         if not candles or len(candles) < 30:
             raise RuntimeError(
-                f"TwelveData returned only {len(candles) if candles else 0} daily "
+                f"Polygon returned only {len(candles) if candles else 0} daily "
                 f"candles for {symbol}. The symbol may not be supported on your plan."
             )
         _cache_set(_backtest_daily_cache, symbol, candles)
@@ -684,7 +680,7 @@ def fetch_non_crypto_backtest_candles(symbol, period_days, random_window=True):
     if len(window) < 5:
         raise RuntimeError(
             f"Not enough daily candles for {symbol} "
-            f"(got {len(window)}). The symbol may not be available on your TwelveData plan."
+            f"(got {len(window)}). The symbol may not be available on your Polygon plan."
         )
 
     # Extract date range for display — show only the user's requested window
@@ -706,9 +702,9 @@ def fetch_candles_for_symbol(symbol, interval="5m", limit=200):
     market = detect_market(symbol)
     if market == "crypto":
         return fetch_binance_raw(symbol, interval, limit)
-    candles = fetch_twelvedata_candles(symbol, interval, limit)
+    candles = fetch_polygon_candles(symbol, interval, limit)
     if not candles:
-        raise RuntimeError(f"No TwelveData candles returned for {symbol}")
+        raise RuntimeError(f"No Polygon candles returned for {symbol}")
     return candles
 
 
@@ -1000,7 +996,7 @@ def get_symbol_summary(symbol, strategy="bot", interval=SIGNALS_INTERVAL, cfg=No
     if df is None:
         return None
 
-    # Only fetch higher TF for crypto (free TwelveData plan: 8 credits/min)
+    # Only fetch higher TF for crypto — Polygon is cheaper but still rate-limited
     # Non-crypto higher TF would double the credits used per symbol
     market = detect_market(symbol)
     if market == "crypto":
@@ -1874,9 +1870,9 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
     ASIAN_END     =  480   # 08:00
     LONDON_START  =  480   # 08:00
     LONDON_END    =  630   # 10:30
-    NY_START      =  780   # 13:00
-    NY_END        =  900   # 15:00
-    SESSION_CLOSE = 1200   # 20:00 hard close
+    NY_START      =  780   # 13:00  — NY open, reversal entry window begins
+    NY_END        = 1020   # 17:00  — London/NY overlap end; doc says "strongest 13:00–17:00 GMT"
+    SESSION_CLOSE = 1200   # 20:00  — hard EOD close
 
     DISP_BODY_RATIO = 0.50   # displacement body must be > 50% of candle range
     SL_BUFFER       = 0.0005 # 0.05% buffer beyond push extreme
@@ -1991,6 +1987,27 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                 else:
                     pushed_above = False
 
+            # Phase 2 quality filters — distinguish manipulation from genuine breakout
+            # -----------------------------------------------------------------------
+            # Filter 1: sweep must penetrate at least 10% of the Asian range.
+            # A 1-pip brush of the boundary is noise, not institutional sweep.
+            asian_range_size = ash - asl
+            if asian_range_size <= 0:
+                continue
+            sweep_depth = (l_high - ash) if pushed_above else (asl - l_low)
+            if sweep_depth < asian_range_size * 0.10:
+                continue
+
+            # Filter 2: "no acceptance" — the London session must FAIL to hold
+            # beyond the Asian range boundary.  The last London candle close must
+            # be back inside (or at) the boundary, confirming the push was
+            # manipulation rather than a genuine trend continuation.
+            last_london_close = float(london[-1][4])
+            if pushed_above and last_london_close > ash:
+                continue   # Price accepted above ASH → genuine breakout, skip
+            if pushed_below and last_london_close < asl:
+                continue   # Price accepted below ASL → genuine breakout, skip
+
             # Phase 3: NY reversal direction is OPPOSITE to push
             if pushed_above:
                 reversal  = "SELL"
@@ -2005,9 +2022,16 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                 tp1_price = mid
                 tp2_price = ash
 
-            # Find displacement candle in NY session
+            # Find displacement candle + FVG in NY session
+            # ---------------------------------------------------------------
+            # Aggressive entry : enter at displacement candle close.
+            # Conservative entry: wait for price to retrace into the FVG zone
+            #   left by the displacement (better R:R, tighter stop).
+            # We prefer conservative when a clean FVG is present; fall back to
+            # aggressive if no FVG forms or price never retraces into it.
             entry_candle = None
             fvg_hi = fvg_lo = None
+            fvg_entry_price = None   # set when price fills the FVG zone
 
             for k, c in enumerate(ny):
                 o   = float(c[1]); h = float(c[2])
@@ -2028,21 +2052,49 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
 
                 entry_candle = c
 
-                # FVG between previous candle and this one
-                if k >= 1:
-                    prev = ny[k - 1]
-                    if reversal == "SELL" and float(prev[3]) > float(c[2]):
-                        fvg_hi = float(prev[3]); fvg_lo = float(c[2])
-                    elif reversal == "BUY" and float(prev[2]) < float(c[3]):
-                        fvg_lo = float(prev[2]); fvg_hi = float(c[3])
+                # Proper ICT FVG: 3-candle pattern — gap between candle[k-1]
+                # and candle[k+1] that candle[k] (displacement) skipped over.
+                if k >= 1 and k + 1 < len(ny):
+                    prev = ny[k - 1]; nxt = ny[k + 1]
+                    if reversal == "SELL":
+                        # Bearish FVG: prev.low > next.high  (imbalance above next)
+                        if float(prev[3]) > float(nxt[2]):
+                            fvg_hi = float(prev[3]); fvg_lo = float(nxt[2])
+                    else:
+                        # Bullish FVG: prev.high < next.low  (imbalance below next)
+                        if float(prev[2]) < float(nxt[3]):
+                            fvg_lo = float(prev[2]); fvg_hi = float(nxt[3])
                 break
 
             if entry_candle is None:
                 continue
 
-            # Entry: aggressive on displacement candle close
+            # --- Entry selection: conservative (FVG) preferred, else aggressive ---
+            # Look ahead through remaining NY candles for a retrace into the FVG.
+            # If found, that candle becomes the entry; if not, use aggressive entry.
             ec = float(entry_candle[4])
-            entry_price = ec * (1 - slip_rate) if reversal == "SELL" else ec * (1 + slip_rate)
+            if fvg_hi is not None and fvg_lo is not None:
+                fvg_mid = (fvg_hi + fvg_lo) / 2
+                try:
+                    k_disp = ny.index(entry_candle)
+                except ValueError:
+                    k_disp = len(ny)
+                # Scan forward for a candle that trades into the FVG zone
+                for c_fwd in ny[k_disp + 1:]:
+                    h_fwd = float(c_fwd[2]); l_fwd = float(c_fwd[3])
+                    if reversal == "SELL" and h_fwd >= fvg_lo:
+                        # Price retraced up into the FVG — conservative short entry
+                        fvg_entry_price = min(h_fwd, fvg_mid)
+                        entry_candle = c_fwd
+                        break
+                    elif reversal == "BUY" and l_fwd <= fvg_hi:
+                        # Price retraced down into the FVG — conservative long entry
+                        fvg_entry_price = max(l_fwd, fvg_mid)
+                        entry_candle = c_fwd
+                        break
+            # Final entry: conservative (FVG retrace) preferred, aggressive fallback
+            raw_entry   = fvg_entry_price if fvg_entry_price is not None else ec
+            entry_price = raw_entry * (1 - slip_rate) if reversal == "SELL" else raw_entry * (1 + slip_rate)
 
             risk_dist = abs(entry_price - sl_price)
             if risk_dist <= 0:
@@ -2062,7 +2114,8 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                 "time":     entry_candle[0],
                 "setup":    ("ICT " + ("bear" if reversal == "SELL" else "bull") +
                              " | push " + ("above ASH" if pushed_above else "below ASL") +
-                             (" | FVG" if fvg_hi else " | displacement")),
+                             (" | FVG entry" if fvg_entry_price is not None
+                              else " | aggressive entry")),
             }
 
             # Walk remaining candles (rest of NY + after-hours)
@@ -2280,11 +2333,11 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
 
 @app.route("/api/health")
 def health():
-    td_key = os.environ.get("TWELVEDATA_API_KEY", "")
+    polygon_key = os.environ.get("POLYGON_API_KEY", "")
     return jsonify({
-        "ok":               True,
-        "time":             now_str(),
-        "twelvedata_key":   bool(td_key),
+        "ok":           True,
+        "time":         now_str(),
+        "polygon_key":  bool(polygon_key),
     })
 
 
@@ -2392,7 +2445,7 @@ def api_backtest():
     """
     [B][C][D][G] Full multi-market backtester.
     • Crypto  : Binance range fetch with random historical window.
-    • Non-crypto: TwelveData range fetch with up to 3 random window attempts.
+    • Non-crypto: Polygon daily bars fetched once and sliced for random windows.
     • Returns descriptive error messages at every failure point.
     """
     data = request.get_json(force=True) or {}
@@ -2469,7 +2522,7 @@ def api_backtest():
                 }), 400
 
         else:
-            # Non-crypto: use TwelveData daily candles (1 credit per symbol,
+            # Non-crypto: use Polygon daily bars (cached 30 min,
             # cached 30 min) to avoid competing with the signals rate limit.
             candles, actual_interval, start_date, end_date = \
                 fetch_non_crypto_backtest_candles(
@@ -2714,7 +2767,7 @@ def get_latest_price(symbol):
     if market == "crypto":
         candles = fetch_binance_raw(symbol, "1m", 2)
     else:
-        candles = fetch_twelvedata_candles(symbol, "5m", 2)
+        candles = fetch_polygon_candles(symbol, "5m", 2)
     if not candles:
         raise RuntimeError(f"Could not fetch latest price for {symbol}")
     return float(candles[-1][4])
