@@ -578,7 +578,7 @@ def fetch_polygon_candles(symbol, interval, limit=200):
         raise RuntimeError(f"Polygon network error for {symbol} ({ticker}): {e}")
 
     status = data.get("status", "")
-    if status in ("ERROR", "NOT_AUTHORIZED", "DELAYED"):
+    if status in ("ERROR", "NOT_AUTHORIZED"):
         raise RuntimeError(
             f"Polygon error for {symbol} ({ticker}): "
             f"{data.get('error', data.get('message', status))}"
