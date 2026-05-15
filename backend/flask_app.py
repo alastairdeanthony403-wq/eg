@@ -137,6 +137,9 @@ DEFAULT_CONFIG = {
     "min_smc_score":            6,
     "blocked_crypto_hours_utc": [0, 1, 2, 3, 22, 23],   # extended late-night dead zones
     "blocked_sessions":         [],                       # e.g. ["Asia"] — populated by learning
+    "atr_multiplier":           1.5,                      # v2: ATR stop distance multiplier
+    "enable_trailing_stop":     True,                     # v2: trailing stop in backtester
+    "enable_fallback_strategy": True,                     # v2: allow EMA fallback when SMC fails
     "trading_mode":             "local_paper",
 }
 
@@ -1083,7 +1086,55 @@ def get_symbol_summary(symbol, strategy="bot", interval=SIGNALS_INTERVAL, cfg=No
     prev   = float(df.iloc[-2]["close"]) if len(df) > 1 else float(df.iloc[-1]["close"])
     last   = float(df.iloc[-1]["close"])
     chg    = ((last - prev) / prev * 100) if prev else 0
-    levels = calculate_trade_levels(df, ev["signal"], cfg.get("risk_reward", 2))
+    levels = calculate_trade_levels(
+        df, ev["signal"],
+        cfg.get("risk_reward", 2),
+        cfg.get("atr_multiplier", 1.5),
+    )
+
+    # ── v2 enriched fields for the frontend ───────────────────────────
+    # RSI 14
+    try:
+        rsi_s   = _rsi_series(df["close"].tolist(), 14)
+        rsi_val = round(rsi_s[-1], 1) if rsi_s and rsi_s[-1] is not None else None
+    except Exception:
+        rsi_val = None
+
+    # EMA alignment stack
+    try:
+        e9_v  = float(df["close"].ewm(span=9,  adjust=False).mean().iloc[-1])
+        e21_v = float(df["close"].ewm(span=21, adjust=False).mean().iloc[-1])
+        e50_v = float(df["close"].ewm(span=50, adjust=False).mean().iloc[-1])
+        if   e9_v > e21_v > e50_v: ema_align = "Bullish stack"
+        elif e9_v < e21_v < e50_v: ema_align = "Bearish stack"
+        elif e9_v > e50_v:          ema_align = "Mixed bullish"
+        else:                       ema_align = "Mixed bearish"
+    except Exception:
+        ema_align = "Unknown"
+
+    # Current trading session
+    session_name = get_session_name(datetime.utcnow())
+
+    # FVG both directions
+    fvg_buy  = detect_fvg_retrace(df, "BUY",  fetch_iv)
+    fvg_sell = detect_fvg_retrace(df, "SELL", fetch_iv)
+    fvg_dir  = "BUY" if fvg_buy else ("SELL" if fvg_sell else None)
+
+    # Quality rating
+    conf_q = ev["confidence"]; smc_q = ev["smc_score"]
+    if   conf_q >= 88 and smc_q >= 8: q_label = "A+"
+    elif conf_q >= 80 and smc_q >= 7: q_label = "A"
+    elif conf_q >= 70 and smc_q >= 6: q_label = "B"
+    elif conf_q >= 60:                 q_label = "C"
+    else:                              q_label = "D"
+
+    # R:R ratio
+    try:
+        _risk   = abs(levels["entry"] - levels["sl"])
+        _reward = abs(levels["tp"]    - levels["entry"])
+        rr_val  = round(_reward / _risk, 2) if _risk else None
+    except Exception:
+        rr_val = None
 
     return _cache_set(_summary_cache, cache_key, {
         "symbol":          symbol,
@@ -1108,6 +1159,16 @@ def get_symbol_summary(symbol, strategy="bot", interval=SIGNALS_INTERVAL, cfg=No
         "entry":           levels["entry"],
         "sl":              levels["sl"],
         "tp":              levels["tp"],
+        # v2 enriched
+        "rsi":             rsi_val,
+        "ema_alignment":   ema_align,
+        "session":         session_name,
+        "fvg_detected":    bool(fvg_buy or fvg_sell),
+        "fvg_direction":   fvg_dir,
+        "quality":         q_label,
+        "rr":              rr_val,
+        "atr_multiplier":  cfg.get("atr_multiplier", 1.5),
+        "min_smc_score":   cfg.get("min_smc_score", 6),
     })
 
 
@@ -2535,6 +2596,7 @@ def update_settings():
         "max_trades_per_day", "max_daily_loss_percent", "max_consecutive_losses",
         "min_smc_score", "min_volume_multiplier", "trading_mode",
         "avoid_quiet_market", "avoid_sideways_market",
+        "atr_multiplier", "enable_trailing_stop", "enable_fallback_strategy",
     ]:
         if k in data:
             cfg[k] = data[k]

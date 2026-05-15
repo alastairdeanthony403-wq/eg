@@ -1,133 +1,502 @@
-import { useCallback, useEffect, useState } from "react";
-import api from "@/lib/api";
-import { Plus, Trash2, BookOpen } from "lucide-react";
+/**
+ * Journal.jsx — v2
+ * Trade journal with AI reasoning storage, confidence display,
+ * emotional notes, and strategy/market filters.
+ */
+import React, { useState, useEffect, useCallback } from "react";
 
-const MOODS = [
-  { v: "confident", e: "🎯", l: "Confident" },
-  { v: "neutral", e: "😐", l: "Neutral" },
-  { v: "rushed", e: "⚡", l: "Rushed" },
-  { v: "fearful", e: "😬", l: "Fearful" },
-  { v: "fomo", e: "🚀", l: "FOMO" },
-];
+const C = {
+  bg0: "#020917", bg1: "#071428", bg2: "#0c1d3a", bg3: "#11264a",
+  bdr: "#1a3356",
+  buy: "#00e5a0", sell: "#ff4266", hold: "#4a9eff", gold: "#f59e0b",
+  t0: "#ddeeff", t1: "#7aadda", t2: "#3d6a8a",
+  mono: "'JetBrains Mono','Cascadia Code',monospace",
+  ui:   "'Outfit','DM Sans',system-ui,sans-serif",
+};
 
-export default function Journal() {
-  const [items, setItems] = useState([]);
+const api = (url, opts = {}) => {
+  const tok = localStorage.getItem("token") || "";
+  return fetch(url, {
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${tok}`, ...opts.headers },
+    ...opts,
+  });
+};
+
+const fn  = (v, d = 2) => v == null ? "—" : Number(v).toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d });
+const inp = { width: "100%", fontFamily: C.mono, fontSize: 10, padding: "7px 10px",
+              borderRadius: 6, background: C.bg3, border: `1px solid ${C.bdr}`,
+              color: C.t0, outline: "none" };
+
+const MOODS   = ["😊 Great","😐 Neutral","😰 Anxious","🎯 Focused","🎲 FOMO","😤 Frustrated","🤑 Greedy"];
+const MARKETS = ["crypto","forex","stocks","commodities"];
+const STRATS  = ["unified_bot","simple_ma","vwap_ema","orb_0dte","manual"];
+
+/* ══════════════════════════════════════════════════════
+   NEW ENTRY FORM
+══════════════════════════════════════════════════════ */
+const NewEntry = ({ onSaved, prefill }) => {
+  const blank = {
+    symbol: "BTCUSDT", side: "BUY",
+    entry: "", exit: "", pnl: "",
+    mood: "😐 Neutral",
+    strategy: "unified_bot",
+    confidence: "", smc_score: "",
+    tags: "", notes: "",
+    ai_reasoning: "",
+  };
+  const [form, setForm] = useState({ ...blank, ...(prefill || {}) });
+  const [saving, setSaving] = useState(false);
   const [open, setOpen] = useState(false);
-  const [form, setForm] = useState({ symbol: "BTCUSDT", side: "BUY", entry: 0, exit: 0, pnl: 0, mood: "neutral", tags: "", notes: "" });
 
-  const load = useCallback(() => {
-    api.get("/journal")
-      .then(({ data }) => setItems(data || []))
-      .catch((err) => console.error("journal load failed:", err));
-  }, []);
-
-  useEffect(() => { load(); }, [load]);
+  const upd = k => e => setForm(f => ({ ...f, [k]: e.target.value }));
 
   const save = async () => {
+    setSaving(true);
     try {
-      await api.post("/journal", { ...form, tags: form.tags.split(",").map((s) => s.trim()).filter(Boolean) });
+      const tags = form.tags ? form.tags.split(",").map(t => t.trim()).filter(Boolean) : [];
+      const notes = [
+        form.notes,
+        form.ai_reasoning ? `\n[AI REASONING]\n${form.ai_reasoning}` : "",
+        form.confidence    ? `\n[CONFIDENCE] ${form.confidence}%` : "",
+        form.smc_score     ? `\n[SMC SCORE] ${form.smc_score}/9` : "",
+        form.strategy      ? `\n[STRATEGY] ${form.strategy}` : "",
+      ].filter(Boolean).join("");
+
+      await api("/api/journal", {
+        method: "POST",
+        body: JSON.stringify({
+          symbol: form.symbol.toUpperCase(),
+          side: form.side,
+          entry: parseFloat(form.entry) || 0,
+          exit:  parseFloat(form.exit)  || 0,
+          pnl:   parseFloat(form.pnl)   || 0,
+          mood:  form.mood,
+          tags, notes,
+        }),
+      });
+      setForm(blank);
       setOpen(false);
-      setForm({ symbol: "BTCUSDT", side: "BUY", entry: 0, exit: 0, pnl: 0, mood: "neutral", tags: "", notes: "" });
-      load();
-    } catch (err) {
-      console.error("journal save failed:", err);
-      alert("Failed to save entry");
-    }
+      onSaved?.();
+    } finally { setSaving(false); }
   };
 
-  const del = async (id) => {
-    if (!window.confirm("Delete entry?")) return;
-    try { await api.delete(`/journal/${id}`); load(); }
-    catch (err) { console.error("journal delete failed:", err); }
-  };
+  const Label = ({ children }) => (
+    <div style={{ fontFamily: C.mono, fontSize: 8, color: C.t2, marginBottom: 4 }}>{children}</div>
+  );
 
   return (
-    <div className="space-y-6 fade-up" data-testid="journal-page">
-      <div className="flex items-end justify-between gap-4 flex-wrap">
-        <div>
-          <div className="section-title">Reflection</div>
-          <h1 className="text-3xl font-bold mt-1">Trade Journal</h1>
-          <p className="text-[var(--text-dim)] text-sm mt-1">Log every trade to find your edge — and your leaks.</p>
-        </div>
-        <button className="btn btn-primary" onClick={() => setOpen(true)} data-testid="journal-new-btn"><Plus size={14}/>New entry</button>
-      </div>
+    <div style={{ background: C.bg1, border: `1px solid ${C.bdr}`, borderRadius: 8, marginBottom: 16 }}>
+      <button onClick={() => setOpen(x => !x)} style={{
+        width: "100%", fontFamily: C.mono, fontSize: 10, fontWeight: 700,
+        padding: "12px 16px", background: "transparent",
+        border: "none", cursor: "pointer",
+        color: open ? C.t0 : C.t1, textAlign: "left",
+        display: "flex", justifyContent: "space-between",
+      }}>
+        <span>{open ? "▼" : "▶"} LOG NEW TRADE</span>
+        {!open && <span style={{ color: C.t2, fontWeight: 400 }}>Click to expand</span>}
+      </button>
 
       {open && (
-        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4" onClick={() => setOpen(false)} data-testid="journal-modal">
-          <div className="panel p-6 max-w-2xl w-full" onClick={(e) => e.stopPropagation()}>
-            <div className="text-xl font-bold mb-4">New journal entry</div>
-            <div className="grid sm:grid-cols-2 gap-3">
-              <div><label className="text-xs text-[var(--text-mute)]">Symbol</label>
-                <input className="input mono" value={form.symbol} onChange={(e) => setForm({ ...form, symbol: e.target.value.toUpperCase() })} data-testid="j-symbol"/></div>
-              <div><label className="text-xs text-[var(--text-mute)]">Side</label>
-                <select className="input" value={form.side} onChange={(e) => setForm({ ...form, side: e.target.value })} data-testid="j-side">
-                  <option value="BUY">BUY</option><option value="SELL">SELL</option></select></div>
-              <div><label className="text-xs text-[var(--text-mute)]">Entry</label>
-                <input className="input mono" type="number" step="0.01" value={form.entry} onChange={(e) => setForm({ ...form, entry: parseFloat(e.target.value) || 0 })} data-testid="j-entry"/></div>
-              <div><label className="text-xs text-[var(--text-mute)]">Exit</label>
-                <input className="input mono" type="number" step="0.01" value={form.exit} onChange={(e) => setForm({ ...form, exit: parseFloat(e.target.value) || 0 })} data-testid="j-exit"/></div>
-              <div><label className="text-xs text-[var(--text-mute)]">PnL ($)</label>
-                <input className="input mono" type="number" step="0.01" value={form.pnl} onChange={(e) => setForm({ ...form, pnl: parseFloat(e.target.value) || 0 })} data-testid="j-pnl"/></div>
-              <div><label className="text-xs text-[var(--text-mute)]">Tags (comma)</label>
-                <input className="input" value={form.tags} onChange={(e) => setForm({ ...form, tags: e.target.value })} placeholder="bos, sweep, NY" data-testid="j-tags"/></div>
+        <div style={{ padding: "0 16px 16px" }}>
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 10 }}>
+            <div style={{ flex: 1, minWidth: 100 }}>
+              <Label>SYMBOL</Label>
+              <input value={form.symbol} onChange={upd("symbol")} style={{ ...inp }} />
             </div>
-            <div className="mt-3">
-              <label className="text-xs text-[var(--text-mute)]">Mood</label>
-              <div className="flex gap-2 flex-wrap mt-1">
-                {MOODS.map((m) => (
-                  <button key={m.v} onClick={() => setForm({ ...form, mood: m.v })} data-testid={`j-mood-${m.v}`}
-                    className={`px-3 py-2 rounded-lg text-sm flex items-center gap-2 border ${form.mood === m.v ? "border-[var(--accent)] text-[var(--accent)] bg-[rgba(0,255,163,0.06)]" : "border-[var(--line-2)] text-[var(--text-mute)]"}`}>
-                    <span>{m.e}</span> {m.l}
-                  </button>
-                ))}
-              </div>
+            <div style={{ flex: 1, minWidth: 80 }}>
+              <Label>SIDE</Label>
+              <select value={form.side} onChange={upd("side")} style={{ ...inp }}>
+                <option>BUY</option><option>SELL</option>
+              </select>
             </div>
-            <div className="mt-3">
-              <label className="text-xs text-[var(--text-mute)]">Notes</label>
-              <textarea className="input min-h-[100px]" rows={4} value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} data-testid="j-notes"
-                placeholder="What did you see? What did you feel? What would you do differently?"/>
+            <div style={{ flex: 1, minWidth: 100 }}>
+              <Label>ENTRY PRICE</Label>
+              <input type="number" value={form.entry} onChange={upd("entry")} style={{ ...inp }} />
             </div>
-            <div className="flex justify-end gap-2 mt-5">
-              <button className="btn btn-ghost" onClick={() => setOpen(false)} data-testid="j-cancel">Cancel</button>
-              <button className="btn btn-primary" onClick={save} data-testid="j-save">Save entry</button>
+            <div style={{ flex: 1, minWidth: 100 }}>
+              <Label>EXIT PRICE</Label>
+              <input type="number" value={form.exit} onChange={upd("exit")} style={{ ...inp }} />
+            </div>
+            <div style={{ flex: 1, minWidth: 80 }}>
+              <Label>PnL ($)</Label>
+              <input type="number" value={form.pnl} onChange={upd("pnl")} style={{ ...inp }} />
             </div>
           </div>
-        </div>
-      )}
 
-      {items.length === 0 ? (
-        <div className="panel p-10 text-center text-[var(--text-mute)]" data-testid="journal-empty">
-          <BookOpen size={32} className="mx-auto mb-3 opacity-50" />
-          <div>No entries yet. Log your first trade to start spotting patterns.</div>
-        </div>
-      ) : (
-        <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-4">
-          {items.map((e) => {
-            const mood = MOODS.find((m) => m.v === e.mood);
-            return (
-              <div key={e.id} className="panel p-5" data-testid={`journal-entry-${e.id}`}>
-                <div className="flex items-center justify-between mb-3">
-                  <div className="flex items-center gap-2">
-                    <div className="font-bold">{e.symbol}</div>
-                    <span className={`pill ${e.side === "BUY" ? "pill-buy" : "pill-sell"}`}>{e.side}</span>
-                  </div>
-                  <button onClick={() => del(e.id)} className="text-[var(--text-mute)] hover:text-[var(--sell)]" data-testid={`j-del-${e.id}`}><Trash2 size={14}/></button>
-                </div>
-                <div className={`mono text-xl font-bold mb-2 ${e.pnl >= 0 ? "num-pos" : "num-neg"}`}>{e.pnl >= 0 ? "+" : ""}${e.pnl.toFixed(2)}</div>
-                <div className="text-xs text-[var(--text-dim)] mono mb-3">Entry {e.entry} · Exit {e.exit}</div>
-                {mood && <div className="text-sm mb-3">{mood.e} {mood.l}</div>}
-                {e.notes && <div className="text-sm text-[var(--text-dim)] leading-relaxed mb-3">{e.notes}</div>}
-                {e.tags?.length > 0 && (
-                  <div className="flex gap-1 flex-wrap">
-                    {e.tags.map((t, i) => <span key={i} className="text-[10px] mono px-2 py-0.5 rounded bg-[var(--bg-3)] text-[var(--text-dim)]">#{t}</span>)}
-                  </div>
-                )}
-                <div className="text-[10px] mono text-[var(--text-mute)] mt-3">{e.created_at}</div>
-              </div>
-            );
-          })}
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 10 }}>
+            <div style={{ flex: 1, minWidth: 120 }}>
+              <Label>STRATEGY</Label>
+              <select value={form.strategy} onChange={upd("strategy")} style={{ ...inp }}>
+                {STRATS.map(s => <option key={s}>{s}</option>)}
+              </select>
+            </div>
+            <div style={{ flex: 1, minWidth: 80 }}>
+              <Label>CONFIDENCE %</Label>
+              <input type="number" min={0} max={100} value={form.confidence} onChange={upd("confidence")} style={{ ...inp }} />
+            </div>
+            <div style={{ flex: 1, minWidth: 80 }}>
+              <Label>SMC SCORE /9</Label>
+              <input type="number" min={0} max={9} value={form.smc_score} onChange={upd("smc_score")} style={{ ...inp }} />
+            </div>
+            <div style={{ flex: 1, minWidth: 150 }}>
+              <Label>EMOTIONAL STATE</Label>
+              <select value={form.mood} onChange={upd("mood")} style={{ ...inp }}>
+                {MOODS.map(m => <option key={m}>{m}</option>)}
+              </select>
+            </div>
+          </div>
+
+          <div style={{ display: "flex", gap: 10, marginBottom: 10 }}>
+            <div style={{ flex: 1 }}>
+              <Label>TAGS (comma-separated)</Label>
+              <input value={form.tags} onChange={upd("tags")} placeholder="e.g. fvg, london, sweep"
+                style={{ ...inp }} />
+            </div>
+          </div>
+
+          <div style={{ marginBottom: 10 }}>
+            <Label>AI REASONING / TRADE NOTES</Label>
+            <textarea value={form.ai_reasoning} onChange={upd("ai_reasoning")}
+              rows={3} placeholder="Why did the bot take this trade? What confirmations aligned?"
+              style={{ ...inp, resize: "vertical" }} />
+          </div>
+
+          <div style={{ marginBottom: 12 }}>
+            <Label>EMOTIONAL NOTES</Label>
+            <textarea value={form.notes} onChange={upd("notes")}
+              rows={2} placeholder="How were you feeling? Did you override the bot?"
+              style={{ ...inp, resize: "vertical" }} />
+          </div>
+
+          <button onClick={save} disabled={saving} style={{
+            fontFamily: C.mono, fontSize: 10, fontWeight: 700,
+            padding: "8px 20px", borderRadius: 7, cursor: saving ? "wait" : "pointer",
+            background: C.buy + "22", border: `1px solid ${C.buy}55`, color: C.buy,
+          }}>
+            {saving ? "Saving…" : "💾 Save Trade"}
+          </button>
         </div>
       )}
     </div>
   );
+};
+
+/* ══════════════════════════════════════════════════════
+   JOURNAL CARD
+══════════════════════════════════════════════════════ */
+const JournalCard = ({ entry, onDelete }) => {
+  const [expanded, setExpanded] = useState(false);
+  const pos   = entry.pnl >= 0;
+  const sigC  = entry.side === "BUY" ? C.buy : C.sell;
+  const notes = entry.notes || "";
+
+  // Parse embedded metadata from notes
+  const confMatch  = notes.match(/\[CONFIDENCE\]\s*(\d+)%/);
+  const smcMatch   = notes.match(/\[SMC SCORE\]\s*([\d]+)\/9/);
+  const stratMatch = notes.match(/\[STRATEGY\]\s*(.+?)(\n|$)/);
+  const reasonMatch = notes.match(/\[AI REASONING\]\n([\s\S]+?)(?:\[|$)/);
+
+  const confidence = confMatch  ? parseInt(confMatch[1])  : null;
+  const smcScore   = smcMatch   ? smcMatch[1]              : null;
+  const strategy   = stratMatch ? stratMatch[1].trim()     : null;
+  const aiReason   = reasonMatch ? reasonMatch[1].trim()   : null;
+  const cleanNotes = notes
+    .replace(/\[AI REASONING\][\s\S]*?(?=\[|$)/g, "")
+    .replace(/\[CONFIDENCE\][^\n]*/g, "")
+    .replace(/\[SMC SCORE\][^\n]*/g, "")
+    .replace(/\[STRATEGY\][^\n]*/g, "")
+    .trim();
+
+  return (
+    <div style={{
+      background: C.bg1, border: `1px solid ${sigC}33`,
+      borderRadius: 10, padding: 14, fontFamily: C.ui,
+    }}>
+      {/* Header */}
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 8 }}>
+        <div>
+          <div style={{ fontFamily: C.mono, fontSize: 14, fontWeight: 800, color: C.t0 }}>
+            {entry.symbol}
+          </div>
+          <div style={{ fontFamily: C.mono, fontSize: 8, color: C.t2, marginTop: 1 }}>
+            {(entry.created_at || "").slice(0, 16)}
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 5, alignItems: "center" }}>
+          {strategy && (
+            <span style={{ fontFamily: C.mono, fontSize: 8, padding: "2px 6px", borderRadius: 3,
+              background: C.bg3, color: C.t2, border: `1px solid ${C.bdr}` }}>
+              {strategy}
+            </span>
+          )}
+          <span style={{ fontFamily: C.mono, fontSize: 11, fontWeight: 700,
+            padding: "3px 10px", borderRadius: 5,
+            background: sigC + "18", color: sigC,
+            border: `1px solid ${sigC}44` }}>
+            {entry.side === "BUY" ? "▲" : "▼"} {entry.side}
+          </span>
+        </div>
+      </div>
+
+      {/* Price + PnL */}
+      <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+        <div style={{ flex: 1, background: C.bg2, borderRadius: 6, padding: "8px 10px" }}>
+          <div style={{ fontFamily: C.mono, fontSize: 8, color: C.t2, marginBottom: 2 }}>ENTRY → EXIT</div>
+          <div style={{ fontFamily: C.mono, fontSize: 12, color: C.t0 }}>
+            {fn(entry.entry, 4)} → {fn(entry.exit, 4)}
+          </div>
+        </div>
+        <div style={{
+          padding: "8px 14px", borderRadius: 6,
+          background: pos ? C.buy + "18" : C.sell + "18",
+          border: `1px solid ${pos ? C.buy : C.sell}33`,
+        }}>
+          <div style={{ fontFamily: C.mono, fontSize: 8, color: C.t2, marginBottom: 2 }}>PnL</div>
+          <div style={{ fontFamily: C.mono, fontSize: 16, fontWeight: 800,
+            color: pos ? C.buy : C.sell }}>
+            {pos ? "+" : ""}${fn(entry.pnl)}
+          </div>
+        </div>
+      </div>
+
+      {/* Metrics row */}
+      <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 8 }}>
+        {confidence !== null && (
+          <span style={{ fontFamily: C.mono, fontSize: 9, padding: "2px 8px", borderRadius: 4,
+            background: confidence >= 70 ? C.buy + "18" : C.gold + "18",
+            color: confidence >= 70 ? C.buy : C.gold,
+            border: `1px solid ${confidence >= 70 ? C.buy : C.gold}40` }}>
+            Conf: {confidence}%
+          </span>
+        )}
+        {smcScore !== null && (
+          <span style={{ fontFamily: C.mono, fontSize: 9, padding: "2px 8px", borderRadius: 4,
+            background: C.bg3, color: C.t1, border: `1px solid ${C.bdr}` }}>
+            SMC: {smcScore}/9
+          </span>
+        )}
+        <span style={{ fontFamily: C.mono, fontSize: 9, padding: "2px 8px", borderRadius: 4,
+          background: C.bg3, color: C.t1, border: `1px solid ${C.bdr}` }}>
+          {entry.mood || "—"}
+        </span>
+        {(entry.tags || []).map(t => (
+          <span key={t} style={{ fontFamily: C.mono, fontSize: 8, padding: "2px 6px", borderRadius: 3,
+            background: C.hold + "18", color: C.hold, border: `1px solid ${C.hold}33` }}>
+            #{t}
+          </span>
+        ))}
+      </div>
+
+      {/* Notes preview */}
+      {cleanNotes && (
+        <div style={{ fontFamily: C.ui, fontSize: 10, color: C.t2,
+          padding: "6px 8px", background: C.bg2, borderRadius: 5, marginBottom: 8,
+          fontStyle: "italic" }}>
+          "{cleanNotes.slice(0, 120)}{cleanNotes.length > 120 ? "…" : ""}"
+        </div>
+      )}
+
+      {/* Actions */}
+      <div style={{ display: "flex", gap: 6 }}>
+        {aiReason && (
+          <button onClick={() => setExpanded(x => !x)} style={{
+            fontFamily: C.mono, fontSize: 9, padding: "5px 10px",
+            borderRadius: 5, cursor: "pointer",
+            background: expanded ? C.bg3 : "transparent",
+            border: `1px solid ${C.bdr}`, color: C.t1,
+          }}>
+            {expanded ? "▲ Hide AI" : "▼ AI Reasoning"}
+          </button>
+        )}
+        <button onClick={() => onDelete(entry.id)} style={{
+          fontFamily: C.mono, fontSize: 9, padding: "5px 10px",
+          borderRadius: 5, cursor: "pointer",
+          background: "transparent", border: `1px solid ${C.bdr}`,
+          color: C.t2, marginLeft: "auto",
+        }}>
+          🗑
+        </button>
+      </div>
+
+      {/* AI reasoning expanded */}
+      {expanded && aiReason && (
+        <div style={{
+          marginTop: 10, padding: 12, borderRadius: 7,
+          background: C.bg0, border: `1px solid ${C.bdr}`,
+          fontFamily: C.mono, fontSize: 9, color: C.t1, lineHeight: 1.7,
+        }}>
+          <div style={{ fontWeight: 700, color: C.t0, marginBottom: 6, fontSize: 10 }}>
+            🤖 AI REASONING
+          </div>
+          {aiReason}
+        </div>
+      )}
+    </div>
+  );
+};
+
+/* ══════════════════════════════════════════════════════
+   STATS SUMMARY
+══════════════════════════════════════════════════════ */
+const JournalStats = ({ entries }) => {
+  const total   = entries.length;
+  const wins    = entries.filter(e => e.pnl > 0).length;
+  const net     = entries.reduce((a, e) => a + (e.pnl || 0), 0);
+  const avgConf = (() => {
+    const confEntries = entries.filter(e => {
+      const m = (e.notes || "").match(/\[CONFIDENCE\]\s*(\d+)%/);
+      return m;
+    });
+    if (!confEntries.length) return null;
+    const sum = confEntries.reduce((a, e) => {
+      const m = (e.notes || "").match(/\[CONFIDENCE\]\s*(\d+)%/);
+      return a + parseInt(m[1]);
+    }, 0);
+    return Math.round(sum / confEntries.length);
+  })();
+
+  if (!total) return null;
+  return (
+    <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 14 }}>
+      {[
+        { l: "TRADES",    v: total, c: C.t0 },
+        { l: "WINS",      v: wins,  c: C.buy },
+        { l: "LOSSES",    v: total - wins, c: C.sell },
+        { l: "WIN RATE",  v: total ? `${Math.round(wins / total * 100)}%` : "—",
+          c: wins / total >= 0.5 ? C.buy : C.sell },
+        { l: "NET PnL",   v: `${net >= 0 ? "+" : ""}$${fn(net)}`,
+          c: net >= 0 ? C.buy : C.sell },
+        ...(avgConf !== null ? [{ l: "AVG CONF", v: `${avgConf}%`, c: avgConf >= 70 ? C.buy : C.gold }] : []),
+      ].map(({ l, v, c }) => (
+        <div key={l} style={{ flex: "1 1 90px", background: C.bg1,
+          border: `1px solid ${C.bdr}`, borderRadius: 8, padding: "10px 14px" }}>
+          <div style={{ fontFamily: C.mono, fontSize: 8, color: C.t2 }}>{l}</div>
+          <div style={{ fontFamily: C.mono, fontSize: 20, fontWeight: 800, color: c, marginTop: 2 }}>{v}</div>
+        </div>
+      ))}
+    </div>
+  );
+};
+
+/* ══════════════════════════════════════════════════════
+   MAIN JOURNAL
+══════════════════════════════════════════════════════ */
+export default function Journal() {
+  const [entries, setEntries] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [filters, setFilters] = useState({ side: "All", mood: "All", strategy: "All", pnl: "All" });
+  const [search,  setSearch]  = useState("");
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const r = await api("/api/journal");
+      const d = await r.json();
+      setEntries(Array.isArray(d) ? d : []);
+    } finally { setLoading(false); }
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  const del = async id => {
+    if (!window.confirm("Delete this entry?")) return;
+    await api(`/api/journal/${id}`, { method: "DELETE" });
+    load();
+  };
+
+  const filtered = entries.filter(e => {
+    if (filters.side     !== "All" && e.side !== filters.side) return false;
+    if (filters.pnl      === "Wins" && e.pnl <= 0)             return false;
+    if (filters.pnl      === "Losses" && e.pnl > 0)            return false;
+    if (filters.strategy !== "All") {
+      const m = (e.notes || "").match(/\[STRATEGY\]\s*(.+?)(\n|$)/);
+      if (!m || m[1].trim() !== filters.strategy) return false;
+    }
+    if (search) {
+      const q = search.toLowerCase();
+      if (!e.symbol?.toLowerCase().includes(q) &&
+          !e.notes?.toLowerCase().includes(q) &&
+          !(e.tags || []).some(t => t.includes(q))) return false;
+    }
+    return true;
+  });
+
+  const FBtn = ({ label, active, onClick }) => (
+    <button onClick={onClick} style={{
+      fontFamily: C.mono, fontSize: 9, fontWeight: active ? 700 : 400,
+      padding: "4px 10px", borderRadius: 5, cursor: "pointer",
+      background: active ? C.bg3 : "transparent",
+      border: `1px solid ${active ? C.bdr : "transparent"}`,
+      color: active ? C.t0 : C.t2,
+    }}>{label}</button>
+  );
+
+  return (
+    <div style={{ background: C.bg0, minHeight: "100vh", fontFamily: C.ui }}>
+      <div style={{ background: C.bg1, borderBottom: `1px solid ${C.bdr}`,
+        padding: "10px 20px", fontFamily: C.mono, fontSize: 14, fontWeight: 800, color: C.t0 }}>
+        <span style={{ color: C.gold }}>▸</span> TRADE JOURNAL
+      </div>
+
+      <div style={{ padding: 20, maxWidth: 1000 }}>
+        <NewEntry onSaved={load} />
+
+        <JournalStats entries={entries} />
+
+        {/* Filters */}
+        <div style={{ background: C.bg1, border: `1px solid ${C.bdr}`, borderRadius: 8,
+          padding: "10px 14px", marginBottom: 14 }}>
+          <div style={{ display: "flex", gap: 14, flexWrap: "wrap", alignItems: "center" }}>
+            <div style={{ display: "flex", gap: 3 }}>
+              <span style={{ fontFamily: C.mono, fontSize: 8, color: C.t2, marginRight: 3 }}>SIDE</span>
+              {["All","BUY","SELL"].map(v => (
+                <FBtn key={v} label={v} active={filters.side === v}
+                  onClick={() => setFilters(f => ({ ...f, side: v }))} />
+              ))}
+            </div>
+            <div style={{ display: "flex", gap: 3 }}>
+              <span style={{ fontFamily: C.mono, fontSize: 8, color: C.t2, marginRight: 3 }}>RESULT</span>
+              {["All","Wins","Losses"].map(v => (
+                <FBtn key={v} label={v} active={filters.pnl === v}
+                  onClick={() => setFilters(f => ({ ...f, pnl: v }))} />
+              ))}
+            </div>
+            <div style={{ display: "flex", gap: 3 }}>
+              <span style={{ fontFamily: C.mono, fontSize: 8, color: C.t2, marginRight: 3 }}>STRAT</span>
+              {["All", ...STRATS].map(v => (
+                <FBtn key={v} label={v === "All" ? "All" : v.replace("_", " ")}
+                  active={filters.strategy === v}
+                  onClick={() => setFilters(f => ({ ...f, strategy: v }))} />
+              ))}
+            </div>
+            <input value={search} onChange={e => setSearch(e.target.value)}
+              placeholder="Search symbol, tag, note…"
+              style={{ ...inp, flex: 1, minWidth: 150, maxWidth: 260 }} />
+          </div>
+        </div>
+
+        {loading ? (
+          <div style={{ textAlign: "center", padding: 40, fontFamily: C.mono, color: C.t2 }}>
+            Loading journal…
+          </div>
+        ) : filtered.length === 0 ? (
+          <div style={{ textAlign: "center", padding: 40, fontFamily: C.mono, color: C.t2 }}>
+            {entries.length === 0 ? "No entries yet. Log your first trade above." : "No entries match filters."}
+          </div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            <div style={{ fontFamily: C.mono, fontSize: 9, color: C.t2, marginBottom: 4 }}>
+              Showing {filtered.length} of {entries.length} entries
+            </div>
+            {filtered.map(e => (
+              <JournalCard key={e.id} entry={e} onDelete={del} />
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
 }
+
+
