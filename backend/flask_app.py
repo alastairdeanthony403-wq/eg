@@ -1,3 +1,8 @@
+# BOT VERSION: 2.0 — Self-Learning SMC Engine
+# Improvements: ATR SL, weighted confidence, ADX filter,
+# extended FVG, trailing stops, dynamic SMC threshold,
+# session learning, self-adjusting config from trade history
+
 """
 AI Trading Engine — Flask backend
 Routes are mounted under /api.
@@ -19,6 +24,9 @@ Key fixes in this version
 [F] Price display: returns both `price` and `price_display` for the frontend.
 [G] /api/backtest: descriptive error messages at every failure point.
 [H] Symbols endpoint returns market membership for frontend grouping.
+[v2] ATR-based SL, weighted confidence, ADX gate, extended FVG lookback,
+     trailing stops in daily backtest path, dynamic SMC threshold,
+     extended session blocking, self-learning system.
 """
 
 from flask import Flask, jsonify, request, g
@@ -78,26 +86,17 @@ ALL_SYMBOLS = (
     + MARKETS["commodities"]
 )
 
-# Polygon.io ticker map — translates internal symbols to Polygon API tickers.
-# Forex + metals use the "C:" prefix (Polygon Forex/FX endpoint).
-# Oil uses liquid ETF proxies available on all Polygon plans (USO = WTI, BNO = Brent).
-# Stocks pass through directly.
 POLYGON_SYMBOL_MAP = {
-    # Forex
     "EURUSD": "C:EURUSD", "GBPUSD": "C:GBPUSD", "USDJPY": "C:USDJPY",
     "AUDUSD": "C:AUDUSD", "USDCAD": "C:USDCAD",
-    # Metals (available via Polygon FX endpoint with C: prefix)
-    "XAUUSD": "C:XAUUSD",   # Gold spot
-    "XAGUSD": "C:XAGUSD",   # Silver spot
-    # Oil — ETF proxies available on all Polygon plans
-    "USOIL":  "USO",         # United States Oil Fund (WTI)
-    "UKOIL":  "BNO",         # iPath S&P GSCI Crude Oil ETF (Brent)
-    # Stocks
+    "XAUUSD": "C:XAUUSD",
+    "XAGUSD": "C:XAGUSD",
+    "USOIL":  "USO",
+    "UKOIL":  "BNO",
     "AAPL": "AAPL", "TSLA": "TSLA", "NVDA": "NVDA",
     "MSFT": "MSFT", "AMZN": "AMZN", "SPY":  "SPY",
 }
 
-# Interval → (multiplier, timespan) for Polygon /v2/aggs
 POLYGON_INTERVAL_MAP = {
     "1m":  (1,  "minute"),
     "5m":  (5,  "minute"),
@@ -108,16 +107,13 @@ POLYGON_INTERVAL_MAP = {
     "1d":  (1,  "day"),
 }
 
-# Approximate ms per bar — used to compute the from/to window
 _POLYGON_INTERVAL_MS = {
     "1m": 60_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000,
     "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000,
 }
 
-# [A] Signals always use 5m — much better TwelveData hit rate on the free tier
 SIGNALS_INTERVAL = "5m"
 
-# Earliest safe date for each market (for random window selection)
 MARKET_EARLIEST = {
     "crypto":      datetime(2020, 1, 1, tzinfo=timezone.utc),
     "forex":       datetime(2018, 1, 1, tzinfo=timezone.utc),
@@ -125,11 +121,12 @@ MARKET_EARLIEST = {
     "commodities": datetime(2018, 1, 1, tzinfo=timezone.utc),
 }
 
+# ── Section 9: extended session blocking ──────────────────────────────────
 DEFAULT_CONFIG = {
     "symbols":                  ALL_SYMBOLS,
     "risk_reward":              2,
     "risk_percent":             1,
-    "min_confidence":           70,   # loosened from 75
+    "min_confidence":           70,
     "starting_balance":         10000,
     "max_trades_per_day":       5,
     "max_daily_loss_percent":   3,
@@ -137,34 +134,30 @@ DEFAULT_CONFIG = {
     "avoid_quiet_market":       True,
     "avoid_sideways_market":    True,
     "min_volume_multiplier":    0.8,
-    "min_smc_score":            6,    # loosened from 7
-    "blocked_crypto_hours_utc": [0, 1, 2, 3],
+    "min_smc_score":            6,
+    "blocked_crypto_hours_utc": [0, 1, 2, 3, 22, 23],   # extended late-night dead zones
+    "blocked_sessions":         [],                       # e.g. ["Asia"] — populated by learning
     "trading_mode":             "local_paper",
 }
 
-JWT_SECRET     = os.environ.get("JWT_SECRET", "ai-trading-engine-secret-change-me")
-JWT_ALGO       = "HS256"
+JWT_SECRET      = os.environ.get("JWT_SECRET", "ai-trading-engine-secret-change-me")
+JWT_ALGO        = "HS256"
 JWT_EXPIRY_DAYS = 7
 
-MARKET_DATA_TTL_SECONDS    = 30
-SUMMARY_TTL_SECONDS        = 90   # cache signals for 90 s — gives backtest room to breathe
-NON_CRYPTO_CANDLE_TTL      = 600  # cache non-crypto candles for 10 min
+MARKET_DATA_TTL_SECONDS  = 30
+SUMMARY_TTL_SECONDS      = 90
+NON_CRYPTO_CANDLE_TTL    = 600
 
 _raw_candle_cache    = {}
-_non_crypto_cache    = {}   # separate long-lived cache for Polygon.io responses
+_non_crypto_cache    = {}
 _summary_cache       = {}
 
-# ── Polygon.io rate-limiter ──────────────────────────────────────────────────
-# Free plan: 5 calls/minute.  Starter+: unlimited.
-# We enforce ≥12 s between requests to stay safely inside free-plan limits.
-# On paid plans, set POLYGON_RATE_LIMIT_SECS=0 in env to disable the delay.
-_polygon_lock          = __import__("threading").Lock()
-_polygon_last_call_ts  = 0.0
+_polygon_lock         = __import__("threading").Lock()
+_polygon_last_call_ts = 0.0
 POLYGON_RATE_LIMIT_SECS = float(os.environ.get("POLYGON_RATE_LIMIT_SECS", "12"))
 
 
 def _polygon_get(url, params, timeout=25):
-    """GET a Polygon.io URL, rate-limited to POLYGON_RATE_LIMIT_SECS between calls."""
     global _polygon_last_call_ts
     if POLYGON_RATE_LIMIT_SECS > 0:
         with _polygon_lock:
@@ -220,6 +213,22 @@ def init_db():
         net_pnl REAL, profit_factor REAL, max_drawdown REAL,
         max_drawdown_percent REAL, win_rate REAL, summary_json TEXT,
         trades_json TEXT, created_at TEXT)""")
+    # ── Section 1A: self-learning log ─────────────────────────────────
+    c.execute("""CREATE TABLE IF NOT EXISTS bot_learning_log (
+        id TEXT PRIMARY KEY,
+        user_id TEXT,
+        created_at TIMESTAMP DEFAULT NOW(),
+        symbol TEXT,
+        interval TEXT,
+        strategy TEXT,
+        analysis_json TEXT,
+        adjustments_json TEXT,
+        before_config TEXT,
+        after_config TEXT,
+        trades_analyzed INTEGER,
+        win_rate_before FLOAT,
+        win_rate_after FLOAT
+    )""")
     conn.commit()
     conn.close()
 
@@ -364,7 +373,6 @@ def detect_market(symbol):
 
 
 def format_price(price, symbol):
-    """[F] Return a display-friendly string for any market's price."""
     if price is None:
         return "—"
     market = detect_market(symbol)
@@ -378,7 +386,6 @@ def format_price(price, symbol):
         return f"{price:.5f}" if "JPY" not in symbol else f"{price:.3f}"
     if market == "commodities":
         return f"{price:.3f}" if price < 100 else f"{price:,.2f}"
-    # stocks
     return f"{price:.2f}"
 
 
@@ -458,13 +465,11 @@ def _fetch_coinbase_raw(symbol="BTCUSDT", interval="5m", limit=200):
         rows   = _aggregate_coinbase_1h_to_4h(raw_1h, limit)
     else:
         rows = _coinbase_fetch_candles(product_id, granularity, limit)
-    # normalise to Binance kline shape [time_ms, open, high, low, close, volume]
     return [[int(r[0]) * 1000, str(r[3]), str(r[2]), str(r[1]),
              str(r[4]), str(r[5])] for r in rows]
 
 
 def fetch_binance_raw(symbol="BTCUSDT", interval="5m", limit=500):
-    """Fetch recent crypto candles via Binance → Coinbase fallback."""
     if not symbol or not symbol.endswith("USDT"):
         raise ValueError(f"fetch_binance_raw: not a USDT symbol: {symbol}")
     cache_key = (symbol, interval, int(limit))
@@ -489,7 +494,6 @@ def fetch_binance_raw(symbol="BTCUSDT", interval="5m", limit=500):
 
 
 def fetch_binance_range(symbol, interval, start_ms, end_ms, limit=1000):
-    """Fetch a specific historical date range from Binance (crypto only)."""
     url    = "https://data-api.binance.vision/api/v3/klines"
     params = {
         "symbol":    symbol,
@@ -514,29 +518,14 @@ def fetch_binance_range(symbol, interval, start_ms, end_ms, limit=1000):
 # ─────────────────────────────────────────────
 
 def fetch_polygon_candles(symbol, interval, limit=200):
-    """
-    Fetch OHLCV candles from Polygon.io for any non-crypto symbol.
-
-    Endpoint: /v2/aggs/ticker/{ticker}/range/{multiplier}/{timespan}/{from}/{to}
-
-    Symbol routing:
-      Forex / metals  →  C:EURUSD, C:XAUUSD, etc.
-      Stocks          →  AAPL, TSLA, SPY, etc.
-      Oil (USO/BNO)   →  stock ETF tickers available on all plans
-
-    Returns list of [ts_ms, open, high, low, close, volume] as strings,
-    oldest-first, matching the same format as fetch_binance_raw().
-    """
     api_key = os.environ.get("POLYGON_API_KEY", "")
     if not api_key:
         raise RuntimeError(
             "POLYGON_API_KEY is not set. "
             "Add it to your Render environment variables."
         )
-
     interval_cfg = POLYGON_INTERVAL_MAP.get(interval)
     if not interval_cfg:
-        # Auto-upgrade 1m → 5m for non-crypto to reduce API load
         if interval == "1m":
             interval_cfg = POLYGON_INTERVAL_MAP["5m"]
         else:
@@ -545,52 +534,41 @@ def fetch_polygon_candles(symbol, interval, limit=200):
                 f"Supported: {list(POLYGON_INTERVAL_MAP.keys())}"
             )
     multiplier, timespan = interval_cfg
-
     ticker = POLYGON_SYMBOL_MAP.get(symbol, symbol)
-
-    # Cache check
     nc_key = (symbol, interval, limit)
     cached = _cache_get(_non_crypto_cache, nc_key, NON_CRYPTO_CANDLE_TTL)
     if cached is not None:
         return cached
-
-    # Compute from/to window — request enough history to fill `limit` bars,
-    # with a 3× buffer to account for weekends and market closures.
     bar_ms   = _POLYGON_INTERVAL_MS.get(interval, 300_000)
     now_ms   = int(time.time() * 1000)
     from_ms  = now_ms - int(bar_ms * limit * 3)
     from_dt  = datetime.utcfromtimestamp(from_ms / 1000).strftime("%Y-%m-%d")
     to_dt    = datetime.utcfromtimestamp(now_ms   / 1000).strftime("%Y-%m-%d")
-
     url    = (f"https://api.polygon.io/v2/aggs/ticker/{ticker}"
               f"/range/{multiplier}/{timespan}/{from_dt}/{to_dt}")
     params = {
         "adjusted": "true",
         "sort":     "asc",
-        "limit":    min(limit * 3, 50000),   # Polygon max per page
+        "limit":    min(limit * 3, 50000),
         "apiKey":   api_key,
     }
-
     try:
         r    = _polygon_get(url, params, timeout=25)
         data = r.json()
     except Exception as e:
         raise RuntimeError(f"Polygon network error for {symbol} ({ticker}): {e}")
-
     status = data.get("status", "")
     if status in ("ERROR", "NOT_AUTHORIZED"):
         raise RuntimeError(
             f"Polygon error for {symbol} ({ticker}): "
             f"{data.get('error', data.get('message', status))}"
         )
-
     results = data.get("results") or []
     if not results:
         raise RuntimeError(
             f"Polygon returned 0 bars for {symbol} ({ticker}). "
             f"Check that the symbol is supported on your plan and markets are not closed."
         )
-
     candles = []
     for bar in results:
         try:
@@ -605,15 +583,11 @@ def fetch_polygon_candles(symbol, interval, limit=200):
         if c <= 0 or h <= 0 or lo_ <= 0:
             continue
         candles.append([ts, str(o), str(h), str(lo_), str(c), str(vol)])
-
-    # Keep only the most recent `limit` bars
     candles = candles[-limit:]
-
     if not candles:
         raise RuntimeError(
             f"Polygon returned bars for {symbol} but all had invalid prices."
         )
-
     _cache_set(_non_crypto_cache, nc_key, candles)
     return candles
 
@@ -621,26 +595,14 @@ def fetch_polygon_candles(symbol, interval, limit=200):
 # ─────────────────────────────────────────────
 # NON-CRYPTO BACKTEST DATA (Polygon daily bars)
 # ─────────────────────────────────────────────
-# Polygon free plan has no per-minute credit limit (unlike TwelveData),
-# so we can request daily bars freely. We still cache for 30 min to avoid
-# hammering the API on repeated backtest runs.
-# ─────────────────────────────────────────────
 
 _backtest_daily_cache = {}
-BACKTEST_DAILY_TTL    = 1800  # 30 minutes
+BACKTEST_DAILY_TTL    = 1800
 
 
-def fetch_non_crypto_backtest_candles(symbol, period_days, random_window=True):
-    """
-    Fetch daily candles for non-crypto backtest via Polygon.io.
-    Uses 1d interval → only 1 API credit per call.
-    Cached for 30 min so repeated runs cost nothing.
-    Returns (candles, "1d", start_date, end_date).
-    """
-    # Check cache first — if we already have this symbol's daily data, slice it
+def fetch_non_crypto_backtest_candles(symbol, period_days, random_window=False):
     cached = _cache_get(_backtest_daily_cache, symbol, BACKTEST_DAILY_TTL)
     if cached is None:
-        # Fetch up to 5 years of daily data in one credit
         try:
             candles = fetch_polygon_candles(symbol, "1d", limit=1825)
         except RuntimeError as e:
@@ -657,23 +619,15 @@ def fetch_non_crypto_backtest_candles(symbol, period_days, random_window=True):
         cached = candles
 
     all_candles = cached
-
-    # How many extra bars to prepend so every strategy has enough warmup history.
-    # unified_bot needs WARMUP=55, vwap_ema needs ADR_PERIOD=10 full days,
-    # simple_ma needs 30. Use 80 to cover all cases with headroom.
     WARMUP_BARS = 80
 
-    # Determine the "trade window" (what the user asked for)
     if random_window and len(all_candles) > period_days + WARMUP_BARS + 5:
-        max_start = len(all_candles) - period_days - 1
+        max_start  = len(all_candles) - period_days - 1
         trade_start = random.randint(WARMUP_BARS, max_start)
     else:
         trade_start = max(WARMUP_BARS, len(all_candles) - period_days)
 
-    trade_end = min(trade_start + period_days, len(all_candles))
-
-    # Prepend warmup bars (strategy uses them to warm up indicators but doesn't
-    # "trade" them — the strategies' own WARMUP guards handle that internally)
+    trade_end   = min(trade_start + period_days, len(all_candles))
     fetch_start = max(0, trade_start - WARMUP_BARS)
     window      = all_candles[fetch_start:trade_end]
 
@@ -683,7 +637,6 @@ def fetch_non_crypto_backtest_candles(symbol, period_days, random_window=True):
             f"(got {len(window)}). The symbol may not be available on your Polygon plan."
         )
 
-    # Extract date range for display — show only the user's requested window
     def ms_to_date(ts):
         return datetime.utcfromtimestamp(int(ts) / 1000).strftime("%Y-%m-%d")
 
@@ -698,7 +651,6 @@ def fetch_non_crypto_backtest_candles(symbol, period_days, random_window=True):
 # ─────────────────────────────────────────────
 
 def fetch_candles_for_symbol(symbol, interval="5m", limit=200):
-    """Route to the right data source by market type."""
     market = detect_market(symbol)
     if market == "crypto":
         return fetch_binance_raw(symbol, interval, limit)
@@ -775,23 +727,96 @@ def get_market_regime(df):
     return "Trending" if rng > 2.5 else "Active" if rng > 1.0 else "Range / Quiet"
 
 
-def estimate_confidence(df, signal):
+# ── Section 2: ATR calculation (pandas-based) ─────────────────────────────
+def calculate_atr(df, period=14):
+    high       = df["high"]
+    low        = df["low"]
+    close      = df["close"]
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low  - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return float(tr.rolling(period).mean().iloc[-1])
+
+
+# ── Section 4: ADX calculation (pandas-based) ─────────────────────────────
+def calculate_adx(df, period=14):
+    high     = df["high"]
+    low      = df["low"]
+    close    = df["close"]
+    plus_dm  = high.diff().clip(lower=0)
+    minus_dm = low.diff().multiply(-1).clip(lower=0)
+    tr = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low  - close.shift()).abs(),
+    ], axis=1).max(axis=1)
+    atr14    = tr.ewm(span=period, adjust=False).mean()
+    plus_di  = 100 * plus_dm.ewm(span=period, adjust=False).mean() / atr14
+    minus_di = 100 * minus_dm.ewm(span=period, adjust=False).mean() / atr14
+    denom    = (plus_di + minus_di).replace(0, float("nan"))
+    dx       = 100 * (plus_di - minus_di).abs() / denom
+    adx_val  = dx.ewm(span=period, adjust=False).mean().iloc[-1]
+    return round(float(adx_val) if pd.notna(adx_val) else 25.0, 2)
+
+
+# ── Section 3: weighted confidence model ──────────────────────────────────
+def estimate_confidence(df, signal, smc_checks_passed=0, total_checks=9):
     if df is None or len(df) < 20:
         return 50
-    closes = df["close"]
-    latest, prev = closes.iloc[-1], closes.iloc[-2]
-    sma20  = closes.tail(20).mean()
-    sma5   = closes.tail(5).mean()
-    conf   = 50
-    if signal == "BUY":
-        if latest > sma20: conf += 15
-        if latest > prev:  conf += 10
-        if latest > sma5:  conf += 10
-    elif signal == "SELL":
-        if latest < sma20: conf += 15
-        if latest < prev:  conf += 10
-        if latest < sma5:  conf += 10
-    return max(35, min(95, conf))
+    score = 50  # base
+
+    # SMC alignment (0-20 points)
+    score += (smc_checks_passed / total_checks) * 20
+
+    # Volume confirmation (0-10 points)
+    try:
+        avg_vol = df["volume"].rolling(20).mean().iloc[-1]
+        cur_vol = df["volume"].iloc[-1]
+        if pd.notna(avg_vol) and avg_vol > 0:
+            if cur_vol > avg_vol * 1.5:
+                score += 10
+            elif cur_vol > avg_vol:
+                score += 5
+    except Exception:
+        pass
+
+    # ATR regime filter (0-10 points) — reward trending volatility
+    try:
+        atr     = calculate_atr(df)
+        atr_avg = df["close"].pct_change().rolling(14).std().iloc[-1] * df["close"].iloc[-1]
+        if pd.notna(atr_avg) and atr > atr_avg:
+            score += 10
+    except Exception:
+        pass
+
+    # Candle body strength (0-10 points)
+    try:
+        candle     = df.iloc[-1]
+        body       = abs(candle["close"] - candle["open"])
+        full_range = candle["high"] - candle["low"]
+        if full_range > 0 and (body / full_range) > 0.6:
+            score += 10
+    except Exception:
+        pass
+
+    # Trend alignment bonus/penalty (±10 points)
+    try:
+        ema9  = df["close"].ewm(span=9,  adjust=False).mean().iloc[-1]
+        ema21 = df["close"].ewm(span=21, adjust=False).mean().iloc[-1]
+        ema50 = df["close"].ewm(span=50, adjust=False).mean().iloc[-1]
+        if signal == "BUY" and ema9 > ema21 > ema50:
+            score += 10
+        elif signal == "SELL" and ema9 < ema21 < ema50:
+            score += 10
+        elif (signal == "BUY" and ema9 < ema50) or (signal == "SELL" and ema9 > ema50):
+            score -= 10
+    except Exception:
+        pass
+
+    return max(35, min(97, round(score)))
 
 
 def get_higher_timeframe(interval):
@@ -850,10 +875,12 @@ def price_in_premium_zone(df):
     return df.iloc[-1]["close"] >= (rh + rl) / 2
 
 
-def detect_fvg_retrace(df, direction):
+# ── Section 5: extended FVG lookback with interval param ──────────────────
+def detect_fvg_retrace(df, direction, interval="5m"):
     if df is None or len(df) < 10:
         return False
-    c = df.tail(8).reset_index(drop=True)
+    lookback = 30 if interval in ["5m", "15m"] else 15
+    c   = df.tail(lookback).reset_index(drop=True)
     cur = c.iloc[-1]["close"]
     for i in range(2, len(c)):
         c1, c3 = c.iloc[i - 2], c.iloc[i]
@@ -866,43 +893,95 @@ def detect_fvg_retrace(df, direction):
     return False
 
 
+# ── Section 9: session blocking with blocked_sessions support ─────────────
 def session_allowed(cfg):
-    return datetime.utcnow().hour not in cfg["blocked_crypto_hours_utc"]
+    now = datetime.utcnow()
+    # Support both key names for backward compatibility with saved user configs
+    blocked_hours = (
+        cfg.get("blocked_hours_utc")
+        or cfg.get("blocked_crypto_hours_utc", [])
+    )
+    if now.hour in blocked_hours:
+        return False
+    session = get_session_name(now)
+    if session in cfg.get("blocked_sessions", []):
+        return False
+    return True
 
 
+# ── Section 2: ATR-based stop loss (6 decimal places for forex) ───────────
+def calculate_trade_levels(df, signal, rr=2, atr_multiplier=1.5):
+    lc = float(df.iloc[-1]["close"])
+    try:
+        atr = calculate_atr(df)
+    except Exception:
+        # Fallback: use 0.5% of price if ATR fails (e.g. insufficient history)
+        atr = lc * 0.005
+
+    if signal == "BUY":
+        sl = lc - (atr * atr_multiplier)
+        tp = lc + ((lc - sl) * rr)
+    elif signal == "SELL":
+        sl = lc + (atr * atr_multiplier)
+        tp = lc - ((sl - lc) * rr)
+    else:
+        sl, tp = lc, lc
+
+    return {"entry": round(lc, 6), "sl": round(sl, 6), "tp": round(tp, 6)}
+
+
+# ── Sections 4, 8: ADX gate + dynamic SMC threshold in evaluate_bot_window ─
 def evaluate_bot_window(df, strategy="bot", symbol="BTCUSDT", interval="5m",
                          higher_df=None, cfg=None):
     cfg = cfg or DEFAULT_CONFIG
     if df is None or len(df) < 50:
         return {
             "signal": "HOLD", "bias": "Neutral", "structure": "Range / Mixed",
-            "regime": "Unknown", "confidence": 50,
+            "regime": "Unknown", "confidence": 50, "adx": 0,
             "trade_idea": "Not enough data",
             "higher_tf": get_higher_timeframe(interval), "higher_tf_bias": "Neutral",
             "liquidity_sweep": None, "bos": None, "smc_score": 0,
             "reasons": ["Insufficient candle history — need ≥50 bars"],
         }
 
-    raw_signal  = generate_signal(df)
-    structure   = get_structure(df)
-    regime      = get_market_regime(df)
-    confidence  = estimate_confidence(df, raw_signal)
-    higher_tf   = get_higher_timeframe(interval)
+    raw_signal     = generate_signal(df)
+    structure      = get_structure(df)
+    regime         = get_market_regime(df)
+    higher_tf      = get_higher_timeframe(interval)
     if higher_df is None:
         higher_df = fetch_df_for_symbol(symbol, higher_tf, 100)
     higher_tf_bias = get_trend_bias(higher_df)
-    sweep = detect_liquidity_sweep(df)
-    bos   = detect_break_of_structure(df)
+    sweep          = detect_liquidity_sweep(df)
+    bos            = detect_break_of_structure(df)
 
-    final, idea, smc_score, reasons = "HOLD", "Wait for clearer confirmation", 0, []
+    # ── Section 4: ADX hard gate ──────────────────────────────────────
+    try:
+        adx = calculate_adx(df)
+    except Exception:
+        adx = 25.0   # default to passable if calculation fails
+
+    if adx < 20:
+        return {
+            "signal": "HOLD", "bias": "Neutral", "structure": structure,
+            "regime": regime, "confidence": 40, "adx": adx,
+            "trade_idea": "No trend detected — ADX filter active",
+            "higher_tf": higher_tf, "higher_tf_bias": higher_tf_bias,
+            "liquidity_sweep": sweep, "bos": bos, "smc_score": 0,
+            "reasons": [f"ADX {adx:.1f} < 20 — no trend, signal blocked"],
+        }
+
+    final, idea, smc_score, confidence, reasons = \
+        "HOLD", "Wait for clearer confirmation", 0, 50, []
 
     if strategy == "basic":
+        confidence = estimate_confidence(df, raw_signal, smc_checks_passed=0)
         final = raw_signal
         idea  = {"BUY": "Pullback long / continuation",
                  "SELL": "Reject highs / continuation short"}.get(final, idea)
         reasons.append(f"Basic momentum signal = {raw_signal}")
 
     elif strategy == "ema_rsi":
+        confidence = estimate_confidence(df, raw_signal, smc_checks_passed=0)
         ef = df["close"].ewm(span=9,  adjust=False).mean()
         es = df["close"].ewm(span=21, adjust=False).mean()
         if ef.iloc[-1] > es.iloc[-1] and confidence >= 65:
@@ -915,15 +994,25 @@ def evaluate_bot_window(df, strategy="bot", symbol="BTCUSDT", interval="5m",
             reasons.append("EMA9 < EMA21 and confidence ≥ 65")
 
     else:   # smart_money / bot
-        min_score = cfg["min_smc_score"]
+        # ── Section 8: dynamic SMC threshold ─────────────────────────
+        if regime == "Trending":
+            dynamic_min = max(6, cfg["min_smc_score"] - 1)   # easier in clear trends
+        elif regime in ["Range / Quiet", "Unknown"]:
+            dynamic_min = cfg["min_smc_score"] + 1            # harder in ranging
+        else:
+            dynamic_min = cfg["min_smc_score"]
+
+        # Preliminary confidence (no SMC alignment bonus yet — avoids circular dep)
+        prelim_conf = estimate_confidence(df, raw_signal, smc_checks_passed=0)
+
         buy_checks = [
             ("HTF bias bullish",              higher_tf_bias == "Bullish"),
             ("Buy-side liquidity sweep",       sweep == "BUY_SWEEP"),
             ("Bullish break of structure",     bos == "BULLISH_BOS"),
             ("Price in discount zone",         price_in_discount_zone(df)),
-            ("FVG retracement long",           detect_fvg_retrace(df, "BUY")),
+            ("FVG retracement long",           detect_fvg_retrace(df, "BUY", interval)),
             (f"Confidence ≥ {cfg['min_confidence']}%",
-                                               confidence >= cfg["min_confidence"]),
+                                               prelim_conf >= cfg["min_confidence"]),
             ("Trending / active regime",       regime not in ["Range / Quiet", "Unknown"]),
             ("Clear structure (not range)",    structure != "Range / Mixed"),
             ("Active session window",          session_allowed(cfg)),
@@ -933,30 +1022,34 @@ def evaluate_bot_window(df, strategy="bot", symbol="BTCUSDT", interval="5m",
             ("Sell-side liquidity sweep",      sweep == "SELL_SWEEP"),
             ("Bearish break of structure",     bos == "BEARISH_BOS"),
             ("Price in premium zone",          price_in_premium_zone(df)),
-            ("FVG retracement short",          detect_fvg_retrace(df, "SELL")),
+            ("FVG retracement short",          detect_fvg_retrace(df, "SELL", interval)),
             (f"Confidence ≥ {cfg['min_confidence']}%",
-                                               confidence >= cfg["min_confidence"]),
+                                               prelim_conf >= cfg["min_confidence"]),
             ("Trending / active regime",       regime not in ["Range / Quiet", "Unknown"]),
             ("Clear structure (not range)",    structure != "Range / Mixed"),
             ("Active session window",          session_allowed(cfg)),
         ]
         bs = sum(1 for _, ok in buy_checks  if ok)
         ss = sum(1 for _, ok in sell_checks if ok)
-        if bs >= min_score:
-            final, idea = "BUY",  "HTF bullish + sweep + BOS + retracement entry"
-            confidence = max(confidence, 80); smc_score = bs
+
+        if bs >= dynamic_min:
+            smc_score  = bs
+            confidence = max(estimate_confidence(df, "BUY",  smc_checks_passed=bs), 80)
+            final, idea = "BUY", "HTF bullish + sweep + BOS + retracement entry"
             reasons = ([f"✓ {n}" for n, ok in buy_checks  if ok] +
                        [f"✗ {n}" for n, ok in buy_checks  if not ok])
-        elif ss >= min_score:
+        elif ss >= dynamic_min:
+            smc_score  = ss
+            confidence = max(estimate_confidence(df, "SELL", smc_checks_passed=ss), 80)
             final, idea = "SELL", "HTF bearish + sweep + BOS + retracement entry"
-            confidence = max(confidence, 80); smc_score = ss
             reasons = ([f"✓ {n}" for n, ok in sell_checks if ok] +
                        [f"✗ {n}" for n, ok in sell_checks if not ok])
         else:
-            smc_score = max(bs, ss)
-            best = buy_checks if bs >= ss else sell_checks
-            reasons = ([f"✓ {n}" for n, ok in best if ok] +
-                       [f"✗ {n}" for n, ok in best if not ok])
+            smc_score  = max(bs, ss)
+            confidence = prelim_conf
+            best       = buy_checks if bs >= ss else sell_checks
+            reasons    = ([f"✓ {n}" for n, ok in best if ok] +
+                          [f"✗ {n}" for n, ok in best if not ok])
 
     bias = {"BUY": "Bullish", "SELL": "Bearish"}.get(final, higher_tf_bias)
     return {
@@ -964,27 +1057,11 @@ def evaluate_bot_window(df, strategy="bot", symbol="BTCUSDT", interval="5m",
         "regime": regime, "confidence": confidence, "trade_idea": idea,
         "higher_tf": higher_tf, "higher_tf_bias": higher_tf_bias,
         "liquidity_sweep": sweep, "bos": bos,
-        "smc_score": smc_score, "reasons": reasons,
+        "smc_score": smc_score, "adx": adx, "reasons": reasons,
     }
 
 
-def calculate_trade_levels(df, signal, rr=2):
-    lc = float(df.iloc[-1]["close"])
-    lh = float(df.iloc[-1]["high"])
-    ll = float(df.iloc[-1]["low"])
-    if signal == "BUY":
-        sl = ll * 0.995
-        tp = lc + (lc - sl) * rr
-    elif signal == "SELL":
-        sl = lh * 1.005
-        tp = lc - (sl - lc) * rr
-    else:
-        sl, tp = lc, lc
-    return {"entry": round(lc, 6), "sl": round(sl, 6), "tp": round(tp, 6)}
-
-
 def get_symbol_summary(symbol, strategy="bot", interval=SIGNALS_INTERVAL, cfg=None):
-    """[A][E][F] Fetch latest prices and signals for a symbol."""
     cfg       = cfg or DEFAULT_CONFIG
     cache_key = (symbol, strategy, interval)
     cached    = _cache_get(_summary_cache, cache_key, SUMMARY_TTL_SECONDS)
@@ -996,13 +1073,11 @@ def get_symbol_summary(symbol, strategy="bot", interval=SIGNALS_INTERVAL, cfg=No
     if df is None:
         return None
 
-    # Only fetch higher TF for crypto — Polygon is cheaper but still rate-limited
-    # Non-crypto higher TF would double the credits used per symbol
     market = detect_market(symbol)
     if market == "crypto":
         higher_df = fetch_df_for_symbol(symbol, get_higher_timeframe(fetch_iv), 100)
     else:
-        higher_df = None   # saves 14 credits per signal refresh
+        higher_df = None
 
     ev     = evaluate_bot_window(df, strategy, symbol, fetch_iv, higher_df, cfg)
     prev   = float(df.iloc[-2]["close"]) if len(df) > 1 else float(df.iloc[-1]["close"])
@@ -1028,6 +1103,7 @@ def get_symbol_summary(symbol, strategy="bot", interval=SIGNALS_INTERVAL, cfg=No
         "liquidity_sweep": ev["liquidity_sweep"],
         "bos":             ev["bos"],
         "smc_score":       ev["smc_score"],
+        "adx":             ev.get("adx", 0),
         "reasons":         ev["reasons"],
         "entry":           levels["entry"],
         "sl":              levels["sl"],
@@ -1051,10 +1127,9 @@ def get_session_name(dt):
 
 
 def _ts_to_str(ts):
-    """Convert a millisecond or second timestamp to a readable string."""
     try:
         t = int(ts)
-        if t > 1e12:          # milliseconds
+        if t > 1e12:
             return datetime.utcfromtimestamp(t / 1000).strftime("%Y-%m-%d %H:%M:%S")
         return datetime.utcfromtimestamp(t).strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
@@ -1062,15 +1137,10 @@ def _ts_to_str(ts):
 
 
 # ─────────────────────────────────────────────
-# SHARED INDICATOR HELPERS (used by new strategies)
+# SHARED INDICATOR HELPERS
 # ─────────────────────────────────────────────
 
 def _adr_series(daily_highs, daily_lows, period=10):
-    """
-    10-period Average Daily Range.
-    Inputs are parallel lists of daily high/low values (one per trading day).
-    Returns a list of the same length; first `period-1` values are None.
-    """
     if len(daily_highs) < period:
         return [None] * len(daily_highs)
     ranges = [daily_highs[j] - daily_lows[j] for j in range(len(daily_highs))]
@@ -1081,20 +1151,14 @@ def _adr_series(daily_highs, daily_lows, period=10):
 
 
 def _vwap_series(candles):
-    """
-    Intraday VWAP that resets at the start of each calendar day.
-    Candles: standard [ts_ms, open, high, low, close, volume] list.
-    Returns list of VWAP values (same length).
-    No lookahead — uses only completed bars.
-    """
-    from datetime import datetime, timezone as _tz
+    from datetime import datetime as _dt
 
     def _date(ts):
         t = int(ts)
         if t > 1e12: t //= 1000
-        return datetime.utcfromtimestamp(t).strftime("%Y-%m-%d")
+        return _dt.utcfromtimestamp(t).strftime("%Y-%m-%d")
 
-    result = []
+    result  = []
     cum_tpv = 0.0
     cum_vol  = 0.0
     cur_day  = None
@@ -1114,61 +1178,33 @@ def _vwap_series(candles):
 
 
 def _candle_et_hour_minute(ts_ms):
-    """Return (hour, minute) in US/Eastern time for a candle timestamp."""
-    from datetime import datetime, timezone as _tz, timedelta as _td
+    from datetime import datetime as _dt, timedelta as _td
     ts = int(ts_ms)
     if ts > 1e12: ts //= 1000
-    utc_dt = datetime.utcfromtimestamp(ts)
-    # ET = UTC-5 (EST) or UTC-4 (EDT). Approximate: use UTC-4 Apr-Oct, UTC-5 otherwise.
-    month = utc_dt.month
+    utc_dt = _dt.utcfromtimestamp(ts)
+    month  = utc_dt.month
     offset = -4 if 4 <= month <= 10 else -5
     et_dt  = utc_dt + _td(hours=offset)
-    return et_dt.hour, et_dt.minute, et_dt.weekday()   # weekday: 0=Mon
+    return et_dt.hour, et_dt.minute, et_dt.weekday()
 
 
 def _candle_et_hm(ts_ms):
-    """Return (hour*100 + minute) integer in ET for easy comparison."""
     h, m, _ = _candle_et_hour_minute(ts_ms)
     return h * 100 + m
 
 
 # ─────────────────────────────────────────────
 # STRATEGY: 0DTE Opening Range Breakout (ORB)
-#
-# Instrument:  SPY or any stock symbol (simulates 0DTE ATM options)
-# Timeframe:   5-minute bars (or 1-minute, auto-adapts)
-# Opening range: first bar(s) covering 09:30–09:35 ET
-# Entry:       Break above 5-min high → simulated CALL (+side)
-#              Break below 5-min low  → simulated PUT  (-side)
-# Only trades: Mondays, Wednesdays, Fridays
-# PnL model:   Options premium ~0.5% of underlying per $1 move.
-#              TP = +100% of option price, SL = -50% of option price.
-#              Time stop: 15:30 ET force-close.
-# Risk:        2% of account per trade (spec requirement).
 # ─────────────────────────────────────────────
 
 def run_orb_strategy(candles, starting_balance=1000,
                      fee_pct=0.04, slippage_pct=0.02):
-    """
-    0DTE Opening Range Breakout — SPY options simulation.
-
-    No overlap with unified_bot / simple_ma: those strategies use
-    EMA/ADX session-based logic. This uses pure price-structure
-    (opening range) on equity options with fixed +100%/-50% targets.
-
-    PnL is modelled as:
-      option_premium  ≈ ATR_5m × 0.5   (rough ATM premium estimate)
-      position_size   = risk_dollar / (option_premium × 0.50)
-                        (stop = 50% of premium = risk_dollar)
-      win  = +100% premium × size
-      loss =  -50% premium × size
-    """
-    RISK_PCT        = 0.02   # 2% per trade (spec)
-    TP_PCT          = 1.00   # +100% of option price
-    SL_PCT          = 0.50   # -50%  of option price
-    TIME_STOP_ET    = 1530   # 15:30 ET
+    RISK_PCT        = 0.02
+    TP_PCT          = 1.00
+    SL_PCT          = 0.50
+    TIME_STOP_ET    = 1530
     OPEN_RANGE_MINS = 5
-    TRADE_DAYS      = {0, 2, 4}   # Mon=0 Wed=2 Fri=4
+    TRADE_DAYS      = {0, 2, 4}
 
     trades  = []
     balance = float(starting_balance)
@@ -1176,69 +1212,53 @@ def run_orb_strategy(candles, starting_balance=1000,
     if len(candles) < 10:
         return trades, balance
 
-    # Group candles by ET date
     from collections import defaultdict
     day_candles = defaultdict(list)
     for c in candles:
         ts = int(c[0]); ts_s = ts // 1000 if ts > 1e12 else ts
         from datetime import datetime as _dt
-        from datetime import timezone as _tz
-        utc = _dt.utcfromtimestamp(ts_s)
-        month = utc.month
-        offset = -4 if 4 <= month <= 10 else -5
         import datetime as _dtmod
+        utc = _dt.utcfromtimestamp(ts_s)
+        month  = utc.month
+        offset = -4 if 4 <= month <= 10 else -5
         et = utc + _dtmod.timedelta(hours=offset)
         day_key = et.strftime("%Y-%m-%d")
-        wd = et.weekday()
-        day_candles[day_key].append((c, et.hour, et.minute, wd))
+        day_candles[day_key].append((c, et.hour, et.minute, et.weekday()))
 
     for day_key in sorted(day_candles.keys()):
         bars = day_candles[day_key]
         if not bars:
             continue
-
-        # Only Mon/Wed/Fri
         weekday = bars[0][3]
         if weekday not in TRADE_DAYS:
             continue
-
-        # Build opening range (09:30–09:35 ET)
         or_bars = [(c, h, m) for c, h, m, _ in bars
                    if h == 9 and 30 <= m < 30 + OPEN_RANGE_MINS]
         if not or_bars:
             continue
-
         or_high = max(float(b[0][2]) for b in or_bars)
         or_low  = min(float(b[0][3]) for b in or_bars)
         if or_high <= or_low:
             continue
-
-        # Estimate ATM option premium ≈ half the opening range
         option_premium = (or_high - or_low) * 0.5
         if option_premium <= 0:
             continue
-
         risk_dollar = balance * RISK_PCT
-        # size such that a 50% move in premium = risk_dollar
         size = risk_dollar / (option_premium * SL_PCT)
-
-        # Find breakout bar after 09:35 ET, before 15:30 ET
-        position = None
+        position   = None
         day_traded = False
 
         for c, hr, mn, _ in bars:
-            hm = hr * 100 + mn
+            hm    = hr * 100 + mn
             if hm < 935:
-                continue   # still in opening range
+                continue
             if hm >= TIME_STOP_ET and position is None:
-                break      # past time stop with no trade
-
-            price = float(c[4])   # close of this bar
+                break
+            price = float(c[4])
             hi    = float(c[2])
             lo    = float(c[3])
             t_str = _ts_to_str(c[0])
 
-            # Force-close at time stop
             if hm >= TIME_STOP_ET and position is not None:
                 ep   = position["entry_price"]
                 side = position["side"]
@@ -1250,66 +1270,50 @@ def run_orb_strategy(candles, starting_balance=1000,
                 net_pnl = opt_pnl - fee
                 balance += net_pnl
                 trades.append({
-                    "side":       side,
-                    "entry":      round(ep, 4),
-                    "exit":       round(price, 4),
-                    "entry_time": position["time"],
-                    "exit_time":  t_str,
-                    "pnl":        round(net_pnl, 4),
-                    "reason":     "Time stop",
-                    "setup":      f"ORB | OR {or_low:.2f}-{or_high:.2f}",
+                    "side": side, "entry": round(ep, 4), "exit": round(price, 4),
+                    "entry_time": position["time"], "exit_time": t_str,
+                    "pnl": round(net_pnl, 4), "reason": "Time stop",
+                    "setup": f"ORB | OR {or_low:.2f}-{or_high:.2f}",
                 })
                 position = None
                 break
 
             if position is None and not day_traded:
-                # Entry on breakout (use close of bar, no lookahead)
                 if price > or_high:
                     ep = price * (1 + slippage_pct / 100)
-                    position = {"side": "BUY", "entry_price": ep,
-                                "premium": option_premium, "time": t_str}
+                    position   = {"side": "BUY",  "entry_price": ep,
+                                  "premium": option_premium, "time": t_str}
                     day_traded = True
                 elif price < or_low:
                     ep = price * (1 - slippage_pct / 100)
-                    position = {"side": "SELL", "entry_price": ep,
-                                "premium": option_premium, "time": t_str}
+                    position   = {"side": "SELL", "entry_price": ep,
+                                  "premium": option_premium, "time": t_str}
                     day_traded = True
 
             elif position is not None:
                 side = position["side"]
                 ep   = position["entry_price"]
                 prem = position["premium"]
-                # Model option PnL: proportional to underlying move / premium
                 underlying_move = (price - ep) if side == "BUY" else (ep - price)
-                opt_pnl_pct = underlying_move / prem   # as fraction of premium
-                # TP: +100% of premium
+                opt_pnl_pct = underlying_move / prem
                 if opt_pnl_pct >= TP_PCT:
                     net_pnl = prem * TP_PCT * size - risk_dollar * fee_pct / 100 * 2
                     balance += net_pnl
                     trades.append({
-                        "side":       side,
-                        "entry":      round(ep, 4),
-                        "exit":       round(price, 4),
-                        "entry_time": position["time"],
-                        "exit_time":  t_str,
-                        "pnl":        round(net_pnl, 4),
-                        "reason":     "Take profit (+100%)",
-                        "setup":      f"ORB | OR {or_low:.2f}-{or_high:.2f}",
+                        "side": side, "entry": round(ep, 4), "exit": round(price, 4),
+                        "entry_time": position["time"], "exit_time": t_str,
+                        "pnl": round(net_pnl, 4), "reason": "Take profit (+100%)",
+                        "setup": f"ORB | OR {or_low:.2f}-{or_high:.2f}",
                     })
                     position = None
-                # SL: -50% of premium
                 elif opt_pnl_pct <= -SL_PCT:
                     net_pnl = -(prem * SL_PCT * size) - risk_dollar * fee_pct / 100 * 2
                     balance += net_pnl
                     trades.append({
-                        "side":       side,
-                        "entry":      round(ep, 4),
-                        "exit":       round(price, 4),
-                        "entry_time": position["time"],
-                        "exit_time":  t_str,
-                        "pnl":        round(net_pnl, 4),
-                        "reason":     "Stop loss (-50%)",
-                        "setup":      f"ORB | OR {or_low:.2f}-{or_high:.2f}",
+                        "side": side, "entry": round(ep, 4), "exit": round(price, 4),
+                        "entry_time": position["time"], "exit_time": t_str,
+                        "pnl": round(net_pnl, 4), "reason": "Stop loss (-50%)",
+                        "setup": f"ORB | OR {or_low:.2f}-{or_high:.2f}",
                     })
                     position = None
 
@@ -1318,43 +1322,19 @@ def run_orb_strategy(candles, starting_balance=1000,
 
 # ─────────────────────────────────────────────
 # STRATEGY: VWAP + EMA Trend
-#
-# Indicators: 9 EMA, 21 EMA, VWAP (intraday, resets daily)
-# Entry:      After 10:30 ET. 9/21 EMA crossover where:
-#               - Long:  price > VWAP (VWAP acting as support)
-#               - Short: price < VWAP (VWAP acting as resistance)
-# Risk:       2% of account per trade
-# SL:         50% of 10-period ADR from entry
-# Scale-out:  Sell 50% at 75% of ADR from entry (Normal Lite target)
-#             Trail remainder at 1×ATR once first target hit
-# No overlap with unified_bot: unified_bot uses session/London sweep logic.
-#   This strategy uses intraday VWAP support/resistance — fundamentally different.
 # ─────────────────────────────────────────────
 
 def run_vwap_ema_strategy(candles, starting_balance=1000,
                            fee_pct=0.04, slippage_pct=0.02):
-    """
-    VWAP + 9/21 EMA Trend with 2-part scaling.
-
-    Differences from unified_bot (no duplication):
-      • Uses VWAP as dynamic support/resistance filter (new)
-      • Entries only after 10:30 ET (time-of-day filter, not session-based)
-      • 2-part exit: 50% off at 75% of ADR, trail remainder at 1×ATR (new)
-      • ADR-based stop (Average Daily Range), not ATR-based (new)
-      • 2% risk (vs unified_bot 1%)
-
-    Compatible with 1-minute bars (as specified). Works on 5m too.
-    No lookahead: all indicators computed on completed bars.
-    """
-    RISK_PCT        = 0.02   # 2% per trade
-    ENTRY_AFTER_ET  = 1030   # 10:30 ET earliest entry
-    CLOSE_ET        = 1600   # 16:00 ET force-close
+    RISK_PCT        = 0.02
+    ENTRY_AFTER_ET  = 1030
+    CLOSE_ET        = 1600
     ADR_PERIOD      = 10
     EMA_FAST        = 9
     EMA_SLOW        = 21
-    ADR_SL_MULT     = 0.50   # SL = 50% of ADR
-    ADR_TP1_MULT    = 0.75   # First target = 75% of ADR
-    TRAIL_ATR_MULT  = 1.0    # Trail remainder at 1×ATR
+    ADR_SL_MULT     = 0.50
+    ADR_TP1_MULT    = 0.75
+    TRAIL_ATR_MULT  = 1.0
 
     trades  = []
     balance = float(starting_balance)
@@ -1371,7 +1351,6 @@ def run_vwap_ema_strategy(candles, starting_balance=1000,
     vwap_s  = _vwap_series(candles)
     atr_s   = _atr_series(highs, lows, closes, 14)
 
-    # Build daily high/low for ADR computation
     from collections import defaultdict
     day_hl = defaultdict(lambda: {"h": None, "l": None})
     dates_in_order = []
@@ -1396,7 +1375,6 @@ def run_vwap_ema_strategy(candles, starting_balance=1000,
         if not dates_in_order or dates_in_order[-1] != d:
             dates_in_order.append(d)
 
-    # ADR per day (computed on prior 10 completed days, no lookahead)
     daily_ranges = [(day_hl[d]["h"] - day_hl[d]["l"]) for d in dates_in_order]
     daily_adr    = {}
     for k, d in enumerate(dates_in_order):
@@ -1405,14 +1383,13 @@ def run_vwap_ema_strategy(candles, starting_balance=1000,
         else:
             daily_adr[d] = None
 
-    # Main loop
     position     = None
     current_day  = None
     day_traded   = False
 
     for i in range(EMA_SLOW + 1, len(candles)):
-        e9  = ema9_s[i];   e9p  = ema9_s[i-1]
-        e21 = ema21_s[i];  e21p = ema21_s[i-1]
+        e9   = ema9_s[i];  e9p  = ema9_s[i-1]
+        e21  = ema21_s[i]; e21p = ema21_s[i-1]
         vwap = vwap_s[i]
         atr_v = atr_s[i]
 
@@ -1429,7 +1406,6 @@ def run_vwap_ema_strategy(candles, starting_balance=1000,
 
         adr = daily_adr.get(d)
 
-        # Force-close at 16:00 ET
         if position is not None and hm >= CLOSE_ET:
             side = position["side"]; ep = position["entry"]
             raw_pnl = ((close - ep) if side == "BUY" else (ep - close)) * position["size"]
@@ -1437,25 +1413,20 @@ def run_vwap_ema_strategy(candles, starting_balance=1000,
             net = raw_pnl - fee
             balance += net
             trades.append({
-                "side":       side,
-                "entry":      round(ep, 6),
-                "exit":       round(close, 6),
-                "entry_time": position["time"],
-                "exit_time":  t_str,
-                "pnl":        round(net, 4),
-                "reason":     "Force close",
-                "setup":      position.get("setup", ""),
+                "side": side, "entry": round(ep, 6), "exit": round(close, 6),
+                "entry_time": position["time"], "exit_time": t_str,
+                "pnl": round(net, 4), "reason": "Force close",
+                "setup": position.get("setup", ""),
             })
             position = None; day_traded = False
             continue
 
-        # ── Manage open position ──────────────────────────────────────────
         if position is not None:
-            side    = position["side"]
-            ep      = position["entry"]
-            sl      = position["sl"]
-            tp1     = position["tp1"]
-            tp1_hit = position["tp1_hit"]
+            side     = position["side"]
+            ep       = position["entry"]
+            sl       = position["sl"]
+            tp1      = position["tp1"]
+            tp1_hit  = position["tp1_hit"]
             trail_sl = position["trail_sl"]
             sz_full  = position["size"]
             sz_rem   = position["size_rem"]
@@ -1466,7 +1437,6 @@ def run_vwap_ema_strategy(candles, starting_balance=1000,
             else:
                 if lo < peak: peak = lo; position["peak"] = peak
 
-            # Advance trail stop
             if tp1_hit:
                 if side == "BUY":
                     candidate = peak - atr_v * TRAIL_ATR_MULT
@@ -1477,30 +1447,24 @@ def run_vwap_ema_strategy(candles, starting_balance=1000,
 
             eff_sl = trail_sl if tp1_hit else sl
 
-            # First target (75% ADR): close 50% of position
             if not tp1_hit:
                 if (side == "BUY" and hi >= tp1) or (side == "SELL" and lo <= tp1):
-                    partial_sz   = sz_full - sz_rem          # 50% already exiting
-                    raw_pnl_p1   = ((tp1 - ep) if side == "BUY" else (ep - tp1)) * partial_sz
-                    fee_p1       = ep * partial_sz * fee_pct / 100 * 2
-                    net_p1       = raw_pnl_p1 - fee_p1
-                    balance     += net_p1
-                    position["tp1_hit"] = True
-                    position["trail_sl"] = ep  # move stop to breakeven
-                    trail_sl    = ep
+                    partial_sz = sz_full - sz_rem
+                    raw_pnl_p1 = ((tp1 - ep) if side == "BUY" else (ep - tp1)) * partial_sz
+                    fee_p1     = ep * partial_sz * fee_pct / 100 * 2
+                    net_p1     = raw_pnl_p1 - fee_p1
+                    balance   += net_p1
+                    position["tp1_hit"]  = True
+                    position["trail_sl"] = ep
+                    trail_sl = ep
                     trades.append({
-                        "side":       side,
-                        "entry":      round(ep, 6),
-                        "exit":       round(tp1, 6),
-                        "entry_time": position["time"],
-                        "exit_time":  t_str,
-                        "pnl":        round(net_p1, 4),
-                        "reason":     "Target 1 (75% ADR) — 50% closed",
-                        "setup":      position.get("setup", ""),
+                        "side": side, "entry": round(ep, 6), "exit": round(tp1, 6),
+                        "entry_time": position["time"], "exit_time": t_str,
+                        "pnl": round(net_p1, 4), "reason": "Target 1 (75% ADR) — 50% closed",
+                        "setup": position.get("setup", ""),
                     })
                     continue
 
-            # Full exit: stop loss or trail
             exit_price = exit_reason = None
             if side == "BUY":
                 if lo <= eff_sl:
@@ -1517,19 +1481,14 @@ def run_vwap_ema_strategy(candles, starting_balance=1000,
                 net     = raw_pnl - fee
                 balance += net
                 trades.append({
-                    "side":       side,
-                    "entry":      round(ep, 6),
-                    "exit":       round(exit_price, 6),
-                    "entry_time": position["time"],
-                    "exit_time":  t_str,
-                    "pnl":        round(net, 4),
-                    "reason":     exit_reason + " (remainder)",
-                    "setup":      position.get("setup", ""),
+                    "side": side, "entry": round(ep, 6), "exit": round(exit_price, 6),
+                    "entry_time": position["time"], "exit_time": t_str,
+                    "pnl": round(net, 4), "reason": exit_reason + " (remainder)",
+                    "setup": position.get("setup", ""),
                 })
                 position = None
             continue
 
-        # ── Entry ─────────────────────────────────────────────────────────
         if day_traded or adr is None or hm < ENTRY_AFTER_ET:
             continue
 
@@ -1537,13 +1496,12 @@ def run_vwap_ema_strategy(candles, starting_balance=1000,
         cross_down = e9p >= e21p and e9 < e21
 
         side = None
-        if cross_up   and close > vwap:   side = "BUY"
+        if cross_up   and close > vwap: side = "BUY"
         elif cross_down and close < vwap: side = "SELL"
 
         if side is None:
             continue
 
-        # SL = 50% ADR, TP1 = 75% ADR
         sl_dist  = adr * ADR_SL_MULT
         tp1_dist = adr * ADR_TP1_MULT
         if sl_dist <= 0:
@@ -1559,17 +1517,11 @@ def run_vwap_ema_strategy(candles, starting_balance=1000,
         tp1_price = ep + tp1_dist if side == "BUY" else ep - tp1_dist
 
         position = {
-            "side":     side,
-            "entry":    ep,
-            "time":     t_str,
-            "sl":       sl_price,
-            "tp1":      tp1_price,
-            "tp1_hit":  False,
-            "trail_sl": sl_price,
-            "peak":     ep,
-            "size":     size,
-            "size_rem": size * 0.50,   # 50% stays after first target
-            "setup":    f"VWAP+EMA | {'above' if side=='BUY' else 'below'} VWAP | ADR {adr:.4f}",
+            "side": side, "entry": ep, "time": t_str,
+            "sl": sl_price, "tp1": tp1_price, "tp1_hit": False,
+            "trail_sl": sl_price, "peak": ep,
+            "size": size, "size_rem": size * 0.50,
+            "setup": f"VWAP+EMA | {'above' if side=='BUY' else 'below'} VWAP | ADR {adr:.4f}",
         }
         day_traded = True
 
@@ -1577,24 +1529,17 @@ def run_vwap_ema_strategy(candles, starting_balance=1000,
 
 
 # ─────────────────────────────────────────────
-# [D] BACKTEST STRATEGY: SIMPLE MA (percentage-based PnL)
+# STRATEGY: SIMPLE MA
 # ─────────────────────────────────────────────
 
 def run_simple_ma_strategy(candles, starting_balance=1000,
                             fee_pct=0.04, slippage_pct=0.02):
-    """
-    [D] MA crossover + fixed percentage risk per trade.
-    Uses a 10/30 SMA crossover on closes.
-    PnL is expressed as % of entry so it works for any price scale
-    (BTC at 60k, EUR/USD at 1.08, AAPL at 180, Gold at 2300).
-    """
     trades      = []
     balance     = float(starting_balance)
-    risk_pct    = 0.01          # 1 % of balance per trade
+    risk_pct    = 0.01
     fee_rate    = fee_pct    / 100
     slip_rate   = slippage_pct / 100
 
-    # need at least 30 candles to start
     if len(candles) < 35:
         return trades, balance
 
@@ -1603,14 +1548,13 @@ def run_simple_ma_strategy(candles, starting_balance=1000,
     def sma(arr, n):
         return sum(arr[-n:]) / n if len(arr) >= n else None
 
-    position = None   # None | dict
+    position = None
 
     for i in range(30, len(candles)):
         fast = sma(closes[:i], 10)
         slow = sma(closes[:i], 30)
         if fast is None or slow is None:
             continue
-
         prev_fast = sma(closes[:i - 1], 10)
         prev_slow = sma(closes[:i - 1], 30)
         if prev_fast is None or prev_slow is None:
@@ -1619,21 +1563,19 @@ def run_simple_ma_strategy(candles, starting_balance=1000,
         price      = closes[i]
         entry_time = _ts_to_str(candles[i][0])
 
-        # --- entry ---
         if position is None:
             crossed_up   = prev_fast <= prev_slow and fast > slow
             crossed_down = prev_fast >= prev_slow and fast < slow
             if crossed_up:
-                ep    = price * (1 + slip_rate)
+                ep = price * (1 + slip_rate)
                 position = {"side": "BUY",  "entry": ep, "time": entry_time,
                             "sl": ep * 0.997, "tp": ep * 1.006}
             elif crossed_down:
-                ep    = price * (1 - slip_rate)
+                ep = price * (1 - slip_rate)
                 position = {"side": "SELL", "entry": ep, "time": entry_time,
                             "sl": ep * 1.003, "tp": ep * 0.994}
             continue
 
-        # --- exit ---
         side = position["side"]
         ep   = position["entry"]
         sl   = position["sl"]
@@ -1645,26 +1587,19 @@ def run_simple_ma_strategy(candles, starting_balance=1000,
         exit_reason = "Held"
 
         if side == "BUY":
-            if lo <= sl:
-                exit_price, exit_reason = sl,    "Stop loss"
-            elif hi >= tp:
-                exit_price, exit_reason = tp,    "Take profit"
-            elif fast < slow:
-                exit_price, exit_reason = price, "Signal reversal"
+            if lo <= sl:   exit_price, exit_reason = sl,    "Stop loss"
+            elif hi >= tp: exit_price, exit_reason = tp,    "Take profit"
+            elif fast < slow: exit_price, exit_reason = price, "Signal reversal"
         else:
-            if hi >= sl:
-                exit_price, exit_reason = sl,    "Stop loss"
-            elif lo <= tp:
-                exit_price, exit_reason = tp,    "Take profit"
-            elif fast > slow:
-                exit_price, exit_reason = price, "Signal reversal"
+            if hi >= sl:   exit_price, exit_reason = sl,    "Stop loss"
+            elif lo <= tp: exit_price, exit_reason = tp,    "Take profit"
+            elif fast > slow: exit_price, exit_reason = price, "Signal reversal"
 
         if exit_price is not None:
-            # percentage return so it's price-scale independent
             ret       = ((exit_price - ep) / ep) if side == "BUY" \
                          else ((ep - exit_price) / ep)
             risk_amt  = balance * risk_pct
-            gross_pnl = risk_amt * (ret / 0.003)   # normalise to ~1 % per ATR unit
+            gross_pnl = risk_amt * (ret / 0.003)
             fee       = risk_amt * fee_rate * 2
             net_pnl   = gross_pnl - fee
             balance  += net_pnl
@@ -1687,7 +1622,6 @@ def run_simple_ma_strategy(candles, starting_balance=1000,
 # ─────────────────────────────────────────────
 
 def _ema_series(values, period):
-    """Full EMA series, None for warm-up bars."""
     if len(values) < period:
         return [None] * len(values)
     mult   = 2 / (period + 1)
@@ -1701,7 +1635,6 @@ def _ema_series(values, period):
 
 
 def _atr_series(highs, lows, closes, period=14):
-    """Average True Range (Wilder smoothing), same length as input."""
     if len(closes) < period + 1:
         return [None] * len(closes)
     trs = [None]
@@ -1721,7 +1654,6 @@ def _atr_series(highs, lows, closes, period=14):
 
 
 def _rsi_series(values, period=14):
-    """Wilder RSI, same length as input, None for warm-up."""
     if len(values) <= period:
         return [None] * len(values)
     result = [None] * period
@@ -1738,15 +1670,9 @@ def _rsi_series(values, period=14):
 
 
 def _adx_series(highs, lows, closes, period=14):
-    """
-    Average Directional Index — measures trend strength (0-100).
-    Values > 25 indicate a trending market worth trading.
-    """
     n = len(closes)
     if n < period * 2 + 1:
         return [None] * n
-
-    # +DM, -DM, TR
     plus_dm  = [0.0]
     minus_dm = [0.0]
     trs      = [0.0]
@@ -1759,7 +1685,6 @@ def _adx_series(highs, lows, closes, period=14):
                        abs(highs[i]-closes[i-1]),
                        abs(lows[i] -closes[i-1])))
 
-    # Smooth with Wilder
     def wilder_smooth(arr, p):
         out  = [None] * p
         val  = sum(arr[:p])
@@ -1786,7 +1711,6 @@ def _adx_series(highs, lows, closes, period=14):
             s = di_plus[i] + di_minus[i]
             dx.append(100 * abs(di_plus[i] - di_minus[i]) / s if s else 0.0)
 
-    # Smooth DX → ADX
     first_valid = next((i for i, v in enumerate(dx) if v is not None), None)
     if first_valid is None:
         return [None] * n
@@ -1805,85 +1729,40 @@ def _adx_series(highs, lows, closes, period=14):
 
 # ─────────────────────────────────────────────
 # UNIFIED BOT STRATEGY  v3
-#
-# What was wrong with v2 and what we fixed
 # ─────────────────────────────────────────────
-# BUG 1 — EMA200 warm-up = 200 bars.  On a 2-day 5m window (576 candles)
-#   the strategy only had 376 bars to trade, and the EMA200 trend hadn't
-#   had time to form a reliable macro direction. Fixed: use EMA50 as the
-#   macro filter (50-bar warm-up) so the strategy works on short windows.
-#
-# BUG 2 — Fee formula was `(ep + exit_price) * size * fee_rate`.
-#   This multiplies two prices × size = price² units, not money.
-#   For BTC at $90k: (90000 + 90000) * size * 0.0004 = 72 per unit, absurd.
-#   Fixed: fee = `notional * fee_rate * 2` where notional = entry_price * size.
-#   Now fees are a realistic ~0.04% of trade value each side.
-#
-# BUG 3 — SL based on `min(recent_lows[-5:])`.  On choppy 5m BTC data the
-#   5 most recent lows are all very close to current price, giving a tiny
-#   r_dist → enormous position size → single loss wipes the account.
-#   Fixed: SL = entry ± 1.5 × ATR (always structurally meaningful and
-#   proportional to actual volatility), with size = risk_dollar / sl_distance.
-#
-# BUG 4 — Entry fires every bar that passes the filter — it re-enters
-#   immediately after a closed trade with no pause to re-assess.
-#   Fixed: mandatory 3-bar cooldown after ANY exit (win or loss).
-#
-# Design principles
-# ─────────────────
-#  • 1 % of starting_balance risked per trade — fixed, never compounds down.
-#  • SL = 1.5 × ATR from entry.  TP = SL_distance × 2.5 (2.5 R:R minimum).
-#  • Trailing stop activates at +1 R, trails at 1 × ATR behind peak price.
-#  • Entry requires: EMA trend stack + ADX > 20 (trending) + RSI zone filter.
-#  • Works on any price scale: size is always risk_dollar / sl_distance.
-# ─────────────────────────────────────────────
+# Section 6: trailing stop added to PATH B (daily bars fallback)
 
 def run_unified_bot_strategy(candles, starting_balance=1000,
                               fee_pct=0.04, slippage_pct=0.02):
     """
-    ICT -- Asian Range -> London Push -> New York Reversal
+    ICT — Asian Range → London Push → New York Reversal
 
-    Phase 1  Asian session  00:00-08:00 GMT   Mark ASH / ASL
-    Phase 2  London open    08:00-10:30 GMT   Detect manipulation push
-    Phase 3  NY open        13:00-15:00 GMT   Trade the reversal
-
-    Entry : Displacement candle (body > 50% of range) closing back toward
-            the Asian range. FVG left by that candle used for tighter entry.
-    SL    : Above London push high (shorts) / below London push low (longs).
-    TP1   : Asian range midpoint -- 50% partial exit, SL moved to breakeven.
-    TP2   : Opposite Asian range boundary (ASL for shorts, ASH for longs).
-
-    Daily-candle fallback (timestamp gap >= 20 h):
-    EMA9/21/50 + ADX + RSI trend-follow, one trade per bar.
-
-    Session limits: 3 wins / 1 loss per calendar day.
+    PATH A : intraday candles  (gap < 20 h)
+    PATH B : daily bars fallback with EMA/ADX/RSI trend-follow
+             Section 6 trailing stop activates at 1R profit.
     """
     from collections import defaultdict
 
-    # -- Constants --------------------------------------------------------
-    RISK_PCT          = 0.01        # 1% of starting balance per trade
-    MAX_WINS_DAY      = 3
-    MAX_LOSS_DAY      = 1
+    RISK_PCT       = 0.01
+    MAX_WINS_DAY   = 3
+    MAX_LOSS_DAY   = 1
 
-    # GMT session boundaries (minutes from midnight)
-    ASIAN_START   =    0   # 00:00
-    ASIAN_END     =  480   # 08:00
-    LONDON_START  =  480   # 08:00
-    LONDON_END    =  630   # 10:30
-    NY_START      =  780   # 13:00  — NY open, reversal entry window begins
-    NY_END        = 1020   # 17:00  — London/NY overlap end; doc says "strongest 13:00–17:00 GMT"
-    SESSION_CLOSE = 1200   # 20:00  — hard EOD close
+    ASIAN_START    =    0
+    ASIAN_END      =  480
+    LONDON_START   =  480
+    LONDON_END     =  630
+    NY_START       =  780
+    NY_END         = 1020
+    SESSION_CLOSE  = 1200
 
-    DISP_BODY_RATIO = 0.50   # displacement body must be > 50% of candle range
-    SL_BUFFER       = 0.0005 # 0.05% buffer beyond push extreme
+    DISP_BODY_RATIO = 0.50
+    SL_BUFFER       = 0.0005
 
-    # Fallback (daily bars only)
     WARMUP        = 55
     ADX_MIN_DAILY = 18
     RSI_BUY_LO    = 40;  RSI_BUY_HI  = 75
     RSI_SELL_LO   = 25;  RSI_SELL_HI = 60
 
-    # -- Setup -----------------------------------------------------------
     trades      = []
     balance     = float(starting_balance)
     risk_dollar = balance * RISK_PCT
@@ -1907,10 +1786,9 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
         return datetime.utcfromtimestamp(int(ts) / 1000).strftime("%Y-%m-%d %H:%M")
 
     # ====================================================================
-    # PATH A -- INTRADAY
+    # PATH A — INTRADAY
     # ====================================================================
     if not is_daily:
-        # Pre-pass: bucket candles into sessions per day
         day_buckets = defaultdict(lambda: {"asian": [], "london": [], "ny": [], "after": []})
         for c in candles:
             hm = _hm(c[0]); d = _date(c[0])
@@ -1935,7 +1813,6 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                 current_day = day
                 day_wins    = 0
                 day_losses  = 0
-                # Force-close any position carried from previous day
                 if position is not None:
                     all_prev = sorted(
                         [c for bkt in day_buckets.values()
@@ -1952,7 +1829,7 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                     balance += net
                     trades.append({
                         "side": position["side"], "entry": round(position["entry"], 6),
-                        "exit": round(lc, 6),     "pnl":   round(net, 4),
+                        "exit": round(lc, 6), "pnl": round(net, 4),
                         "entry_time": position["time"], "exit_time": position["time"],
                         "reason": "End-of-day close",
                     })
@@ -1963,14 +1840,12 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
             if day_losses >= MAX_LOSS_DAY or day_wins >= MAX_WINS_DAY:
                 continue
 
-            # Phase 1: Asian range
             ash = max(float(c[2]) for c in asian)
             asl = min(float(c[3]) for c in asian)
             mid = (ash + asl) / 2
             if ash <= asl:
                 continue
 
-            # Phase 2: London push -- which boundary did it sweep?
             l_high = max(float(c[2]) for c in london)
             l_low  = min(float(c[3]) for c in london)
 
@@ -1980,17 +1855,12 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
             if not pushed_above and not pushed_below:
                 continue
 
-            # If both swept take the larger deviation
             if pushed_above and pushed_below:
                 if (l_high - ash) >= (asl - l_low):
                     pushed_below = False
                 else:
                     pushed_above = False
 
-            # Phase 2 quality filters — distinguish manipulation from genuine breakout
-            # -----------------------------------------------------------------------
-            # Filter 1: sweep must penetrate at least 10% of the Asian range.
-            # A 1-pip brush of the boundary is noise, not institutional sweep.
             asian_range_size = ash - asl
             if asian_range_size <= 0:
                 continue
@@ -1998,17 +1868,12 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
             if sweep_depth < asian_range_size * 0.10:
                 continue
 
-            # Filter 2: "no acceptance" — the London session must FAIL to hold
-            # beyond the Asian range boundary.  The last London candle close must
-            # be back inside (or at) the boundary, confirming the push was
-            # manipulation rather than a genuine trend continuation.
             last_london_close = float(london[-1][4])
             if pushed_above and last_london_close > ash:
-                continue   # Price accepted above ASH → genuine breakout, skip
+                continue
             if pushed_below and last_london_close < asl:
-                continue   # Price accepted below ASL → genuine breakout, skip
+                continue
 
-            # Phase 3: NY reversal direction is OPPOSITE to push
             if pushed_above:
                 reversal  = "SELL"
                 push_ext  = l_high
@@ -2022,16 +1887,9 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                 tp1_price = mid
                 tp2_price = ash
 
-            # Find displacement candle + FVG in NY session
-            # ---------------------------------------------------------------
-            # Aggressive entry : enter at displacement candle close.
-            # Conservative entry: wait for price to retrace into the FVG zone
-            #   left by the displacement (better R:R, tighter stop).
-            # We prefer conservative when a clean FVG is present; fall back to
-            # aggressive if no FVG forms or price never retraces into it.
-            entry_candle = None
+            entry_candle    = None
             fvg_hi = fvg_lo = None
-            fvg_entry_price = None   # set when price fills the FVG zone
+            fvg_entry_price = None
 
             for k, c in enumerate(ny):
                 o   = float(c[1]); h = float(c[2])
@@ -2052,16 +1910,12 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
 
                 entry_candle = c
 
-                # Proper ICT FVG: 3-candle pattern — gap between candle[k-1]
-                # and candle[k+1] that candle[k] (displacement) skipped over.
                 if k >= 1 and k + 1 < len(ny):
                     prev = ny[k - 1]; nxt = ny[k + 1]
                     if reversal == "SELL":
-                        # Bearish FVG: prev.low > next.high  (imbalance above next)
                         if float(prev[3]) > float(nxt[2]):
                             fvg_hi = float(prev[3]); fvg_lo = float(nxt[2])
                     else:
-                        # Bullish FVG: prev.high < next.low  (imbalance below next)
                         if float(prev[2]) < float(nxt[3]):
                             fvg_lo = float(prev[2]); fvg_hi = float(nxt[3])
                 break
@@ -2069,9 +1923,6 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
             if entry_candle is None:
                 continue
 
-            # --- Entry selection: conservative (FVG) preferred, else aggressive ---
-            # Look ahead through remaining NY candles for a retrace into the FVG.
-            # If found, that candle becomes the entry; if not, use aggressive entry.
             ec = float(entry_candle[4])
             if fvg_hi is not None and fvg_lo is not None:
                 fvg_mid = (fvg_hi + fvg_lo) / 2
@@ -2079,22 +1930,20 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                     k_disp = ny.index(entry_candle)
                 except ValueError:
                     k_disp = len(ny)
-                # Scan forward for a candle that trades into the FVG zone
                 for c_fwd in ny[k_disp + 1:]:
                     h_fwd = float(c_fwd[2]); l_fwd = float(c_fwd[3])
                     if reversal == "SELL" and h_fwd >= fvg_lo:
-                        # Price retraced up into the FVG — conservative short entry
                         fvg_entry_price = min(h_fwd, fvg_mid)
                         entry_candle = c_fwd
                         break
                     elif reversal == "BUY" and l_fwd <= fvg_hi:
-                        # Price retraced down into the FVG — conservative long entry
                         fvg_entry_price = max(l_fwd, fvg_mid)
                         entry_candle = c_fwd
                         break
-            # Final entry: conservative (FVG retrace) preferred, aggressive fallback
+
             raw_entry   = fvg_entry_price if fvg_entry_price is not None else ec
-            entry_price = raw_entry * (1 - slip_rate) if reversal == "SELL" else raw_entry * (1 + slip_rate)
+            entry_price = raw_entry * (1 - slip_rate) if reversal == "SELL" \
+                          else raw_entry * (1 + slip_rate)
 
             risk_dist = abs(entry_price - sl_price)
             if risk_dist <= 0:
@@ -2118,7 +1967,6 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                               else " | aggressive entry")),
             }
 
-            # Walk remaining candles (rest of NY + after-hours)
             try:
                 k_start = ny.index(entry_candle) + 1
             except ValueError:
@@ -2142,10 +1990,10 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                             "side": "SELL", "entry": round(position["entry"], 6),
                             "exit": round(ep, 6), "pnl": round(net, 4),
                             "entry_time": position["time"], "exit_time": t,
-                            "reason": "TP1 -- Asian midpoint (50%)",
+                            "reason": "TP1 — Asian midpoint (50%)",
                         })
                         position["scaled"] = True
-                        position["sl"]     = position["entry"]  # move to breakeven
+                        position["sl"]     = position["entry"]
 
                     elif position["scaled"] and lo_ <= position["tp2"]:
                         ep  = position["tp2"]; sz = position["size_rem"]
@@ -2157,7 +2005,7 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                             "side": "SELL", "entry": round(position["entry"], 6),
                             "exit": round(ep, 6), "pnl": round(net, 4),
                             "entry_time": position["time"], "exit_time": t,
-                            "reason": "TP2 -- Opposite Asian boundary (ASL)",
+                            "reason": "TP2 — Opposite Asian boundary (ASL)",
                         })
                         day_wins += 1; position = None
 
@@ -2189,7 +2037,7 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                             "side": "BUY", "entry": round(position["entry"], 6),
                             "exit": round(ep, 6), "pnl": round(net, 4),
                             "entry_time": position["time"], "exit_time": t,
-                            "reason": "TP1 -- Asian midpoint (50%)",
+                            "reason": "TP1 — Asian midpoint (50%)",
                         })
                         position["scaled"] = True
                         position["sl"]     = position["entry"]
@@ -2204,7 +2052,7 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                             "side": "BUY", "entry": round(position["entry"], 6),
                             "exit": round(ep, 6), "pnl": round(net, 4),
                             "entry_time": position["time"], "exit_time": t,
-                            "reason": "TP2 -- Opposite Asian boundary (ASH)",
+                            "reason": "TP2 — Opposite Asian boundary (ASH)",
                         })
                         day_wins += 1; position = None
 
@@ -2225,7 +2073,6 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                         if not position["scaled"]: day_losses += 1
                         position = None
 
-            # Force-close at session end if still open
             if position is not None:
                 last = (after or ny)[-1] if (after or ny) else None
                 if last:
@@ -2247,7 +2094,8 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
         return trades, balance
 
     # ====================================================================
-    # PATH B -- DAILY BARS fallback  (EMA + ADX + RSI)
+    # PATH B — DAILY BARS with EMA + ADX + RSI
+    # Section 6: trailing stop activates at 1R profit
     # ====================================================================
     closes = [float(c[4]) for c in candles]
     highs  = [float(c[2]) for c in candles]
@@ -2278,21 +2126,51 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
         if today != current_day:
             current_day = today; day_wins = 0; day_losses = 0
 
+        # ── Section 6: manage open position with trailing stop ────────
         if position is not None:
-            ep = position["entry"]; sl_p = position["sl"]; tp_p = position["tp"]
-            side = position["side"]; sz = position["size"]
+            ep     = position["entry"]
+            sl_p   = position["sl"]
+            tp_p   = position["tp"]
+            side   = position["side"]
+            sz     = position["size"]
+            trail  = position.get("trailing_sl", sl_p)
+            one_r  = abs(ep - sl_p)
+
             exit_price = exit_reason = None
+
             if side == "BUY":
-                if lo <= sl_p:  exit_price, exit_reason = sl_p, "Stop loss"
-                elif hi >= tp_p: exit_price, exit_reason = tp_p, "Take profit"
-            else:
-                if hi >= sl_p:  exit_price, exit_reason = sl_p, "Stop loss"
-                elif lo <= tp_p: exit_price, exit_reason = tp_p, "Take profit"
+                # Advance trailing stop once 1R is reached
+                if one_r > 0 and hi >= ep + one_r:
+                    candidate = close - one_r * 0.5
+                    if candidate > trail:
+                        trail = candidate
+                        position["trailing_sl"] = trail
+                # Only label as "Trailing stop" if it has moved above the initial SL
+                trail_active = trail > sl_p
+                if trail_active and lo <= trail:
+                    exit_price, exit_reason = trail, "Trailing stop"
+                elif lo <= sl_p:
+                    exit_price, exit_reason = sl_p, "Stop loss"
+                elif hi >= tp_p:
+                    exit_price, exit_reason = tp_p, "Take profit"
+            else:  # SELL
+                if one_r > 0 and lo <= ep - one_r:
+                    candidate = close + one_r * 0.5
+                    if candidate < trail:
+                        trail = candidate
+                        position["trailing_sl"] = trail
+                trail_active = trail < sl_p
+                if trail_active and hi >= trail:
+                    exit_price, exit_reason = trail, "Trailing stop"
+                elif hi >= sl_p:
+                    exit_price, exit_reason = sl_p, "Stop loss"
+                elif lo <= tp_p:
+                    exit_price, exit_reason = tp_p, "Take profit"
+
             if exit_price:
                 gp  = ((exit_price - ep) if side == "BUY" else (ep - exit_price)) * sz
                 fee = ep * sz * fee_rate * 2
                 net = gp - fee
-                balance += net
                 if net > 0: day_wins   += 1
                 else:       day_losses += 1
                 trades.append({
@@ -2306,7 +2184,7 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
         if day_losses >= MAX_LOSS_DAY or day_wins >= MAX_WINS_DAY:
             continue
 
-        sl_dist = max(atr_v * 1.5, close * 0.001)
+        sl_dist   = max(atr_v * 1.5, close * 0.001)
         direction = None
         if e9 > e21 and close > e50 and adx_v >= ADX_MIN_DAILY and RSI_BUY_LO < rsi_v < RSI_BUY_HI:
             direction = "BUY"
@@ -2322,6 +2200,7 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
         position = {
             "side": direction, "entry": ep, "sl": sl_p, "tp": tp_p,
             "size": sz, "time": t_str,
+            "trailing_sl": sl_p,   # Section 6: initialize at SL
         }
 
     return trades, balance
@@ -2334,20 +2213,15 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
 @app.route("/api/health")
 def health():
     polygon_key = os.environ.get("POLYGON_API_KEY", "")
-    return jsonify({
-        "ok":           True,
-        "time":         now_str(),
-        "polygon_key":  bool(polygon_key),
-    })
+    return jsonify({"ok": True, "time": now_str(), "polygon_key": bool(polygon_key)})
 
 
 @app.route("/api/symbols", methods=["GET"])
 def get_symbols():
-    """[H] Return canonical symbol list with market membership."""
     symbol_market = {sym: mkt for mkt, syms in MARKETS.items() for sym in syms}
     return jsonify({
-        "symbols": ALL_SYMBOLS,
-        "markets": MARKETS,
+        "symbols":       ALL_SYMBOLS,
+        "markets":       MARKETS,
         "symbol_market": symbol_market,
     })
 
@@ -2355,23 +2229,11 @@ def get_symbols():
 @app.route("/api/signals", methods=["GET"])
 @auth_required
 def signals():
-    """
-    [A][E] Signals for all 18 symbols using 5m interval.
-
-    Rate-limit strategy:
-    - Crypto (Binance) symbols are free to poll — no TD credits used.
-    - Non-crypto symbols are cached for NON_CRYPTO_CANDLE_TTL (5 min).
-      On the first call all 14 non-crypto symbols are fetched sequentially
-      through the rate-limiter (8 s gap each = ~112 s total).
-      On subsequent calls within 5 min the cached data is returned instantly.
-    - The frontend polls every 15 s but most calls hit the cache.
-    """
     cfg      = get_user_config()
     strategy = request.args.get("strategy", "bot").lower()
     out      = []
     errors   = []
 
-    # Return cached summaries without waiting on TD for symbols we already have
     fresh, needs_fetch = [], []
     for sym in ALL_SYMBOLS:
         cache_key = (sym, strategy, SIGNALS_INTERVAL)
@@ -2381,7 +2243,6 @@ def signals():
         else:
             needs_fetch.append(sym)
 
-    # Return cached symbols immediately; fetch the rest
     out.extend(fresh)
     for sym in needs_fetch:
         try:
@@ -2393,7 +2254,6 @@ def signals():
         except Exception as e:
             errors.append({"symbol": sym, "error": str(e)})
 
-    # Re-sort to the canonical order so the frontend always sees consistent ordering
     order = {sym: i for i, sym in enumerate(ALL_SYMBOLS)}
     out.sort(key=lambda s: order.get(s["symbol"], 999))
 
@@ -2443,32 +2303,28 @@ def chart_candles():
 @auth_required
 def api_backtest():
     """
-    [B][C][D][G] Full multi-market backtester.
-    • Crypto  : Binance range fetch with random historical window.
-    • Non-crypto: Polygon daily bars fetched once and sliced for random windows.
-    • Returns descriptive error messages at every failure point.
+    Section 7: random_window defaults to False, period_days defaults to 30,
+               max period_days raised to 90.
     """
     data = request.get_json(force=True) or {}
 
     symbol      = str(data.get("symbol",      "BTCUSDT")).upper()
     interval    = str(data.get("interval",    "5m"))
     strategy    = str(data.get("strategy",    "unified_bot")).lower()
-    period_days = max(2, min(int(data.get("period_days", 7)), 60))
-    rand_window = bool(data.get("random_window", True))
+    period_days = max(2, min(int(data.get("period_days", 30)), 90))   # default 30, max 90
+    rand_window = bool(data.get("random_window", False))               # default False
     sb          = float(data.get("starting_balance", 1000))
     fee_pct     = float(data.get("fee_percent",       0.04))
     slip_pct    = float(data.get("slippage_percent",  0.02))
 
     market = detect_market(symbol)
 
-    # ── validate symbol ──
     if symbol not in ALL_SYMBOLS:
         return jsonify({
             "error": f"Symbol '{symbol}' is not supported. "
                      f"Supported symbols: {ALL_SYMBOLS}"
         }), 400
 
-    # ── validate interval ──
     valid_intervals = ["1m", "5m", "15m", "1h", "4h"]
     if interval not in valid_intervals:
         return jsonify({
@@ -2476,37 +2332,36 @@ def api_backtest():
                      f"Use one of: {valid_intervals}"
         }), 400
 
-    # ── fetch candles ──
-    actual_interval = interval          # may be upgraded for non-crypto on short intervals
+    actual_interval = interval
     start_date = end_date = None
 
     try:
         if market == "crypto":
-            # Binance range fetch with random window
             iv_minutes  = {"1m": 1, "5m": 5, "15m": 15, "1h": 60, "4h": 240}[interval]
             target_rows = max(100, min(int(period_days * 24 * 60 / iv_minutes), 1000))
             period_ms   = period_days * 24 * 60 * 60 * 1000
             now_utc     = datetime.now(timezone.utc)
 
             if rand_window:
-                earliest   = MARKET_EARLIEST["crypto"]
-                latest_end = now_utc - timedelta(hours=1)
+                earliest     = MARKET_EARLIEST["crypto"]
+                latest_end   = now_utc - timedelta(hours=1)
                 latest_start = latest_end - timedelta(days=period_days)
                 if latest_start > earliest:
-                    span = int((latest_start - earliest).total_seconds())
+                    span   = int((latest_start - earliest).total_seconds())
                     offset = random.randint(0, span)
                     start_dt = earliest + timedelta(seconds=offset)
                 else:
                     start_dt = earliest
-                end_dt   = start_dt + timedelta(days=period_days)
-                start_ms = int(start_dt.timestamp() * 1000)
-                end_ms   = int(end_dt.timestamp()   * 1000)
+                end_dt = start_dt + timedelta(days=period_days)
             else:
+                # Section 7: when random_window=False, always use most recent period
                 end_ms   = int(now_utc.timestamp() * 1000)
                 start_ms = end_ms - period_ms
                 start_dt = datetime.utcfromtimestamp(start_ms / 1000)
                 end_dt   = datetime.utcfromtimestamp(end_ms   / 1000)
 
+            start_ms   = int(start_dt.timestamp() * 1000)
+            end_ms     = int(end_dt.timestamp()   * 1000)
             start_date = start_dt.strftime("%Y-%m-%d")
             end_date   = end_dt.strftime("%Y-%m-%d")
 
@@ -2522,8 +2377,6 @@ def api_backtest():
                 }), 400
 
         else:
-            # Non-crypto: use Polygon daily bars (cached 30 min,
-            # cached 30 min) to avoid competing with the signals rate limit.
             candles, actual_interval, start_date, end_date = \
                 fetch_non_crypto_backtest_candles(
                     symbol, period_days, random_window=rand_window
@@ -2536,7 +2389,6 @@ def api_backtest():
             "error": f"Unexpected error fetching candles for {symbol}: {e}"
         }), 500
 
-    # ── run strategy ──
     try:
         if strategy == "unified_bot":
             trades, ending_balance = run_unified_bot_strategy(candles, sb, fee_pct, slip_pct)
@@ -2552,7 +2404,6 @@ def api_backtest():
                      f"Candles available: {len(candles)}"
         }), 500
 
-    # ── compute summary stats ──
     total   = len(trades)
     wins    = [t for t in trades if t["pnl"] > 0]
     losses  = [t for t in trades if t["pnl"] <= 0]
@@ -2567,7 +2418,6 @@ def api_backtest():
     end_ts   = candles[-1][0]
     days     = max(1, (int(end_ts) - int(start_ts)) / (1000 * 60 * 60 * 24))
 
-    # ── persist ──
     run_id = str(uuid.uuid4())
     try:
         conn = get_conn(); c = conn.cursor()
@@ -2692,6 +2542,8 @@ def update_settings():
         cfg["symbols"] = [s.upper() for s in data["symbols"] if isinstance(s, str)]
     if "blocked_crypto_hours_utc" in data and isinstance(data["blocked_crypto_hours_utc"], list):
         cfg["blocked_crypto_hours_utc"] = data["blocked_crypto_hours_utc"]
+    if "blocked_sessions" in data and isinstance(data["blocked_sessions"], list):
+        cfg["blocked_sessions"] = data["blocked_sessions"]
     conn = get_conn(); c = conn.cursor()
     c.execute("UPDATE users SET settings=%s WHERE id=%s", (json.dumps(cfg), g.user_id))
     conn.commit(); conn.close()
@@ -2879,8 +2731,8 @@ def open_paper_trade():
     cfg    = get_user_config()
     levels = calculate_trade_levels(df, side, cfg.get("risk_reward", 2))
     price  = float(df.iloc[-1]["close"])
-    risk_amt   = cfg["starting_balance"] * (cfg["risk_percent"] / 100)
-    stop_dist  = abs(price - levels["sl"])
+    risk_amt  = cfg["starting_balance"] * (cfg["risk_percent"] / 100)
+    stop_dist = abs(price - levels["sl"])
     size = risk_amt / stop_dist if stop_dist else 0
     tid  = str(uuid.uuid4())
     conn = get_conn(); c = conn.cursor()
@@ -2966,3 +2818,353 @@ def stats():
         "balance":          round(cfg["starting_balance"] + sum(pnls), 2),
         "starting_balance": cfg["starting_balance"],
     })
+
+
+# ─────────────────────────────────────────────
+# SECTION 1: SELF-LEARNING SYSTEM
+# ─────────────────────────────────────────────
+
+def _analyze_losing_trades(losing_trades, backtest_runs, cfg):
+    """
+    Pure rule-based analysis of losing trades across recent backtest runs.
+    Returns {"patterns": [...], "adjustments": {...}}
+    Keys prefixed "_r_" carry human-readable reasons and are stripped before
+    the response is sent to the client.
+    """
+    patterns    = []
+    adjustments = {}
+    total       = len(losing_trades)
+
+    if total == 0:
+        return {
+            "patterns":    ["No losing trades found across the analyzed runs."],
+            "adjustments": {},
+        }
+
+    # ── 1. Session & hour clustering ──────────────────────────────────
+    session_counts = {"London": 0, "New York": 0, "Asia": 0}
+    hour_counts    = {}
+
+    for t in losing_trades:
+        raw = t.get("entry_time", "")
+        try:
+            dt  = datetime.strptime(str(raw)[:19], "%Y-%m-%d %H:%M:%S")
+            h   = dt.hour
+            hour_counts[h] = hour_counts.get(h, 0) + 1
+            sn  = get_session_name(dt)
+            session_counts[sn] = session_counts.get(sn, 0) + 1
+        except Exception:
+            pass
+
+    for session, count in session_counts.items():
+        pct = count / total
+        if pct >= 0.70:
+            patterns.append(
+                f"{count}/{total} losses ({round(pct*100)}%) occurred in "
+                f"{session} session"
+            )
+            if session == "Asia":
+                blocked = set(cfg.get("blocked_crypto_hours_utc", []))
+                blocked |= set(range(0, 8))
+                adjustments["blocked_crypto_hours_utc"] = sorted(blocked)
+                adjustments["_r_blocked_hours"] = (
+                    "70%+ losses in Asia session → hours 0–7 UTC added to blocked list"
+                )
+            else:
+                bs = list(cfg.get("blocked_sessions", []))
+                if session not in bs:
+                    bs.append(session)
+                adjustments["blocked_sessions"] = bs
+                adjustments["_r_blocked_sessions"] = (
+                    f"70%+ losses in {session} session → session blocked"
+                )
+
+    # Hour-level: any 3-hour UTC window with 60%+ of losses
+    if total >= 5:
+        for start_h in range(24):
+            window = {start_h % 24, (start_h + 1) % 24, (start_h + 2) % 24}
+            wcount = sum(hour_counts.get(h, 0) for h in window)
+            if wcount / total >= 0.60:
+                end_h = (start_h + 2) % 24
+                patterns.append(
+                    f"{wcount}/{total} losses clustered in the "
+                    f"{start_h:02d}:00–{end_h:02d}:59 UTC window"
+                )
+                break
+
+    # ── 2. Stop-loss tightness ────────────────────────────────────────
+    sl_losses = [t for t in losing_trades
+                 if "stop" in t.get("reason", "").lower()]
+    if sl_losses:
+        tight = sum(
+            1 for t in sl_losses
+            if float(t.get("entry") or 0) > 0
+            and abs(float(t.get("exit") or 0) - float(t.get("entry") or 0))
+               / float(t.get("entry") or 1) * 100 < 0.3
+        )
+        tight_pct = tight / len(sl_losses)
+        if tight_pct >= 0.60:
+            patterns.append(
+                f"{tight}/{len(sl_losses)} stop-loss exits within 0.3% of entry "
+                f"({round(tight_pct*100)}%) — SL consistently too tight"
+            )
+            cur_rr = float(cfg.get("risk_reward", 2))
+            adjustments["risk_reward"] = round(cur_rr + 0.5, 1)
+            adjustments["_r_rr"] = (
+                f"Tight SL pattern → risk_reward {cur_rr} → "
+                f"{round(cur_rr + 0.5, 1)}"
+            )
+    else:
+        sl_losses = []  # ensure defined
+
+    # ── 3. High SL hit rate → raise min_confidence ───────────────────
+    sl_rate = len(sl_losses) / total
+    if sl_rate >= 0.70:
+        patterns.append(
+            f"{round(sl_rate*100)}% of losing trades hit stop loss — "
+            f"entries may lack sufficient conviction"
+        )
+        cur_conf = int(cfg.get("min_confidence", 70))
+        if "min_confidence" not in adjustments and cur_conf < 88:
+            adjustments["min_confidence"] = cur_conf + 5
+            adjustments["_r_conf"] = (
+                f"High SL hit rate → min_confidence {cur_conf} → {cur_conf + 5}"
+            )
+
+    # ── 4. Low average win rate → raise min_smc_score ────────────────
+    wrs = [float(r.get("win_rate") or 0) for r in backtest_runs]
+    if wrs:
+        avg_wr = sum(wrs) / len(wrs)
+        if avg_wr < 40:
+            patterns.append(
+                f"Average win rate is {avg_wr:.1f}% across {len(wrs)} runs "
+                f"— signal selectivity too low"
+            )
+            cur_smc = int(cfg.get("min_smc_score", 6))
+            if "min_smc_score" not in adjustments and cur_smc < 9:
+                adjustments["min_smc_score"] = cur_smc + 1
+                adjustments["_r_smc"] = (
+                    f"Low avg win rate → min_smc_score {cur_smc} → {cur_smc + 1}"
+                )
+
+    # ── 5. Directional bias ───────────────────────────────────────────
+    buy_l  = sum(1 for t in losing_trades if t.get("side") == "BUY")
+    sell_l = sum(1 for t in losing_trades if t.get("side") == "SELL")
+    if buy_l / total >= 0.75:
+        patterns.append(
+            f"{buy_l}/{total} losses were BUY trades — "
+            f"bearish macro bias may be consistently missed"
+        )
+    elif sell_l / total >= 0.75:
+        patterns.append(
+            f"{sell_l}/{total} losses were SELL trades — "
+            f"bullish macro bias may be consistently missed"
+        )
+
+    # ── 6. Majority of runs unprofitable → sideways market flag ──────
+    low_pf = [r for r in backtest_runs
+              if float(r.get("profit_factor") or 0) < 1.0]
+    if len(low_pf) / max(len(backtest_runs), 1) >= 0.60:
+        patterns.append(
+            f"{len(low_pf)}/{len(backtest_runs)} runs had profit_factor < 1.0 "
+            f"— likely trading in ranging / low-volatility conditions"
+        )
+        if not cfg.get("avoid_sideways_market"):
+            adjustments["avoid_sideways_market"] = True
+            adjustments["_r_sideways"] = (
+                "Majority of runs unprofitable → avoid_sideways_market enabled"
+            )
+
+    if not patterns:
+        patterns.append(
+            "No dominant failure pattern detected. "
+            "Run at least 5 backtests for reliable pattern recognition."
+        )
+
+    return {"patterns": patterns, "adjustments": adjustments}
+
+
+@app.route("/api/learn", methods=["POST", "OPTIONS"])
+@auth_required
+def learn_from_mistakes():
+    """
+    Section 1B — analyze losing trades and auto-adjust config.
+    Body params:
+      n_runs     : int  — how many recent backtest runs to analyze (default 5, max 20)
+      auto_apply : bool — whether to immediately apply suggested changes (default true)
+      symbol     : str  — optional filter to a specific symbol
+    """
+    data       = request.get_json(force=True) or {}
+    n_runs     = max(1, min(int(data.get("n_runs", 5)), 20))
+    auto_apply = bool(data.get("auto_apply", True))
+    symbol     = data.get("symbol")
+
+    # ── Pull recent backtest runs ──────────────────────────────────────
+    conn = get_conn(); cur = conn.cursor()
+    query  = """SELECT id, symbol, interval, strategy, win_rate, net_pnl,
+                       profit_factor, trades_json, summary_json, created_at
+                FROM backtest_runs
+                WHERE user_id = %s"""
+    params = [g.user_id]
+    if symbol:
+        query  += " AND symbol = %s"
+        params.append(symbol.upper())
+    query  += " ORDER BY created_at DESC LIMIT %s"
+    params.append(n_runs)
+
+    cur.execute(query, params)
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        return jsonify({
+            "ok":    False,
+            "error": "No backtest runs found. Run at least 1 backtest first.",
+        }), 400
+
+    backtest_runs = []
+    losing_trades = []
+
+    for row in rows:
+        run = {
+            "id":            row[0],
+            "symbol":        row[1],
+            "interval":      row[2],
+            "strategy":      row[3],
+            "win_rate":      row[4],
+            "net_pnl":       row[5],
+            "profit_factor": row[6],
+            "created_at":    str(row[9]),
+        }
+        backtest_runs.append(run)
+        try:
+            for t in json.loads(row[7] or "[]"):
+                if float(t.get("pnl", 0) or 0) < 0:
+                    t["_symbol"]   = row[1]
+                    t["_strategy"] = row[3]
+                    losing_trades.append(t)
+        except Exception:
+            pass
+
+    cfg        = get_user_config()
+    before_cfg = dict(cfg)
+
+    avg_wr_before = (
+        sum(float(r.get("win_rate") or 0) for r in backtest_runs)
+        / len(backtest_runs)
+    )
+
+    # ── Rule-based analysis ───────────────────────────────────────────
+    analysis  = _analyze_losing_trades(losing_trades, backtest_runs, cfg)
+    patterns  = analysis["patterns"]
+    all_adj   = analysis["adjustments"]
+
+    real_adj = {k: v for k, v in all_adj.items() if not k.startswith("_r_")}
+    reasons  = {k[3:]: v for k, v in all_adj.items() if k.startswith("_r_")}
+
+    # ── Apply adjustments ─────────────────────────────────────────────
+    after_cfg = dict(before_cfg)
+    applied   = False
+    if auto_apply and real_adj:
+        after_cfg.update(real_adj)
+        conn = get_conn(); cur = conn.cursor()
+        cur.execute(
+            "UPDATE users SET settings=%s WHERE id=%s",
+            (json.dumps(after_cfg), g.user_id),
+        )
+        conn.commit(); conn.close()
+        applied = True
+
+    # ── Persist learning log entry ────────────────────────────────────
+    log_id = str(uuid.uuid4())
+    try:
+        conn = get_conn(); cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO bot_learning_log
+              (id, user_id, symbol, interval, strategy,
+               analysis_json, adjustments_json,
+               before_config, after_config,
+               trades_analyzed, win_rate_before, win_rate_after)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, (
+            log_id,
+            g.user_id,
+            symbol or "ALL",
+            backtest_runs[0]["interval"] if backtest_runs else "mixed",
+            backtest_runs[0]["strategy"] if backtest_runs else "mixed",
+            json.dumps({"patterns": patterns, "reasons": reasons}),
+            json.dumps(real_adj),
+            json.dumps(before_cfg),
+            json.dumps(after_cfg),
+            len(losing_trades),
+            round(avg_wr_before, 2),
+            None,   # win_rate_after filled after the next backtest run
+        ))
+        conn.commit(); conn.close()
+    except Exception as e:
+        print(f"[learn] DB save error: {e}")
+
+    # ── Build before/after diff for the UI ───────────────────────────
+    diff = {
+        k: {"before": before_cfg.get(k), "after": after_cfg.get(k)}
+        for k in real_adj
+    }
+
+    return jsonify({
+        "ok":              True,
+        "log_id":          log_id,
+        "runs_analyzed":   len(backtest_runs),
+        "trades_analyzed": len(losing_trades),
+        "patterns":        patterns,
+        "adjustments":     real_adj,
+        "reasons":         reasons,
+        "diff":            diff,
+        "applied":         applied,
+        "win_rate_before": round(avg_wr_before, 2),
+    })
+
+
+@app.route("/api/learn/history", methods=["GET"])
+@auth_required
+def learn_history():
+    """Section 1C — return the last 20 learning log entries for this user."""
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("""
+        SELECT id, created_at, symbol, strategy,
+               analysis_json, adjustments_json,
+               before_config, after_config,
+               trades_analyzed, win_rate_before, win_rate_after
+        FROM bot_learning_log
+        WHERE user_id = %s
+        ORDER BY created_at DESC
+        LIMIT 20
+    """, (g.user_id,))
+    rows = cur.fetchall(); conn.close()
+
+    result = []
+    for r in rows:
+        try:
+            analysis = json.loads(r[4] or "{}")
+            adj      = json.loads(r[5] or "{}")
+            before   = json.loads(r[6] or "{}")
+            after    = json.loads(r[7] or "{}")
+            diff = {
+                k: {"before": before.get(k), "after": after.get(k)}
+                for k in adj
+            }
+        except Exception:
+            analysis = {}; adj = {}; diff = {}
+        result.append({
+            "id":              r[0],
+            "created_at":      str(r[1]),
+            "symbol":          r[2],
+            "strategy":        r[3],
+            "patterns":        analysis.get("patterns", []),
+            "reasons":         analysis.get("reasons", {}),
+            "adjustments":     adj,
+            "diff":            diff,
+            "trades_analyzed": r[8],
+            "win_rate_before": r[9],
+            "win_rate_after":  r[10],
+        })
+    return jsonify(result)
