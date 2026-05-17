@@ -1,661 +1,385 @@
 /**
- * Settings.jsx — v2
- * Full bot configuration UI: AI aggressiveness, confidence threshold,
- * session filters, ATR multiplier, risk management, trailing stop,
- * fallback strategy, market selection toggles.
+ * Settings.jsx — NexusBot v2
+ * Full bot configuration: AI aggressiveness, thresholds, session
+ * filters, ATR multiplier, risk, trailing stop, fallback strategy,
+ * market toggles, daily limits.
  */
-import React, { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback } from "react";
+import { Save, RefreshCw, AlertTriangle, CheckCircle, Settings as SettingsIcon } from "lucide-react";
 
-/* ══════════════════════════════════════════════════════
-   THEME
-══════════════════════════════════════════════════════ */
-const C = {
-  bg0: "#020917", bg1: "#071428", bg2: "#0c1d3a", bg3: "#11264a",
-  bdr: "#1a3356",
-  buy: "#00e5a0", sell: "#ff4266", hold: "#4a9eff", gold: "#f59e0b",
-  purple: "#a78bfa",
-  t0: "#ddeeff", t1: "#7aadda", t2: "#3d6a8a",
-  mono: "'JetBrains Mono','Cascadia Code',monospace",
-  ui:   "'Outfit','DM Sans',system-ui,sans-serif",
+// ── Design tokens ─────────────────────────────────────────────────────────────
+const T = {
+  bg:"#050914", bg2:"#08111f", bg3:"#0d1a2e", bg4:"#111f38",
+  border:"#162036", b2:"#1e3060",
+  text:"#c8d8f0", t2:"#6a8aaa", t3:"#2a4060",
+  green:"#00ffa3", red:"#ff2d55", gold:"#ffc107",
+  blue:"#4facfe", purple:"#9f7aea", cyan:"#22d3ee",
+};
+const MONO = "'JetBrains Mono','Cascadia Code','Courier New',monospace";
+const UI   = "'Rajdhani','Segoe UI',system-ui,sans-serif";
+
+const GS = `
+@import url('https://fonts.googleapis.com/css2?family=Rajdhani:wght@400;500;600;700&family=JetBrains+Mono:wght@300;400;500&display=swap');
+*{box-sizing:border-box}
+::-webkit-scrollbar{width:5px}
+::-webkit-scrollbar-track{background:#050914}
+::-webkit-scrollbar-thumb{background:#162036;border-radius:3px}
+@keyframes spin{to{transform:rotate(360deg)}}
+@keyframes slide{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:translateY(0)}}
+`;
+
+// ── CONFIG DEFAULTS (mirrors backend DEFAULT_CONFIG) ─────────────────────────
+const DEFAULTS = {
+  // AI / Signal quality
+  min_confidence:    65,
+  min_smc_score:     6,
+  adx_min:           20,
+  risk_reward:       2.0,
+  atr_multiplier:    1.5,
+  // Risk
+  risk_percentage:   1.0,
+  daily_trade_limit: 5,
+  // Features
+  enable_trailing_stop:    true,
+  enable_fallback_strategy:true,
+  enable_breakeven_stop:   true,
+  // Session filters
+  blocked_hours: [],
+  blocked_sessions: [],
+  // Markets
+  markets: ["crypto","forex","stocks","commodities"],
 };
 
-const api = (url, opts = {}) => {
-  const tok = localStorage.getItem("token") || "";
-  return fetch(url, {
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${tok}`, ...opts.headers },
-    ...opts,
-  });
-};
+const SESSIONS = ["Asia","London","New York"];
+const MARKETS  = ["crypto","forex","stocks","commodities"];
 
-/* ══════════════════════════════════════════════════════
-   ATOMS
-══════════════════════════════════════════════════════ */
-const SectionTitle = ({ icon, title, subtitle }) => (
-  <div style={{ marginBottom: 16 }}>
-    <div style={{ fontFamily: C.mono, fontSize: 12, fontWeight: 800, color: C.t0, letterSpacing: ".06em" }}>
-      {icon} {title}
-    </div>
-    {subtitle && (
-      <div style={{ fontFamily: C.ui, fontSize: 10, color: C.t2, marginTop: 2 }}>{subtitle}</div>
-    )}
-  </div>
-);
+// ── MAIN COMPONENT ────────────────────────────────────────────────────────────
+export default function Settings() {
+  const [cfg,     setCfg]     = useState(DEFAULTS);
+  const [loading, setLoading] = useState(true);
+  const [saving,  setSaving]  = useState(false);
+  const [saved,   setSaved]   = useState(false);
+  const [error,   setError]   = useState(null);
 
-const SettingRow = ({ label, hint, children }) => (
-  <div style={{
-    display: "flex", justifyContent: "space-between", alignItems: "center",
-    padding: "12px 0", borderBottom: `1px solid ${C.bdr}55`,
-    gap: 16,
-  }}>
-    <div style={{ flex: 1 }}>
-      <div style={{ fontFamily: C.mono, fontSize: 10, fontWeight: 600, color: C.t0 }}>{label}</div>
-      {hint && <div style={{ fontFamily: C.ui, fontSize: 9, color: C.t2, marginTop: 2 }}>{hint}</div>}
-    </div>
-    <div style={{ flexShrink: 0 }}>{children}</div>
-  </div>
-);
+  const token = localStorage.getItem("token");
+  const hdrs  = { "Content-Type":"application/json", Authorization:`Bearer ${token}` };
 
-const Toggle = ({ value, onChange, onColor, label }) => (
-  <button onClick={() => onChange(!value)} style={{
-    display: "flex", alignItems: "center", gap: 8,
-    fontFamily: C.mono, fontSize: 9, fontWeight: 700,
-    padding: "6px 12px", borderRadius: 20, cursor: "pointer",
-    background: value ? (onColor || C.buy) + "22" : C.bg3,
-    border: `1px solid ${value ? (onColor || C.buy) + "55" : C.bdr}`,
-    color: value ? (onColor || C.buy) : C.t2,
-    transition: "all .2s",
-    minWidth: 100,
-  }}>
-    <span style={{
-      width: 10, height: 10, borderRadius: "50%",
-      background: value ? (onColor || C.buy) : C.t2,
-      boxShadow: value ? `0 0 6px ${onColor || C.buy}` : "none",
-      transition: "all .2s",
-    }} />
-    {value ? (label?.[1] || "ON") : (label?.[0] || "OFF")}
-  </button>
-);
+  // ── Load config ─────────────────────────────────────────────────────────────
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const r = await fetch("/api/settings", {headers:hdrs});
+      const d = await r.json();
+      if(r.ok) setCfg(prev=>({...DEFAULTS,...prev,...(d.config||d)}));
+    } catch{}
+    finally{ setLoading(false); }
+  },[]);
 
-const Slider = ({ value, min, max, step, onChange, color, unit }) => {
-  const pct = ((value - min) / (max - min)) * 100;
-  return (
-    <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 200 }}>
-      <input type="range" min={min} max={max} step={step || 1} value={value}
-        onChange={e => onChange(parseFloat(e.target.value))}
-        style={{ flex: 1, accentColor: color || C.buy, cursor: "pointer" }}
-      />
-      <span style={{
-        fontFamily: C.mono, fontSize: 11, fontWeight: 700,
-        color: color || C.buy, minWidth: 48, textAlign: "right",
-      }}>
-        {value}{unit || ""}
-      </span>
-    </div>
-  );
-};
+  useEffect(()=>{ load(); },[load]);
 
-const NumInput = ({ value, onChange, min, max, step, unit }) => (
-  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-    <input type="number" value={value} min={min} max={max} step={step || 1}
-      onChange={e => onChange(parseFloat(e.target.value) || 0)}
-      style={{
-        fontFamily: C.mono, fontSize: 11, fontWeight: 700,
-        width: 80, padding: "5px 8px", borderRadius: 6,
-        background: C.bg3, border: `1px solid ${C.bdr}`, color: C.t0,
-        textAlign: "right",
-      }}
-    />
-    {unit && <span style={{ fontFamily: C.mono, fontSize: 9, color: C.t2 }}>{unit}</span>}
-  </div>
-);
-
-const Card = ({ children, accent }) => (
-  <div style={{
-    background: C.bg1,
-    border: `1px solid ${accent ? accent + "44" : C.bdr}`,
-    borderRadius: 10,
-    padding: "16px 20px",
-    marginBottom: 14,
-    borderLeft: accent ? `3px solid ${accent}` : undefined,
-  }}>
-    {children}
-  </div>
-);
-
-/* ══════════════════════════════════════════════════════
-   SESSION FILTER
-══════════════════════════════════════════════════════ */
-const SessionFilter = ({ blocked, onChange }) => {
-  const sessions = [
-    { key: "Asia",     hours: "20:00–04:00 UTC", color: "#818cf8" },
-    { key: "London",   hours: "07:00–12:00 UTC", color: C.gold },
-    { key: "New York", hours: "12:00–21:00 UTC", color: C.buy },
-  ];
-  const toggle = s => {
-    const next = blocked.includes(s)
-      ? blocked.filter(x => x !== s)
-      : [...blocked, s];
-    onChange(next);
+  // ── Save config ─────────────────────────────────────────────────────────────
+  const save = async () => {
+    setSaving(true); setError(null); setSaved(false);
+    try {
+      const r = await fetch("/api/settings", {
+        method:"POST", headers:hdrs,
+        body:JSON.stringify(cfg),
+      });
+      const d = await r.json();
+      if(!r.ok) throw new Error(d.error||"Save failed");
+      setSaved(true);
+      setTimeout(()=>setSaved(false),3000);
+    } catch(e){ setError(e.message); }
+    finally{ setSaving(false); }
   };
-  return (
-    <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-      {sessions.map(s => {
-        const active = !blocked.includes(s.key);
-        return (
-          <button key={s.key} onClick={() => toggle(s.key)} style={{
-            display: "flex", flexDirection: "column",
-            padding: "10px 14px", borderRadius: 8, cursor: "pointer",
-            background: active ? s.color + "18" : C.bg3,
-            border: `1px solid ${active ? s.color + "55" : C.bdr}`,
-            color: active ? s.color : C.t2,
-            transition: "all .15s",
-          }}>
-            <span style={{ fontFamily: C.mono, fontSize: 10, fontWeight: 700 }}>
-              {active ? "✓" : "✗"} {s.key}
-            </span>
-            <span style={{ fontFamily: C.mono, fontSize: 8, color: C.t2, marginTop: 2 }}>
-              {s.hours}
-            </span>
-          </button>
-        );
-      })}
+
+  const set = (key,val) => setCfg(prev=>({...prev,[key]:val}));
+
+  const toggleBlockedSession = (s) => {
+    const cur = cfg.blocked_sessions||[];
+    setCfg(prev=>({...prev,
+      blocked_sessions: cur.includes(s)?cur.filter(x=>x!==s):[...cur,s]
+    }));
+  };
+
+  const toggleMarket = (m) => {
+    const cur = cfg.markets||[];
+    setCfg(prev=>({...prev,
+      markets: cur.includes(m)?cur.filter(x=>x!==m):[...cur,m]
+    }));
+  };
+
+  // ── AI Aggressiveness helper ─────────────────────────────────────────────────
+  const aggressiveness = () => {
+    const conf = cfg.min_confidence||65;
+    const smc  = cfg.min_smc_score||6;
+    if(conf<=60&&smc<=4) return{label:"VERY AGGRESSIVE",color:T.red};
+    if(conf<=70&&smc<=5) return{label:"AGGRESSIVE",color:"#ff8c42"};
+    if(conf<=78&&smc<=7) return{label:"BALANCED",color:T.gold};
+    return{label:"CONSERVATIVE",color:T.green};
+  };
+  const agg = aggressiveness();
+
+  if(loading) return(
+    <div style={{background:T.bg,minHeight:"100vh",display:"flex",alignItems:"center",
+      justifyContent:"center",gap:14,color:T.t2}}>
+      <div style={{width:30,height:30,border:`2px solid ${T.border}`,borderTop:`2px solid ${T.blue}`,
+        borderRadius:"50%",animation:"spin 1s linear infinite"}}/>
+      <span style={{fontFamily:MONO,fontSize:12,letterSpacing:2}}>LOADING CONFIG…</span>
     </div>
   );
-};
 
-/* ══════════════════════════════════════════════════════
-   MARKET SELECTOR
-══════════════════════════════════════════════════════ */
-const MARKET_SYMBOLS = {
-  crypto:       ["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT","ADAUSDT","DOTUSDT","AVAXUSDT"],
-  forex:        ["EURUSD","GBPUSD","USDJPY","AUDUSD","USDCAD","USDCHF","NZDUSD","GBPJPY"],
-  stocks:       ["AAPL","TSLA","NVDA","MSFT","AMZN","META","GOOGL","SPY"],
-  commodities:  ["XAUUSD","XAGUSD","USOIL","UKOIL","NATGAS"],
-};
-const MARKET_COLORS = {
-  crypto: C.gold, forex: C.hold, stocks: C.buy, commodities: "#f97316",
-};
+  return (
+    <div style={{background:T.bg,minHeight:"100vh",fontFamily:UI,color:T.text}}>
+      <style>{GS}</style>
 
-const MarketSelector = ({ enabled, selected, onToggleMarket, onToggleSymbol }) => (
-  <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-    {Object.entries(MARKET_SYMBOLS).map(([mkt, syms]) => {
-      const mktOn = enabled[mkt] !== false;
-      const col   = MARKET_COLORS[mkt];
-      return (
-        <div key={mkt} style={{
-          background: C.bg2, borderRadius: 8, padding: 12,
-          border: `1px solid ${mktOn ? col + "44" : C.bdr}`,
-          opacity: mktOn ? 1 : 0.5, transition: "all .15s",
-        }}>
-          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: mktOn ? 8 : 0 }}>
-            <span style={{ fontFamily: C.mono, fontSize: 10, fontWeight: 700, color: mktOn ? col : C.t2 }}>
-              {mkt.toUpperCase()}
-            </span>
-            <Toggle value={mktOn} onChange={v => onToggleMarket(mkt, v)} onColor={col}
-              label={["DISABLED","ENABLED"]} />
-          </div>
-          {mktOn && (
-            <div style={{ display: "flex", gap: 5, flexWrap: "wrap" }}>
-              {syms.map(sym => {
-                const on = (selected[mkt] || syms).includes(sym);
-                return (
-                  <button key={sym} onClick={() => onToggleSymbol(mkt, sym)} style={{
-                    fontFamily: C.mono, fontSize: 8, fontWeight: 600,
-                    padding: "2px 8px", borderRadius: 4, cursor: "pointer",
-                    background: on ? col + "20" : C.bg3,
-                    border: `1px solid ${on ? col + "55" : C.bdr}`,
-                    color: on ? col : C.t2,
-                    transition: "all .12s",
-                  }}>
-                    {on ? "✓" : "+"} {sym}
+      {/* Header */}
+      <div style={{background:T.bg2,borderBottom:`1px solid ${T.border}`,padding:"12px 20px",
+        display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+        <div style={{display:"flex",alignItems:"center",gap:12}}>
+          <SettingsIcon size={16} style={{color:T.purple}}/>
+          <span style={{fontFamily:MONO,fontSize:14,letterSpacing:3,color:T.text}}>BOT SETTINGS</span>
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:10}}>
+          {saved&&(
+            <div style={{display:"flex",alignItems:"center",gap:6,
+              fontFamily:MONO,fontSize:11,color:T.green,animation:"slide .2s ease"}}>
+              <CheckCircle size={13}/>SAVED
+            </div>
+          )}
+          {error&&(
+            <div style={{fontFamily:MONO,fontSize:11,color:T.red}}>⚠ {error}</div>
+          )}
+          <button onClick={load}
+            style={{background:T.bg3,border:`1px solid ${T.border}`,color:T.t2,
+              borderRadius:3,padding:"5px 12px",cursor:"pointer",fontFamily:MONO,fontSize:10,
+              letterSpacing:1,display:"flex",alignItems:"center",gap:5}}>
+            <RefreshCw size={11}/>RELOAD
+          </button>
+          <button onClick={save} disabled={saving}
+            style={{background:`${T.blue}20`,border:`1px solid ${T.blue}50`,color:T.blue,
+              borderRadius:4,padding:"7px 18px",cursor:"pointer",fontFamily:MONO,fontSize:11,
+              letterSpacing:1,display:"flex",alignItems:"center",gap:6,opacity:saving?0.7:1}}>
+            <Save size={13}/>{saving?"SAVING…":"SAVE ALL"}
+          </button>
+        </div>
+      </div>
+
+      {/* Aggressiveness indicator */}
+      <div style={{background:T.bg3,borderBottom:`1px solid ${T.border}`,padding:"10px 20px",
+        display:"flex",alignItems:"center",gap:14}}>
+        <span style={{fontFamily:MONO,fontSize:9,color:T.t2,letterSpacing:2}}>BOT AGGRESSIVENESS</span>
+        <div style={{flex:1,maxWidth:300,height:3,background:T.bg2,borderRadius:2}}>
+          <div style={{
+            height:"100%",
+            width:`${Math.max(10,Math.min(100,100-((cfg.min_confidence||65)-50)*2))}%`,
+            background:agg.color,borderRadius:2,transition:"width .4s,background .4s"
+          }}/>
+        </div>
+        <span style={{fontFamily:MONO,fontSize:11,color:agg.color,fontWeight:700,letterSpacing:1}}>
+          {agg.label}
+        </span>
+        <span style={{fontFamily:MONO,fontSize:10,color:T.t2,marginLeft:8}}>
+          Conf ≥{cfg.min_confidence}% · SMC ≥{cfg.min_smc_score}/9 · ADX ≥{cfg.adx_min}
+        </span>
+      </div>
+
+      <div style={{padding:"20px",display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(360px,1fr))",gap:16}}>
+
+        {/* ── Signal Quality ── */}
+        <Section title="AI SIGNAL QUALITY" color={T.blue} icon="🎯">
+          <Slider label="Minimum Confidence %" min={40} max={95} step={1}
+            val={cfg.min_confidence} onChange={v=>set("min_confidence",v)}
+            help="Signals below this confidence are shown as HOLD. Higher = fewer but better trades."
+            color={cfg.min_confidence>=80?T.green:cfg.min_confidence>=65?T.gold:T.red}/>
+          <Slider label="Minimum SMC Score" min={2} max={9} step={1}
+            val={cfg.min_smc_score} onChange={v=>set("min_smc_score",v)}
+            help="Number of SMC checks that must pass (out of 9). Higher = stricter setup requirements."
+            color={T.purple}/>
+          <Slider label="ADX Minimum" min={15} max={40} step={1}
+            val={cfg.adx_min} onChange={v=>set("adx_min",v)}
+            help="Minimum ADX value required. Below this, the market is too choppy to trade."
+            color={cfg.adx_min>=25?T.green:T.gold}/>
+          <Slider label="Risk : Reward Ratio" min={1} max={5} step={0.5}
+            val={cfg.risk_reward} onChange={v=>set("risk_reward",v)}
+            help="Minimum R:R before a trade is taken. 2.0 means the target is 2× the stop distance."
+            color={T.cyan} fmt={v=>v+"R"}/>
+          <Slider label="ATR Multiplier (stop distance)" min={0.5} max={4} step={0.25}
+            val={cfg.atr_multiplier} onChange={v=>set("atr_multiplier",v)}
+            help="Stop loss distance = ATR × this multiplier. Higher = wider stops, fewer stopped-out early."
+            color={T.gold} fmt={v=>`${v}×`}/>
+        </Section>
+
+        {/* ── Risk Management ── */}
+        <Section title="RISK MANAGEMENT" color={T.red} icon="🛡️">
+          <Slider label="Risk Per Trade (%)" min={0.25} max={5} step={0.25}
+            val={cfg.risk_percentage} onChange={v=>set("risk_percentage",v)}
+            help="What % of your account to risk on each trade. 1% is professional standard."
+            color={cfg.risk_percentage<=1?T.green:cfg.risk_percentage<=2?T.gold:T.red} fmt={v=>v+"%"}/>
+          <Slider label="Max Trades Per Day" min={1} max={20} step={1}
+            val={cfg.daily_trade_limit} onChange={v=>set("daily_trade_limit",v)}
+            help="Bot won't enter new trades once this count is reached for the day."
+            color={T.text}/>
+          <Toggle label="Enable Trailing Stop"
+            val={cfg.enable_trailing_stop} onChange={v=>set("enable_trailing_stop",v)}
+            help="Once price moves 1R in profit, the stop loss trails to lock in gains."/>
+          <Toggle label="Enable Breakeven Stop"
+            val={cfg.enable_breakeven_stop} onChange={v=>set("enable_breakeven_stop",v)}
+            help="Move stop to entry price once trade is 0.5R in profit."/>
+          <Toggle label="Enable Fallback Strategy (EMA+ADX)"
+            val={cfg.enable_fallback_strategy} onChange={v=>set("enable_fallback_strategy",v)}
+            help="When SMC conditions don't align, fall back to the simpler EMA+ADX trend strategy."/>
+        </Section>
+
+        {/* ── Session Filters ── */}
+        <Section title="SESSION FILTERS" color={T.gold} icon="🕐">
+          <div style={{marginBottom:14}}>
+            <div style={{fontFamily:MONO,fontSize:9,color:T.t2,letterSpacing:1,marginBottom:8}}>
+              BLOCKED SESSIONS (no trades taken)
+            </div>
+            <div style={{display:"flex",gap:8}}>
+              {SESSIONS.map(s=>{
+                const blocked=(cfg.blocked_sessions||[]).includes(s);
+                return(
+                  <button key={s} onClick={()=>toggleBlockedSession(s)}
+                    style={{padding:"7px 16px",borderRadius:4,cursor:"pointer",
+                      border:`1px solid ${blocked?T.red+"60":T.border}`,
+                      background:blocked?`${T.red}18`:T.bg2,
+                      color:blocked?T.red:T.t2,fontFamily:MONO,fontSize:10,letterSpacing:1}}>
+                    {blocked?"✗":"✓"} {s}
                   </button>
                 );
               })}
             </div>
-          )}
-        </div>
-      );
-    })}
-  </div>
-);
-
-/* ══════════════════════════════════════════════════════
-   AGGRESSIVENESS PRESET
-══════════════════════════════════════════════════════ */
-const PRESETS = [
-  {
-    key: "conservative",
-    label: "Conservative",
-    desc: "High confidence bar · Fewer but cleaner trades",
-    icon: "🛡",
-    color: C.buy,
-    values: { min_confidence: 80, min_smc_score: 8, risk_percent: 0.5, max_trades_per_day: 2 },
-  },
-  {
-    key: "balanced",
-    label: "Balanced",
-    desc: "Default settings · Good R:R with reasonable frequency",
-    icon: "⚖",
-    color: C.hold,
-    values: { min_confidence: 70, min_smc_score: 6, risk_percent: 1.0, max_trades_per_day: 4 },
-  },
-  {
-    key: "aggressive",
-    label: "Aggressive",
-    desc: "Lower bar · More signals · Higher risk",
-    icon: "🔥",
-    color: C.sell,
-    values: { min_confidence: 55, min_smc_score: 4, risk_percent: 2.0, max_trades_per_day: 8 },
-  },
-];
-
-const AggressivenessPreset = ({ current, onApply }) => (
-  <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-    {PRESETS.map(p => {
-      const isCurrent = current === p.key;
-      return (
-        <button key={p.key} onClick={() => onApply(p)} style={{
-          flex: 1, minWidth: 150, padding: "12px 14px", borderRadius: 8, cursor: "pointer",
-          background: isCurrent ? p.color + "18" : C.bg2,
-          border: `2px solid ${isCurrent ? p.color : C.bdr}`,
-          textAlign: "left", transition: "all .15s",
-        }}>
-          <div style={{ fontFamily: C.mono, fontSize: 12, fontWeight: 800,
-            color: isCurrent ? p.color : C.t0, marginBottom: 4 }}>
-            {p.icon} {p.label}
-          </div>
-          <div style={{ fontFamily: C.ui, fontSize: 10, color: C.t2, marginBottom: 6 }}>{p.desc}</div>
-          {Object.entries(p.values).map(([k, v]) => (
-            <div key={k} style={{ fontFamily: C.mono, fontSize: 8, color: isCurrent ? p.color : C.t2 }}>
-              {k.replace(/_/g, " ")}: {v}
+            <div style={{fontFamily:MONO,fontSize:9,color:T.t2,marginTop:7,lineHeight:1.5}}>
+              Asia: 00:00–07:00 UTC · London: 07:00–12:00 UTC · New York: 12:00–21:00 UTC
             </div>
-          ))}
-        </button>
-      );
-    })}
-  </div>
-);
-
-/* ══════════════════════════════════════════════════════
-   SAVE BUTTON + STATUS
-══════════════════════════════════════════════════════ */
-const SaveBar = ({ dirty, saving, onSave, onReset }) => (
-  <div style={{
-    position: "sticky", bottom: 0, zIndex: 100,
-    background: C.bg1, borderTop: `1px solid ${C.bdr}`,
-    padding: "12px 20px",
-    display: "flex", justifyContent: "space-between", alignItems: "center",
-  }}>
-    <span style={{ fontFamily: C.mono, fontSize: 9, color: dirty ? C.gold : C.t2 }}>
-      {dirty ? "⚠ Unsaved changes" : "✓ All settings saved"}
-    </span>
-    <div style={{ display: "flex", gap: 8 }}>
-      <button onClick={onReset} disabled={!dirty} style={{
-        fontFamily: C.mono, fontSize: 9, padding: "7px 16px", borderRadius: 6, cursor: dirty ? "pointer" : "default",
-        background: "transparent", border: `1px solid ${C.bdr}`, color: dirty ? C.t1 : C.t2,
-        opacity: dirty ? 1 : 0.4,
-      }}>
-        ↩ Reset
-      </button>
-      <button onClick={onSave} disabled={saving || !dirty} style={{
-        fontFamily: C.mono, fontSize: 10, fontWeight: 700,
-        padding: "7px 20px", borderRadius: 6, cursor: saving ? "wait" : dirty ? "pointer" : "default",
-        background: saving ? C.bg3 : dirty ? C.buy + "22" : C.bg3,
-        border: `1px solid ${saving ? C.bdr : dirty ? C.buy + "55" : C.bdr}`,
-        color: saving ? C.t2 : dirty ? C.buy : C.t2,
-        transition: "all .15s",
-        opacity: !dirty ? 0.5 : 1,
-      }}>
-        {saving ? "Saving…" : "💾 Save Settings"}
-      </button>
-    </div>
-  </div>
-);
-
-/* ══════════════════════════════════════════════════════
-   MAIN SETTINGS
-══════════════════════════════════════════════════════ */
-const DEFAULT_LOCAL = {
-  enabled_markets: { crypto: true, forex: true, stocks: true, commodities: false },
-  selected_symbols: Object.fromEntries(
-    Object.entries(MARKET_SYMBOLS).map(([k, v]) => [k, v])
-  ),
-};
-
-export default function Settings() {
-  const [cfg,      setCfg]     = useState(null);
-  const [original, setOriginal] = useState(null);
-  const [local,    setLocal]   = useState(DEFAULT_LOCAL);
-  const [saving,   setSaving]  = useState(false);
-  const [preset,   setPreset]  = useState("balanced");
-  const [toast,    setToast]   = useState(null);
-
-  const load = useCallback(async () => {
-    try {
-      const r = await api("/api/settings");
-      const d = await r.json();
-      const settings = d.settings || d;
-      setCfg(settings);
-      setOriginal(JSON.parse(JSON.stringify(settings)));
-    } catch (e) {
-      // Provide sensible defaults if API not yet available
-      const defaults = {
-        min_confidence: 70,
-        min_smc_score: 6,
-        risk_percent: 1.0,
-        risk_reward: 2.0,
-        max_trades_per_day: 4,
-        max_daily_loss_percent: 5,
-        max_consecutive_losses: 3,
-        blocked_sessions: [],
-        atr_multiplier: 1.5,
-        enable_trailing_stop: true,
-        enable_fallback_strategy: true,
-        avoid_quiet_market: true,
-        avoid_sideways_market: true,
-        trading_mode: "local_paper",
-        starting_balance: 10000,
-      };
-      setCfg(defaults);
-      setOriginal(JSON.parse(JSON.stringify(defaults)));
-    }
-  }, []);
-
-  useEffect(() => { load(); }, [load]);
-
-  const upd = (key, value) => setCfg(c => ({ ...c, [key]: value }));
-
-  const dirty = cfg && original
-    ? JSON.stringify(cfg) !== JSON.stringify(original)
-    : false;
-
-  const save = async () => {
-    setSaving(true);
-    try {
-      const r = await api("/api/settings", {
-        method: "POST",
-        body: JSON.stringify(cfg),
-      });
-      const d = await r.json();
-      if (d.ok) {
-        setOriginal(JSON.parse(JSON.stringify(cfg)));
-        showToast("✓ Settings saved successfully", C.buy);
-      } else {
-        showToast(`⚠ ${d.error || "Save failed"}`, C.sell);
-      }
-    } catch {
-      showToast("⚠ Network error — settings may not have saved", C.sell);
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const reset = () => { setCfg(JSON.parse(JSON.stringify(original))); };
-
-  const showToast = (msg, color) => {
-    setToast({ msg, color });
-    setTimeout(() => setToast(null), 3500);
-  };
-
-  const applyPreset = p => {
-    setCfg(c => ({ ...c, ...p.values }));
-    setPreset(p.key);
-    showToast(`Applied ${p.label} preset`, p.color);
-  };
-
-  const toggleMarket = (mkt, on) => {
-    setLocal(l => ({ ...l, enabled_markets: { ...l.enabled_markets, [mkt]: on } }));
-  };
-
-  const toggleSymbol = (mkt, sym) => {
-    setLocal(l => {
-      const cur  = l.selected_symbols[mkt] || MARKET_SYMBOLS[mkt];
-      const next = cur.includes(sym) ? cur.filter(s => s !== sym) : [...cur, sym];
-      return { ...l, selected_symbols: { ...l.selected_symbols, [mkt]: next } };
-    });
-  };
-
-  if (!cfg) return (
-    <div style={{ background: C.bg0, minHeight: "100vh",
-      display: "flex", alignItems: "center", justifyContent: "center",
-      fontFamily: C.mono, color: C.t2 }}>
-      Loading settings…
-    </div>
-  );
-
-  const confColor = cfg.min_confidence >= 80 ? C.buy
-    : cfg.min_confidence >= 65 ? C.gold : C.sell;
-
-  return (
-    <div style={{ background: C.bg0, minHeight: "100vh", fontFamily: C.ui }}>
-      {/* Header */}
-      <div style={{ background: C.bg1, borderBottom: `1px solid ${C.bdr}`,
-        padding: "10px 20px",
-        display: "flex", justifyContent: "space-between", alignItems: "center",
-        position: "sticky", top: 0, zIndex: 200, backdropFilter: "blur(8px)",
-      }}>
-        <div style={{ fontFamily: C.mono, fontSize: 14, fontWeight: 800, color: C.t0 }}>
-          <span style={{ color: C.purple }}>▸</span> BOT SETTINGS
-        </div>
-        <span style={{ fontFamily: C.mono, fontSize: 9, padding: "3px 10px", borderRadius: 4,
-          background: cfg.trading_mode === "live" ? C.sell + "22" : C.buy + "18",
-          color: cfg.trading_mode === "live" ? C.sell : C.buy,
-          border: `1px solid ${cfg.trading_mode === "live" ? C.sell + "55" : C.buy + "33"}` }}>
-          {cfg.trading_mode?.replace("_", " ").toUpperCase() || "PAPER"}
-        </span>
-      </div>
-
-      {/* Toast */}
-      {toast && (
-        <div style={{
-          position: "fixed", top: 60, right: 20, zIndex: 500,
-          fontFamily: C.mono, fontSize: 10, padding: "10px 16px", borderRadius: 7,
-          background: toast.color + "22", border: `1px solid ${toast.color}55`,
-          color: toast.color, boxShadow: `0 4px 20px ${toast.color}22`,
-        }}>
-          {toast.msg}
-        </div>
-      )}
-
-      <div style={{ padding: 20, maxWidth: 900, paddingBottom: 80 }}>
-
-        {/* ── AI Aggressiveness ── */}
-        <Card accent={C.purple}>
-          <SectionTitle icon="🤖" title="AI AGGRESSIVENESS"
-            subtitle="Preset modes control how often the bot triggers signals. Conservative = fewer, higher-quality trades." />
-          <AggressivenessPreset current={preset} onApply={applyPreset} />
-        </Card>
-
-        {/* ── Signal Quality ── */}
-        <Card accent={confColor}>
-          <SectionTitle icon="🎯" title="SIGNAL QUALITY THRESHOLDS"
-            subtitle="The bot will only emit a signal when both confidence and SMC score meet the minimums." />
-
-          <SettingRow
-            label="Minimum Confidence %"
-            hint={`Current: ${cfg.min_confidence}% — signals below this are suppressed`}
-          >
-            <Slider value={cfg.min_confidence} min={30} max={95} step={1}
-              onChange={v => upd("min_confidence", v)} color={confColor} unit="%" />
-          </SettingRow>
-
-          <SettingRow
-            label="Minimum SMC Score"
-            hint={`Current: ${cfg.min_smc_score}/9 — how many SMC checks must align for a full ICT setup`}
-          >
-            <Slider value={cfg.min_smc_score} min={1} max={9} step={1}
-              onChange={v => upd("min_smc_score", v)} color={C.hold} unit="/9" />
-          </SettingRow>
-
-          <SettingRow
-            label="Fallback Strategy (EMA+ADX)"
-            hint="When SMC score is below minimum, use EMA+ADX trend-follow instead of blocking the signal"
-          >
-            <Toggle value={cfg.enable_fallback_strategy}
-              onChange={v => upd("enable_fallback_strategy", v)}
-              label={["DISABLED","ENABLED"]} />
-          </SettingRow>
-
-          <SettingRow
-            label="Block Sideways Market"
-            hint="Suppresses signals when ADX is below 20 and price is ranging"
-          >
-            <Toggle value={cfg.avoid_sideways_market}
-              onChange={v => upd("avoid_sideways_market", v)} />
-          </SettingRow>
-
-          <SettingRow
-            label="Block Quiet Market"
-            hint="Suppresses signals during low-volume / pre-market conditions"
-          >
-            <Toggle value={cfg.avoid_quiet_market}
-              onChange={v => upd("avoid_quiet_market", v)} />
-          </SettingRow>
-        </Card>
-
-        {/* ── Risk Management ── */}
-        <Card accent={C.gold}>
-          <SectionTitle icon="⚠️" title="RISK MANAGEMENT"
-            subtitle="Controls how much capital is risked per trade and maximum daily exposure." />
-
-          <SettingRow label="Risk per Trade %" hint="Percentage of account balance risked on each trade">
-            <Slider value={cfg.risk_percent} min={0.1} max={5} step={0.1}
-              onChange={v => upd("risk_percent", v)} color={C.gold} unit="%" />
-          </SettingRow>
-
-          <SettingRow label="Risk : Reward Ratio" hint="Minimum R:R — take profit will be placed at this multiple of the stop distance">
-            <Slider value={cfg.risk_reward} min={1} max={5} step={0.5}
-              onChange={v => upd("risk_reward", v)} color={C.buy} unit=":1" />
-          </SettingRow>
-
-          <SettingRow label="ATR Stop Multiplier"
-            hint="Stop loss = entry ± (ATR × multiplier). Higher = wider stops, fewer whipsaws">
-            <Slider value={cfg.atr_multiplier} min={0.5} max={4} step={0.25}
-              onChange={v => upd("atr_multiplier", v)} color={C.hold} unit="×" />
-          </SettingRow>
-
-          <SettingRow label="Trailing Stop" hint="Moves the stop loss with price to lock in profits as the trade runs">
-            <Toggle value={cfg.enable_trailing_stop}
-              onChange={v => upd("enable_trailing_stop", v)}
-              label={["DISABLED","ENABLED"]} />
-          </SettingRow>
-
-          <SettingRow label="Max Trades Per Day" hint="Bot will not open new positions after this limit is hit">
-            <NumInput value={cfg.max_trades_per_day} min={1} max={20}
-              onChange={v => upd("max_trades_per_day", v)} unit="trades/day" />
-          </SettingRow>
-
-          <SettingRow label="Max Daily Loss %" hint="Bot pauses for the day after losing this % of starting balance">
-            <Slider value={cfg.max_daily_loss_percent} min={1} max={20} step={0.5}
-              onChange={v => upd("max_daily_loss_percent", v)} color={C.sell} unit="%" />
-          </SettingRow>
-
-          <SettingRow label="Max Consecutive Losses" hint="Bot pauses after this many losses in a row to avoid revenge trading">
-            <NumInput value={cfg.max_consecutive_losses} min={1} max={10}
-              onChange={v => upd("max_consecutive_losses", v)} unit="losses" />
-          </SettingRow>
-
-          <SettingRow label="Starting / Paper Balance" hint="Virtual balance used for paper trading and backtests">
-            <NumInput value={cfg.starting_balance} min={100} max={10000000} step={100}
-              onChange={v => upd("starting_balance", v)} unit="USD" />
-          </SettingRow>
-        </Card>
-
-        {/* ── Session Filters ── */}
-        <Card accent={C.gold}>
-          <SectionTitle icon="🕐" title="SESSION FILTERS"
-            subtitle="Only sessions that are enabled (✓) will trigger new entries. Blocked sessions are skipped." />
-          <SettingRow
-            label="Active Trading Sessions"
-            hint="Click a session to toggle it on or off"
-          >
-            <div />
-          </SettingRow>
-          <SessionFilter
-            blocked={cfg.blocked_sessions || []}
-            onChange={v => upd("blocked_sessions", v)}
-          />
-          <div style={{ fontFamily: C.mono, fontSize: 9, color: C.t2, marginTop: 10 }}>
-            Blocked: {(cfg.blocked_sessions || []).length === 0
-              ? "None — all sessions active"
-              : (cfg.blocked_sessions || []).join(", ")}
           </div>
-        </Card>
 
-        {/* ── Market Selection ── */}
-        <Card>
-          <SectionTitle icon="🌍" title="MARKET & SYMBOL SELECTION"
-            subtitle="Enable or disable entire market categories, or pick specific symbols." />
-          <div style={{ fontFamily: C.ui, fontSize: 10, color: C.t2, marginBottom: 12 }}>
-            Note: Symbol selection is stored locally and used to filter the dashboard. The backend scans all symbols by default.
+          <div>
+            <div style={{fontFamily:MONO,fontSize:9,color:T.t2,letterSpacing:1,marginBottom:8}}>
+              BLOCKED HOURS (UTC, comma separated e.g. "0,1,2,22,23")
+            </div>
+            <input
+              value={(cfg.blocked_hours||[]).join(",")}
+              onChange={e=>{
+                const vals = e.target.value.split(",").map(v=>parseInt(v.trim())).filter(v=>!isNaN(v)&&v>=0&&v<24);
+                set("blocked_hours",vals);
+              }}
+              placeholder="e.g. 0,1,2,22,23"
+              style={{...inpStyle,width:"100%"}}/>
+            <div style={{fontFamily:MONO,fontSize:9,color:T.t2,marginTop:5}}>
+              Currently blocked: {(cfg.blocked_hours||[]).length===0?"None":(cfg.blocked_hours||[]).map(h=>h+":00").join(", ")}
+            </div>
           </div>
-          <MarketSelector
-            enabled={local.enabled_markets}
-            selected={local.selected_symbols}
-            onToggleMarket={toggleMarket}
-            onToggleSymbol={toggleSymbol}
-          />
-        </Card>
+        </Section>
 
-        {/* ── Trading Mode ── */}
-        <Card accent={cfg.trading_mode === "live" ? C.sell : C.buy}>
-          <SectionTitle icon="⚡" title="TRADING MODE"
-            subtitle="Controls whether the bot executes real orders or runs in paper mode." />
-
-          <SettingRow label="Trading Mode"
-            hint={cfg.trading_mode === "live"
-              ? "⚠ LIVE MODE — real orders will be placed on your exchange"
-              : "Paper mode — no real orders, safe for testing"}>
-            <div style={{ display: "flex", gap: 6 }}>
-              {["local_paper", "live"].map(m => (
-                <button key={m} onClick={() => upd("trading_mode", m)} style={{
-                  fontFamily: C.mono, fontSize: 9, fontWeight: 700,
-                  padding: "6px 14px", borderRadius: 6, cursor: "pointer",
-                  background: cfg.trading_mode === m
-                    ? (m === "live" ? C.sell + "22" : C.buy + "22")
-                    : C.bg3,
-                  border: `1px solid ${cfg.trading_mode === m
-                    ? (m === "live" ? C.sell + "55" : C.buy + "55")
-                    : C.bdr}`,
-                  color: cfg.trading_mode === m
-                    ? (m === "live" ? C.sell : C.buy)
-                    : C.t2,
-                }}>
-                  {m === "live" ? "🔴 LIVE" : "🟢 PAPER"}
+        {/* ── Active Markets ── */}
+        <Section title="ACTIVE MARKETS" color={T.green} icon="📊">
+          <div style={{fontFamily:MONO,fontSize:9,color:T.t2,letterSpacing:1,marginBottom:10}}>
+            SELECT WHICH MARKETS TO SCAN FOR SIGNALS
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+            {MARKETS.map(m=>{
+              const active=(cfg.markets||[]).includes(m);
+              const mc={crypto:T.gold,forex:T.blue,stocks:T.green,commodities:T.purple}[m]||T.t2;
+              return(
+                <button key={m} onClick={()=>toggleMarket(m)}
+                  style={{padding:"10px 14px",borderRadius:4,cursor:"pointer",
+                    border:`1px solid ${active?mc+"60":T.border}`,
+                    background:active?`${mc}15`:T.bg2,
+                    color:active?mc:T.t2,fontFamily:MONO,fontSize:11,
+                    textTransform:"uppercase",letterSpacing:1,
+                    display:"flex",alignItems:"center",gap:8,textAlign:"left"}}>
+                  <div style={{width:8,height:8,borderRadius:"50%",
+                    background:active?mc:T.t3,
+                    boxShadow:active?`0 0 6px ${mc}`:"none"}}/>
+                  {m.charAt(0).toUpperCase()+m.slice(1)}
                 </button>
-              ))}
-            </div>
-          </SettingRow>
-        </Card>
-
-        {/* ── Current config preview ── */}
-        <Card>
-          <SectionTitle icon="📋" title="ACTIVE CONFIGURATION PREVIEW"
-            subtitle="Full JSON snapshot of all current settings." />
-          <button onClick={() => {
-            const el = document.getElementById("cfg-json");
-            el.style.display = el.style.display === "none" ? "block" : "none";
-          }} style={{
-            fontFamily: C.mono, fontSize: 9, padding: "5px 12px",
-            borderRadius: 5, cursor: "pointer",
-            background: C.bg3, border: `1px solid ${C.bdr}`, color: C.t1,
-            marginBottom: 10,
-          }}>
-            Toggle JSON
-          </button>
-          <pre id="cfg-json" style={{ display: "none",
-            fontFamily: C.mono, fontSize: 9, color: C.t1,
-            background: C.bg0, border: `1px solid ${C.bdr}`,
-            borderRadius: 7, padding: 14, overflowX: "auto",
-            lineHeight: 1.6,
-          }}>
-            {JSON.stringify(cfg, null, 2)}
-          </pre>
-        </Card>
+              );
+            })}
+          </div>
+          <div style={{marginTop:12,fontFamily:MONO,fontSize:9,color:T.t2,lineHeight:1.6}}>
+            Active: {(cfg.markets||[]).length===0?"None":(cfg.markets||[]).map(m=>m.charAt(0).toUpperCase()+m.slice(1)).join(", ")}
+          </div>
+        </Section>
 
       </div>
 
-      <SaveBar dirty={dirty} saving={saving} onSave={save} onReset={reset} />
+      {/* Bottom save bar */}
+      <div style={{position:"sticky",bottom:0,background:T.bg2,borderTop:`1px solid ${T.border}`,
+        padding:"12px 20px",display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+        <div style={{fontFamily:MONO,fontSize:10,color:T.t2}}>
+          Changes take effect on the next signal scan.
+        </div>
+        <div style={{display:"flex",gap:10,alignItems:"center"}}>
+          {saved&&<span style={{fontFamily:MONO,fontSize:11,color:T.green,animation:"slide .2s ease"}}>✓ Saved</span>}
+          {error&&<span style={{fontFamily:MONO,fontSize:11,color:T.red}}>⚠ {error}</span>}
+          <button onClick={save} disabled={saving}
+            style={{background:`${T.blue}20`,border:`1px solid ${T.blue}50`,color:T.blue,
+              borderRadius:4,padding:"8px 24px",cursor:"pointer",fontFamily:MONO,fontSize:12,
+              letterSpacing:2,display:"flex",alignItems:"center",gap:7,opacity:saving?0.7:1}}>
+            <Save size={13}/>{saving?"SAVING…":"SAVE ALL SETTINGS"}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
+
+// ── SUB-COMPONENTS ────────────────────────────────────────────────────────────
+function Section({title,color,icon,children}){
+  return(
+    <div style={{background:T.bg3,border:`1px solid ${T.border}`,borderRadius:6,padding:16}}>
+      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:16,
+        paddingBottom:10,borderBottom:`1px solid ${T.border}`}}>
+        <span style={{fontSize:14}}>{icon}</span>
+        <span style={{fontFamily:MONO,fontSize:10,color,letterSpacing:2}}>{title}</span>
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function Slider({label,min,max,step,val,onChange,help,color,fmt:fmtFn}){
+  const display = fmtFn ? fmtFn(val) : String(val);
+  const pct     = ((val-min)/(max-min))*100;
+  return(
+    <div style={{marginBottom:16}}>
+      <div style={{display:"flex",justifyContent:"space-between",marginBottom:6}}>
+        <span style={{fontFamily:MONO,fontSize:10,color:T.text}}>{label}</span>
+        <span style={{fontFamily:MONO,fontSize:12,color,fontWeight:600}}>{display}</span>
+      </div>
+      <input type="range" min={min} max={max} step={step} value={val}
+        onChange={e=>onChange(Number(e.target.value))}
+        style={{width:"100%",accentColor:color,cursor:"pointer"}}/>
+      <div style={{display:"flex",justifyContent:"space-between",marginTop:3}}>
+        <span style={{fontFamily:MONO,fontSize:8,color:T.t2}}>{fmtFn?fmtFn(min):min}</span>
+        <span style={{fontFamily:MONO,fontSize:8,color:T.t2}}>{fmtFn?fmtFn(max):max}</span>
+      </div>
+      {help&&<div style={{fontFamily:UI,fontSize:11,color:T.t2,marginTop:5,lineHeight:1.5}}>{help}</div>}
+    </div>
+  );
+}
+
+function Toggle({label,val,onChange,help}){
+  return(
+    <div style={{marginBottom:14,display:"flex",alignItems:"flex-start",gap:12}}>
+      <button onClick={()=>onChange(!val)}
+        style={{flexShrink:0,width:42,height:22,borderRadius:11,border:"none",cursor:"pointer",
+          background:val?T.green:T.t3,position:"relative",transition:"background .2s"}}>
+        <div style={{position:"absolute",top:3,left:val?22:3,width:16,height:16,
+          borderRadius:"50%",background:"#fff",transition:"left .2s"}}/>
+      </button>
+      <div>
+        <div style={{fontFamily:MONO,fontSize:10,color:T.text,marginBottom:3}}>{label}</div>
+        {help&&<div style={{fontFamily:UI,fontSize:11,color:T.t2,lineHeight:1.5}}>{help}</div>}
+      </div>
+    </div>
+  );
+}
+
+const inpStyle = {
+  background:T.bg2, border:`1px solid ${T.border}`, color:T.text,
+  borderRadius:3, padding:"6px 10px", fontFamily:MONO, fontSize:11,
+};

@@ -1,740 +1,509 @@
 /**
- * Dashboard.jsx — v2 Institutional Trading Terminal
- * Live signal cards with AI reasoning, ADX/RSI/EMA/SMC visibility,
- * expandable analysis panels, and a premium dark terminal aesthetic.
+ * Dashboard.jsx — NexusBot Trading Terminal v2
+ * Professional institutional-grade live signal dashboard.
+ * Shows: signal cards, AI analysis, confidence logic, SMC checks, trade levels.
  */
-import React, { useState, useEffect, useCallback, useRef } from "react";
-import {
-  AreaChart, Area, XAxis, YAxis, Tooltip,
-  ResponsiveContainer, ReferenceLine,
-} from "recharts";
+import { useState, useEffect, useCallback, useRef } from "react";
+import { RefreshCw, ChevronDown, ChevronUp, CheckCircle, XCircle } from "lucide-react";
 
-/* ══════════════════════════════════════════════════════
-   THEME
-══════════════════════════════════════════════════════ */
-const C = {
-  bg0:  "#020917",   // page
-  bg1:  "#071428",   // card
-  bg2:  "#0c1d3a",   // elevated
-  bg3:  "#11264a",   // hover / pill
-  bdr:  "#1a3356",
-  buy:  "#00e5a0",
-  sell: "#ff4266",
-  hold: "#4a9eff",
-  gold: "#f59e0b",
-  t0:   "#ddeeff",
-  t1:   "#7aadda",
-  t2:   "#3d6a8a",
-  mono: "'JetBrains Mono','Cascadia Code','Fira Code',monospace",
-  ui:   "'Outfit','DM Sans',system-ui,sans-serif",
+// ── Design tokens ────────────────────────────────────────────────────────────
+const T = {
+  bg:"#050914", bg2:"#08111f", bg3:"#0d1a2e", bg4:"#111f38",
+  border:"#162036", b2:"#1e3060",
+  text:"#c8d8f0", t2:"#6a8aaa", t3:"#2a4060",
+  green:"#00ffa3", red:"#ff2d55", gold:"#ffc107",
+  blue:"#4facfe", purple:"#9f7aea", cyan:"#22d3ee",
 };
+const MONO = "'JetBrains Mono','Cascadia Code','Courier New',monospace";
+const UI   = "'Rajdhani','Segoe UI',system-ui,sans-serif";
 
-/* Inject fonts + global keyframes once */
-let _injected = false;
-const injectGlobals = () => {
-  if (_injected || typeof document === "undefined") return;
-  _injected = true;
-  const lnk = document.createElement("link");
-  lnk.rel = "stylesheet";
-  lnk.href =
-    "https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&" +
-    "family=JetBrains+Mono:wght@400;500;700&display=swap";
-  document.head.appendChild(lnk);
-  const sty = document.createElement("style");
-  sty.textContent = `
-    @keyframes pulse-buy  { 0%,100%{box-shadow:0 0 14px rgba(0,229,160,.2),0 0 0 1px rgba(0,229,160,.3)}  50%{box-shadow:0 0 30px rgba(0,229,160,.38),0 0 0 1px rgba(0,229,160,.5)} }
-    @keyframes pulse-sell { 0%,100%{box-shadow:0 0 14px rgba(255,66,102,.2),0 0 0 1px rgba(255,66,102,.3)} 50%{box-shadow:0 0 30px rgba(255,66,102,.38),0 0 0 1px rgba(255,66,102,.5)} }
-    @keyframes fadeDown   { from{opacity:0;transform:translateY(-8px)} to{opacity:1;transform:translateY(0)} }
-    @keyframes spin       { to{transform:rotate(360deg)} }
-    @keyframes priceUp    { 0%{background:rgba(0,229,160,.18)} 100%{background:transparent} }
-    @keyframes priceDown  { 0%{background:rgba(255,66,102,.18)} 100%{background:transparent} }
-    @keyframes blink      { 0%,100%{opacity:1} 50%{opacity:.3} }
-    .buy-glow  { animation: pulse-buy  3s ease-in-out infinite; }
-    .sell-glow { animation: pulse-sell 3s ease-in-out infinite; }
-    .slide-in  { animation: fadeDown 0.28s ease; }
-    .price-up  { animation: priceUp   0.9s ease; }
-    .price-down{ animation: priceDown 0.9s ease; }
-    .live-dot  { animation: blink 1.4s ease-in-out infinite; }
-    *  { box-sizing:border-box; }
-    ::-webkit-scrollbar       { width:5px; height:5px; }
-    ::-webkit-scrollbar-track { background:#071428; }
-    ::-webkit-scrollbar-thumb { background:#1a3356; border-radius:3px; }
-  `;
-  document.head.appendChild(sty);
-};
+// ── Helpers ──────────────────────────────────────────────────────────────────
+const fmt   = (n,d=2)  => n==null?"—":Number(n).toFixed(d);
+const fmtP  = (n)      => n==null?"—":n>=1000?n.toLocaleString(undefined,{maximumFractionDigits:2}):n>=1?fmt(n,4):fmt(n,6);
+const qColor= (q)      => ({"A+":T.green,A:"#7fff6e",B:T.gold,C:"#ff8c42",D:T.red})[q]||T.t2;
+const getRR = (e,s,t)  => {if(!e||!s||!t)return"—";const r=Math.abs(e-s),w=Math.abs(t-e);return r>0?(w/r).toFixed(1)+"R":"—";};
 
-/* ══════════════════════════════════════════════════════
-   HELPERS
-══════════════════════════════════════════════════════ */
-const api = (url, opts = {}) => {
-  const tok = localStorage.getItem("token") || "";
-  return fetch(url, {
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${tok}`, ...opts.headers },
-    ...opts,
-  });
-};
+function getSession(){
+  const h=new Date().getUTCHours();
+  if(h>=7&&h<12) return{name:"London",  color:"#4facfe"};
+  if(h>=12&&h<21)return{name:"New York",color:"#ff6b9d"};
+  if(h>=0&&h<7)  return{name:"Asia",    color:"#ffd93d"};
+  return{name:"Off-Hours",color:T.t2};
+}
 
-const qualityInfo = (conf, smc) => {
-  if (conf >= 88 && smc >= 8) return { label: "A+", bg: "#064533", col: "#00e5a0" };
-  if (conf >= 80 && smc >= 7) return { label: "A",  bg: "#065240", col: "#10d98a" };
-  if (conf >= 70 && smc >= 6) return { label: "B",  bg: "#1e3a8a", col: "#60a5fa" };
-  if (conf >= 60)              return { label: "C",  bg: "#7c3403", col: "#fbbf24" };
-  return                              { label: "D",  bg: "#1c1917", col: "#6b7280" };
-};
+const GS = `
+@import url('https://fonts.googleapis.com/css2?family=Rajdhani:wght@400;500;600;700&family=JetBrains+Mono:wght@300;400;500&display=swap');
+*{box-sizing:border-box}
+::-webkit-scrollbar{width:5px;height:5px}
+::-webkit-scrollbar-track{background:#050914}
+::-webkit-scrollbar-thumb{background:#162036;border-radius:3px}
+@keyframes spin{to{transform:rotate(360deg)}}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+@keyframes slide{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:translateY(0)}}
+@keyframes flash{0%,100%{opacity:1}40%{opacity:.3}}
+`;
 
-const sessionCol = s =>
-  s === "London" ? "#f59e0b" : s === "New York" ? "#34d399" : "#818cf8";
+// ── MAIN COMPONENT ────────────────────────────────────────────────────────────
+export default function Dashboard() {
+  const [signals,    setSignals]    = useState([]);
+  const [loading,    setLoading]    = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [error,      setError]      = useState(null);
+  const [filter,     setFilter]     = useState("all");
+  const [strategy,   setStrategy]   = useState("bot");
+  const [expanded,   setExpanded]   = useState(null);
+  const [session,    setSession]    = useState(getSession());
+  const [lastUpd,    setLastUpd]    = useState(null);
+  const [flashing,   setFlashing]   = useState({});
+  const prevPx = useRef({});
 
-const mktEmoji = m =>
-  ({ crypto: "₿", forex: "FX", stocks: "EQ", commodities: "AU" }[m] || "—");
+  const token   = localStorage.getItem("token");
+  const hdrs    = { Authorization:`Bearer ${token}` };
 
-const fn = (v, d = 2) => {
-  if (v == null || isNaN(v)) return "—";
-  return Number(v).toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d });
-};
+  const load = useCallback(async (silent=false) => {
+    if(!silent) setLoading(true); else setRefreshing(true);
+    setError(null);
+    try {
+      const r = await fetch(`/api/signals?strategy=${strategy}`, {headers:hdrs});
+      const d = await r.json();
+      if(!r.ok) throw new Error(d.error||"Failed");
+      const sigs = d.signals||[];
+      const fl={};
+      sigs.forEach(s=>{
+        const p=prevPx.current[s.symbol];
+        if(p&&p!==s.price) fl[s.symbol]=s.price>p?"up":"dn";
+        prevPx.current[s.symbol]=s.price;
+      });
+      setFlashing(fl);
+      setTimeout(()=>setFlashing({}),900);
+      setSignals(sigs); setLastUpd(new Date()); setSession(getSession());
+    } catch(e){setError(e.message);}
+    finally{setLoading(false);setRefreshing(false);}
+  },[strategy]);
 
-const fmtChg = v => {
-  const n = parseFloat(v);
-  return isNaN(n) ? "—" : (n >= 0 ? "+" : "") + n.toFixed(2) + "%";
-};
+  useEffect(()=>{ load(); const iv=setInterval(()=>load(true),30000); return()=>clearInterval(iv); },[load]);
 
-/* ══════════════════════════════════════════════════════
-   ATOMS
-══════════════════════════════════════════════════════ */
-const Tag = ({ label, active, small }) => (
-  <span style={{
-    fontFamily: C.mono,
-    fontSize: small ? 8 : 9,
-    fontWeight: 600,
-    padding: small ? "1px 5px" : "2px 7px",
-    borderRadius: 4,
-    background: active ? C.buy + "16" : C.bg3,
-    color:       active ? C.buy      : C.t2,
-    border:      `1px solid ${active ? C.buy + "40" : C.bdr}`,
-  }}>
-    {active ? "✓" : "✗"} {label}
-  </span>
-);
-
-const Pill = ({ label, value, color }) => (
-  <div style={{
-    flex: 1, textAlign: "center",
-    padding: "5px 2px",
-    background: C.bg3, borderRadius: 6, border: `1px solid ${C.bdr}`,
-    minWidth: 0,
-  }}>
-    <div style={{ fontFamily: C.mono, fontSize: 12, fontWeight: 700, color: color || C.t0 }}>
-      {value ?? "—"}
-    </div>
-    <div style={{ fontFamily: C.ui, fontSize: 8, color: C.t2, marginTop: 1 }}>{label}</div>
-  </div>
-);
-
-const ConfBar = ({ value }) => {
-  const pct = Math.max(0, Math.min(100, value || 0));
-  const col = pct >= 80 ? C.buy : pct >= 65 ? C.gold : pct >= 50 ? C.hold : C.sell;
-  return (
-    <div>
-      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 3 }}>
-        <span style={{ fontFamily: C.mono, fontSize: 9, color: C.t2 }}>CONFIDENCE</span>
-        <span style={{ fontFamily: C.mono, fontSize: 11, fontWeight: 700, color: col }}>{pct}%</span>
-      </div>
-      <div style={{ height: 4, background: C.bg3, borderRadius: 99, overflow: "hidden" }}>
-        <div style={{
-          height: "100%", width: `${pct}%`, borderRadius: 99,
-          background: `linear-gradient(90deg,${col}66,${col})`,
-          transition: "width .7s ease",
-          boxShadow: `0 0 6px ${col}88`,
-        }} />
-      </div>
-    </div>
-  );
-};
-
-/* ══════════════════════════════════════════════════════
-   MINI PRICE CHART (lazy-loaded on card expand)
-══════════════════════════════════════════════════════ */
-const MiniChart = ({ symbol, entry, sl, tp, signal }) => {
-  const [data, setData] = useState([]);
-  useEffect(() => {
-    api(`/api/chart-candles?symbol=${symbol}&interval=5m&limit=80`)
-      .then(r => r.json())
-      .then(d => {
-        if (d.ok && d.data) setData(d.data.map((c, i) => ({ i, v: c.close })));
-      })
-      .catch(() => {});
-  }, [symbol]);
-
-  if (!data.length) return (
-    <div style={{ height: 90, display: "flex", alignItems: "center", justifyContent: "center" }}>
-      <span style={{ fontFamily: C.mono, fontSize: 10, color: C.t2 }}>Loading chart…</span>
-    </div>
-  );
-
-  const col = signal === "BUY" ? C.buy : signal === "SELL" ? C.sell : C.hold;
-  const gradId = `grad-${symbol}`;
+  const shown = signals.filter(s=>filter==="all"||s.market===filter);
+  const buys  = signals.filter(s=>s.signal==="BUY").length;
+  const sells = signals.filter(s=>s.signal==="SELL").length;
 
   return (
-    <div style={{ height: 90, marginTop: 6 }}>
-      <ResponsiveContainer width="100%" height="100%">
-        <AreaChart data={data} margin={{ top: 2, right: 0, bottom: 0, left: 0 }}>
-          <defs>
-            <linearGradient id={gradId} x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor={col} stopOpacity={0.3} />
-              <stop offset="100%" stopColor={col} stopOpacity={0} />
-            </linearGradient>
-          </defs>
-          <Area type="monotone" dataKey="v" stroke={col} strokeWidth={1.5}
-            fill={`url(#${gradId})`} dot={false} isAnimationActive={false} />
-          {entry && <ReferenceLine y={entry} stroke={col}     strokeDasharray="4 2" strokeWidth={1} label={{ value: "E", fill: col,  fontSize: 8, fontFamily: C.mono }} />}
-          {sl    && <ReferenceLine y={sl}    stroke={C.sell}  strokeDasharray="4 2" strokeWidth={1} label={{ value: "SL", fill: C.sell, fontSize: 8, fontFamily: C.mono }} />}
-          {tp    && <ReferenceLine y={tp}    stroke={C.gold}  strokeDasharray="4 2" strokeWidth={1} label={{ value: "TP", fill: C.gold, fontSize: 8, fontFamily: C.mono }} />}
-          <YAxis hide domain={["auto", "auto"]} />
-          <Tooltip
-            contentStyle={{ background: C.bg1, border: `1px solid ${C.bdr}`, borderRadius: 6, fontFamily: C.mono, fontSize: 9 }}
-            formatter={v => [fn(v, 5), "Price"]}
-            labelFormatter={() => ""}
-          />
-        </AreaChart>
-      </ResponsiveContainer>
-      <div style={{ display: "flex", gap: 10, justifyContent: "center", marginTop: 4 }}>
-        {[["E", col], ["SL", C.sell], ["TP", C.gold]].map(([l, c]) => (
-          <span key={l} style={{ fontFamily: C.mono, fontSize: 8, color: c }}>— {l}</span>
-        ))}
-      </div>
-    </div>
-  );
-};
+    <div style={{background:T.bg,minHeight:"100vh",fontFamily:UI,color:T.text}}>
+      <style>{GS}</style>
 
-/* ══════════════════════════════════════════════════════
-   AI ANALYSIS PANEL
-══════════════════════════════════════════════════════ */
-const AIPanel = ({ s }) => {
-  const passing = (s.reasons || []).filter(r => r.startsWith("✓")).length;
-  const total   = (s.reasons || []).length;
-  const setupType = s.smc_score >= s.min_smc_score
-    ? "Full ICT / SMC Setup"
-    : s.signal !== "HOLD"
-    ? "Fallback EMA + ADX Trend-Follow"
-    : "No valid setup — signal blocked";
-
-  return (
-    <div className="slide-in" style={{
-      marginTop: 10, padding: 14, borderRadius: 8,
-      background: C.bg0, border: `1px solid ${C.bdr}`,
-    }}>
-      {/* Header */}
-      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 10 }}>
-        <span style={{ fontFamily: C.mono, fontSize: 10, fontWeight: 700, color: C.t1, letterSpacing: ".06em" }}>
-          🤖 AI ANALYSIS
-        </span>
-        <span style={{ fontFamily: C.mono, fontSize: 9, color: C.t2 }}>{passing}/{total} confirmations</span>
-      </div>
-
-      {/* Setup type */}
-      <div style={{
-        padding: "7px 10px", borderRadius: 6, marginBottom: 10,
-        background: C.bg2, borderLeft: `3px solid ${C.hold}`,
-      }}>
-        <div style={{ fontFamily: C.mono, fontSize: 8, color: C.t2, marginBottom: 2 }}>SETUP TYPE</div>
-        <div style={{ fontFamily: C.ui, fontSize: 11, fontWeight: 600, color: C.t0 }}>{setupType}</div>
-      </div>
-
-      {/* Trade idea */}
-      {s.trade_idea && s.trade_idea !== "Wait for clearer confirmation" && (
-        <div style={{
-          padding: "7px 10px", borderRadius: 6, marginBottom: 10,
-          background: C.bg2, borderLeft: `3px solid ${s.signal === "BUY" ? C.buy : C.sell}`,
-        }}>
-          <div style={{ fontFamily: C.mono, fontSize: 8, color: C.t2, marginBottom: 2 }}>TRADE IDEA</div>
-          <div style={{ fontFamily: C.ui, fontSize: 11, color: C.t0 }}>{s.trade_idea}</div>
-        </div>
-      )}
-
-      {/* Context grid */}
-      <div style={{ display: "flex", gap: 5, flexWrap: "wrap", marginBottom: 10 }}>
-        {[
-          { l: "Regime",    v: s.regime },
-          { l: "Structure", v: s.structure },
-          { l: "HTF",       v: s.higher_tf_bias },
-          { l: "Session",   v: s.session },
-          { l: "ADX",       v: s.adx ? s.adx.toFixed(1) : "—" },
-          { l: "RSI",       v: s.rsi ? s.rsi.toFixed(0) : "—" },
-          { l: "EMA",       v: s.ema_alignment },
-          { l: "SMC",       v: `${s.smc_score}/9` },
-        ].map(({ l, v }) => (
-          <span key={l} style={{
-            fontFamily: C.mono, fontSize: 9, padding: "2px 7px", borderRadius: 4,
-            background: C.bg3, border: `1px solid ${C.bdr}`, color: C.t1,
-          }}>
-            <span style={{ color: C.t2 }}>{l}: </span>{v || "—"}
+      {/* TOP BAR */}
+      <div style={{background:T.bg2,borderBottom:`1px solid ${T.border}`,padding:"10px 20px",
+        display:"flex",alignItems:"center",justifyContent:"space-between",
+        position:"sticky",top:0,zIndex:200,flexWrap:"wrap",gap:12}}>
+        <div style={{display:"flex",alignItems:"center",gap:18}}>
+          <span style={{fontFamily:MONO,fontSize:16,letterSpacing:3,color:T.text}}>
+            ⬡<span style={{color:T.green}}>NEXUS</span>BOT
           </span>
-        ))}
-      </div>
-
-      {/* Reason checklist */}
-      <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
-        {(s.reasons || []).map((r, i) => {
-          const pass = r.startsWith("✓");
-          return (
-            <div key={i} style={{
-              fontFamily: C.mono, fontSize: 10,
-              color: pass ? C.buy : C.t2,
-              padding: "3px 6px",
-              borderRadius: 4,
-              background: pass ? C.buy + "08" : "transparent",
-              borderBottom: i < s.reasons.length - 1 ? `1px solid ${C.bdr}44` : "none",
-            }}>
-              {r}
-            </div>
-          );
-        })}
-      </div>
-
-      {/* Why confidence is high/low */}
-      <div style={{ marginTop: 10, padding: "8px 10px", background: C.bg2, borderRadius: 6 }}>
-        <div style={{ fontFamily: C.mono, fontSize: 8, color: C.t2, marginBottom: 4 }}>WHY CONFIDENCE IS {s.confidence >= 70 ? "HIGH" : s.confidence >= 50 ? "MODERATE" : "LOW"}</div>
-        <div style={{ fontFamily: C.ui, fontSize: 10, color: C.t1, lineHeight: 1.6 }}>
-          {s.confidence >= 80
-            ? `Strong ${s.signal === "BUY" ? "bullish" : "bearish"} alignment across all timeframes. 
-               ADX ${s.adx?.toFixed(0) || "?"} confirms trending conditions. 
-               ${s.smc_score}/${s.min_smc_score} SMC threshold met — high conviction entry.`
-            : s.confidence >= 65
-            ? `Moderate confluence. ${passing}/${total} checks passed. 
-               ${s.adx < 25 ? "ADX is low — trend may be weak. " : ""}
-               ${s.rsi && s.rsi > 65 ? "RSI approaching overbought — watch for exhaustion. " : ""}
-               Confidence acceptable but not optimal.`
-            : `Low confluence. Only ${passing}/${total} SMC checks aligned. 
-               ${s.adx < 20 ? "ADX below 20 — no strong trend. " : ""}
-               Consider waiting for a higher quality setup.`}
-        </div>
-      </div>
-    </div>
-  );
-};
-
-/* ══════════════════════════════════════════════════════
-   SIGNAL CARD
-══════════════════════════════════════════════════════ */
-const SignalCard = ({ s }) => {
-  const [expanded, setExpanded] = useState(false);
-  const [showChart, setShowChart] = useState(false);
-  const prevPriceRef = useRef(s.price);
-  const [flashCls, setFlashCls] = useState("");
-
-  useEffect(() => {
-    if (s.price !== prevPriceRef.current) {
-      setFlashCls(s.price > prevPriceRef.current ? "price-up" : "price-down");
-      prevPriceRef.current = s.price;
-      const t = setTimeout(() => setFlashCls(""), 900);
-      return () => clearTimeout(t);
-    }
-  }, [s.price]);
-
-  const rrDisp  = s.rr ? `1:${s.rr}` : "—";
-  const sigCol  = s.signal === "BUY" ? C.buy : s.signal === "SELL" ? C.sell : C.hold;
-  const glowCls = s.signal === "BUY" ? "buy-glow" : s.signal === "SELL" ? "sell-glow" : "";
-  const q       = qualityInfo(s.confidence, s.smc_score);
-
-  const adxColor = s.adx > 30 ? C.buy : s.adx > 20 ? C.gold : C.sell;
-  const rsiColor = s.rsi > 70  ? C.sell : s.rsi < 30  ? C.buy  : C.gold;
-
-  return (
-    <div className={glowCls} style={{
-      background: C.bg1,
-      border: `1px solid ${sigCol}44`,
-      borderRadius: 12,
-      padding: 16,
-      display: "flex", flexDirection: "column", gap: 9,
-      transition: "transform .15s",
-      fontFamily: C.ui,
-    }}>
-
-      {/* ── Row 1: Symbol + badges ── */}
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
-        <div>
-          <div style={{ fontFamily: C.mono, fontSize: 15, fontWeight: 800, color: C.t0 }}>
-            <span style={{ fontSize: 10, marginRight: 5, background: C.bg3, padding: "1px 6px", borderRadius: 3, color: C.t2 }}>
-              {mktEmoji(s.market)}
+          {/* Session indicator */}
+          <div style={{display:"flex",alignItems:"center",gap:7,background:T.bg3,
+            border:`1px solid ${T.border}`,borderRadius:4,padding:"4px 11px"}}>
+            <div style={{width:7,height:7,borderRadius:"50%",background:session.color,
+              boxShadow:`0 0 7px ${session.color}`,animation:"pulse 2s infinite"}}/>
+            <span style={{fontFamily:MONO,fontSize:11,color:session.color,letterSpacing:1}}>
+              {session.name.toUpperCase()} SESSION
             </span>
-            {s.symbol}
           </div>
-          <div style={{ fontFamily: C.mono, fontSize: 8, color: C.t2, marginTop: 1 }}>
-            {s.market?.toUpperCase()} • HTF {s.higher_tf?.toUpperCase()}
-          </div>
-        </div>
-        <div style={{ display: "flex", gap: 5, flexWrap: "wrap", justifyContent: "flex-end" }}>
-          {/* Quality badge */}
-          <span style={{
-            fontFamily: C.mono, fontSize: 11, fontWeight: 900,
-            padding: "2px 8px", borderRadius: 4,
-            background: q.bg, color: q.col,
-            border: `1px solid ${q.col}40`,
-          }}>{q.label}</span>
-          {/* Session */}
-          <span style={{
-            fontFamily: C.mono, fontSize: 9, fontWeight: 700,
-            padding: "2px 7px", borderRadius: 4,
-            background: sessionCol(s.session) + "20",
-            color: sessionCol(s.session),
-            border: `1px solid ${sessionCol(s.session)}44`,
-          }}>{s.session || "—"}</span>
-        </div>
-      </div>
-
-      {/* ── Row 2: Price ── */}
-      <div className={flashCls} style={{
-        display: "flex", justifyContent: "space-between", alignItems: "center",
-        padding: "9px 12px", borderRadius: 8,
-        background: C.bg0, border: `1px solid ${C.bdr}`,
-        transition: "background .25s",
-      }}>
-        <span style={{ fontFamily: C.mono, fontSize: 19, fontWeight: 700, color: C.t0 }}>
-          {s.price_display || fn(s.price, 4)}
-        </span>
-        <div style={{ textAlign: "right" }}>
-          <div style={{
-            fontFamily: C.mono, fontSize: 11, fontWeight: 600,
-            color: parseFloat(s.change_pct) >= 0 ? C.buy : C.sell,
-          }}>
-            {fmtChg(s.change_pct)}
-          </div>
-          <div style={{ fontFamily: C.mono, fontSize: 8, color: C.t2 }}>24h</div>
-        </div>
-      </div>
-
-      {/* ── Row 3: Signal + bias ── */}
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-        <span style={{
-          fontFamily: C.mono, fontSize: 14, fontWeight: 900,
-          padding: "5px 14px", borderRadius: 7,
-          background: sigCol + "18", color: sigCol,
-          border: `1px solid ${sigCol}55`,
-          letterSpacing: ".1em",
-        }}>
-          {s.signal === "BUY" ? "▲ BUY" : s.signal === "SELL" ? "▼ SELL" : "◼ HOLD"}
-        </span>
-        <span style={{ fontFamily: C.mono, fontSize: 9, color: C.t2 }}>
-          {s.bias} · {s.structure}
-        </span>
-      </div>
-
-      {/* ── Confidence bar ── */}
-      <ConfBar value={s.confidence} />
-
-      {/* ── Row 4: Metrics ── */}
-      <div style={{ display: "flex", gap: 4 }}>
-        <Pill label="ADX"   value={s.adx  ? s.adx.toFixed(1)  : "—"} color={adxColor} />
-        <Pill label="RSI"   value={s.rsi  ? s.rsi.toFixed(0)  : "—"} color={rsiColor} />
-        <Pill label="SMC"   value={`${s.smc_score}/9`}                color={s.smc_score >= 7 ? C.buy : s.smc_score >= 5 ? C.gold : C.sell} />
-        <Pill label="R:R"   value={rrDisp}                            color={C.t0} />
-      </div>
-
-      {/* ── EMA alignment ── */}
-      <div style={{
-        fontFamily: C.mono, fontSize: 9, padding: "4px 9px", borderRadius: 5,
-        background: C.bg3,
-        color: s.ema_alignment?.startsWith("Bull") ? C.buy
-             : s.ema_alignment?.startsWith("Bear") ? C.sell : C.t1,
-      }}>
-        EMA: {s.ema_alignment || "—"}
-      </div>
-
-      {/* ── SMC check tags ── */}
-      <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
-        <Tag label="SWEEP"   active={!!s.liquidity_sweep} small />
-        <Tag label="BOS"     active={!!s.bos} small />
-        <Tag label="FVG"     active={!!s.fvg_detected} small />
-        <Tag label="HTF BUL" active={s.higher_tf_bias === "Bullish"} small />
-        <Tag label="HTF BEA" active={s.higher_tf_bias === "Bearish"} small />
-        <Tag label="SESSION" active={!!s.session && s.session !== "—"} small />
-      </div>
-
-      {/* ── Trade levels ── */}
-      {s.signal !== "HOLD" && (
-        <div style={{
-          display: "grid", gridTemplateColumns: "1fr 1fr 1fr",
-          gap: 4, borderTop: `1px solid ${C.bdr}`, paddingTop: 9,
-        }}>
-          {[
-            { l: "ENTRY",  v: s.entry, c: C.t0 },
-            { l: "STOP",   v: s.sl,    c: C.sell },
-            { l: "TARGET", v: s.tp,    c: C.buy },
-          ].map(({ l, v, c }) => (
-            <div key={l} style={{ textAlign: "center" }}>
-              <div style={{ fontFamily: C.mono, fontSize: 8, color: C.t2, marginBottom: 2 }}>{l}</div>
-              <div style={{ fontFamily: C.mono, fontSize: 10, fontWeight: 700, color: c }}>
-                {fn(v, 4)}
-              </div>
-            </div>
+          {/* Market sentiment pills */}
+          {[["▲",buys,T.green],["▼",sells,T.red]].map(([sym,n,c])=>(
+            <span key={sym} style={{fontFamily:MONO,fontSize:11,padding:"2px 9px",borderRadius:3,
+              background:`${c}18`,border:`1px solid ${c}40`,color:c}}>
+              {sym} {n}
+            </span>
           ))}
         </div>
-      )}
-
-      {/* ── Action buttons ── */}
-      <div style={{ display: "flex", gap: 5, borderTop: `1px solid ${C.bdr}`, paddingTop: 8 }}>
-        <button onClick={() => setExpanded(x => !x)} style={{
-          flex: 2, fontFamily: C.mono, fontSize: 9, fontWeight: 600,
-          padding: "6px 0", borderRadius: 6, cursor: "pointer",
-          background: expanded ? C.bg3 : "transparent",
-          border: `1px solid ${C.bdr}`,
-          color: expanded ? C.t0 : C.t1,
-          transition: "all .15s",
-        }}>
-          {expanded ? "▲ Close Analysis" : "▼ AI Analysis"}
-        </button>
-        <button onClick={() => setShowChart(x => !x)} style={{
-          flex: 1, fontFamily: C.mono, fontSize: 9, fontWeight: 600,
-          padding: "6px 0", borderRadius: 6, cursor: "pointer",
-          background: showChart ? C.bg3 : "transparent",
-          border: `1px solid ${C.bdr}`,
-          color: showChart ? C.t0 : C.t1,
-          transition: "all .15s",
-        }}>
-          📈 Chart
-        </button>
-      </div>
-
-      {/* ── Expanded: AI panel ── */}
-      {expanded && <AIPanel s={s} />}
-
-      {/* ── Expanded: Mini chart ── */}
-      {showChart && (
-        <div className="slide-in">
-          <MiniChart symbol={s.symbol} entry={s.entry} sl={s.sl} tp={s.tp} signal={s.signal} />
-        </div>
-      )}
-    </div>
-  );
-};
-
-/* ══════════════════════════════════════════════════════
-   STATS BAR
-══════════════════════════════════════════════════════ */
-const StatsBar = ({ signals }) => {
-  const total   = signals.length;
-  const buys    = signals.filter(s => s.signal === "BUY").length;
-  const sells   = signals.filter(s => s.signal === "SELL").length;
-  const avgConf = total ? Math.round(signals.reduce((a, s) => a + (s.confidence || 0), 0) / total) : 0;
-  const aPlus   = signals.filter(s => qualityInfo(s.confidence, s.smc_score).label === "A+").length;
-  const avgAdx  = total ? (signals.reduce((a, s) => a + (s.adx || 0), 0) / total).toFixed(1) : "0";
-
-  return (
-    <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 14 }}>
-      {[
-        { l: "SIGNALS", v: total, c: C.t0 },
-        { l: "BUY",     v: buys,  c: C.buy },
-        { l: "SELL",    v: sells, c: C.sell },
-        { l: "AVG CONF",v: `${avgConf}%`, c: avgConf >= 70 ? C.buy : C.gold },
-        { l: "A+ GRADE",v: aPlus, c: C.gold },
-        { l: "AVG ADX", v: avgAdx, c: parseFloat(avgAdx) >= 25 ? C.buy : C.t1 },
-      ].map(({ l, v, c }) => (
-        <div key={l} style={{
-          flex: "1 1 90px",
-          background: C.bg1, border: `1px solid ${C.bdr}`,
-          borderRadius: 8, padding: "10px 14px",
-        }}>
-          <div style={{ fontFamily: C.mono, fontSize: 8, color: C.t2, letterSpacing: ".08em" }}>{l}</div>
-          <div style={{ fontFamily: C.mono, fontSize: 22, fontWeight: 800, color: c, marginTop: 2 }}>{v}</div>
-        </div>
-      ))}
-    </div>
-  );
-};
-
-/* ══════════════════════════════════════════════════════
-   FILTER BAR
-══════════════════════════════════════════════════════ */
-const FilterBar = ({ filters, onChange }) => {
-  const Btn = ({ v, active, onClick }) => (
-    <button onClick={onClick} style={{
-      fontFamily: C.mono, fontSize: 9, fontWeight: active ? 700 : 400,
-      padding: "4px 10px", borderRadius: 5, cursor: "pointer",
-      background: active ? C.bg3 : "transparent",
-      border:  `1px solid ${active ? C.bdr : "transparent"}`,
-      color:   active ? C.t0 : C.t2,
-      transition: "all .12s",
-    }}>{v.toUpperCase()}</button>
-  );
-
-  return (
-    <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginBottom: 14 }}>
-      <div style={{ display: "flex", gap: 3, alignItems: "center" }}>
-        <span style={{ fontFamily: C.mono, fontSize: 8, color: C.t2, marginRight: 3 }}>MKT</span>
-        {["All","crypto","forex","stocks","commodities"].map(m => (
-          <Btn key={m} v={m} active={filters.market === m}
-            onClick={() => onChange({ ...filters, market: m })} />
-        ))}
-      </div>
-      <div style={{ display: "flex", gap: 3, alignItems: "center" }}>
-        <span style={{ fontFamily: C.mono, fontSize: 8, color: C.t2, marginRight: 3 }}>SIG</span>
-        {["All","BUY","SELL","HOLD"].map(s => (
-          <Btn key={s} v={s} active={filters.signal === s}
-            onClick={() => onChange({ ...filters, signal: s })} />
-        ))}
-      </div>
-      <div style={{ display: "flex", gap: 3, alignItems: "center" }}>
-        <span style={{ fontFamily: C.mono, fontSize: 8, color: C.t2, marginRight: 3 }}>GRADE</span>
-        {["All","A+","A","B","C"].map(g => (
-          <Btn key={g} v={g} active={filters.grade === g}
-            onClick={() => onChange({ ...filters, grade: g })} />
-        ))}
-      </div>
-    </div>
-  );
-};
-
-/* ══════════════════════════════════════════════════════
-   MAIN DASHBOARD
-══════════════════════════════════════════════════════ */
-export default function Dashboard() {
-  const [signals,   setSignals]   = useState([]);
-  const [loading,   setLoading]   = useState(true);
-  const [error,     setError]     = useState(null);
-  const [lastUpd,   setLastUpd]   = useState(null);
-  const [countdown, setCountdown] = useState(30);
-  const [strategy,  setStrategy]  = useState("bot");
-  const [filters,   setFilters]   = useState({ market: "All", signal: "All", grade: "All" });
-
-  useEffect(() => { injectGlobals(); }, []);
-
-  const fetchSignals = useCallback(async () => {
-    try {
-      const r = await api(`/api/signals?strategy=${strategy}`);
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      const d = await r.json();
-      setSignals(d.signals || []);
-      setLastUpd(new Date().toLocaleTimeString());
-      setError(null);
-    } catch (e) {
-      setError(e.message);
-    } finally {
-      setLoading(false);
-      setCountdown(30);
-    }
-  }, [strategy]);
-
-  useEffect(() => {
-    fetchSignals();
-    const iv = setInterval(fetchSignals, 30_000);
-    return () => clearInterval(iv);
-  }, [fetchSignals]);
-
-  useEffect(() => {
-    const t = setInterval(() => setCountdown(c => Math.max(0, c - 1)), 1000);
-    return () => clearInterval(t);
-  }, []);
-
-  const [utc, setUtc] = useState("");
-  useEffect(() => {
-    const upd = () => setUtc(new Date().toUTCString().slice(17, 25));
-    upd();
-    const t = setInterval(upd, 1000);
-    return () => clearInterval(t);
-  }, []);
-
-  const hour = new Date().getUTCHours();
-  const currentSession = hour >= 7 && hour < 12 ? "London"
-    : hour >= 12 && hour < 21 ? "New York" : "Asia";
-
-  const filtered = signals.filter(s => {
-    if (filters.market !== "All" && s.market !== filters.market) return false;
-    if (filters.signal !== "All" && s.signal !== filters.signal) return false;
-    if (filters.grade  !== "All" && s.quality !== filters.grade) return false;
-    return true;
-  });
-
-  return (
-    <div style={{ background: C.bg0, minHeight: "100vh", fontFamily: C.ui }}>
-
-      {/* ── Sticky header ── */}
-      <div style={{
-        background: C.bg1, borderBottom: `1px solid ${C.bdr}`,
-        padding: "10px 20px",
-        display: "flex", justifyContent: "space-between", alignItems: "center",
-        position: "sticky", top: 0, zIndex: 200,
-        backdropFilter: "blur(8px)",
-      }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
-          <div style={{ fontFamily: C.mono, fontSize: 14, fontWeight: 800, color: C.t0 }}>
-            <span style={{ color: C.buy }}>▸</span> TRADING TERMINAL
-          </div>
-          {/* Live dot */}
-          <span className="live-dot" style={{
-            display: "inline-block", width: 6, height: 6, borderRadius: "50%",
-            background: C.buy,
-          }} />
-          <select value={strategy} onChange={e => setStrategy(e.target.value)} style={{
-            fontFamily: C.mono, fontSize: 9, padding: "4px 8px", borderRadius: 5,
-            background: C.bg3, border: `1px solid ${C.bdr}`, color: C.t1,
-            cursor: "pointer",
-          }}>
-            <option value="bot">SMC Bot</option>
-            <option value="basic">Basic Momentum</option>
-            <option value="ema_rsi">EMA / RSI</option>
-          </select>
-        </div>
-
-        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-          <span style={{
-            fontFamily: C.mono, fontSize: 9,
-            padding: "3px 8px", borderRadius: 4,
-            background: sessionCol(currentSession) + "22",
-            color: sessionCol(currentSession),
-            border: `1px solid ${sessionCol(currentSession)}40`,
-          }}>{currentSession}</span>
-          <span style={{ fontFamily: C.mono, fontSize: 10, color: C.t2 }}>{utc} UTC</span>
-          <span style={{ fontFamily: C.mono, fontSize: 9, color: loading ? C.gold : C.t2 }}>
-            {loading ? "Updating…" : `↻ ${countdown}s`}
-          </span>
-          <button onClick={fetchSignals} disabled={loading} style={{
-            fontFamily: C.mono, fontSize: 9, padding: "5px 12px", borderRadius: 5,
-            background: C.bg3, border: `1px solid ${C.bdr}`, color: C.t1,
-            cursor: loading ? "wait" : "pointer",
-          }}>
-            ↻ Refresh
+        <div style={{display:"flex",alignItems:"center",gap:12}}>
+          {lastUpd&&<span style={{fontFamily:MONO,fontSize:10,color:T.t2}}>{lastUpd.toLocaleTimeString()}</span>}
+          <button onClick={()=>load(true)} disabled={refreshing}
+            style={{background:T.bg3,border:`1px solid ${T.border}`,color:refreshing?T.t2:T.text,
+              borderRadius:3,padding:"5px 12px",cursor:"pointer",fontFamily:MONO,fontSize:10,letterSpacing:1,
+              display:"flex",alignItems:"center",gap:5}}>
+            <RefreshCw size={11} style={{animation:refreshing?"spin 1s linear infinite":"none"}}/>
+            {refreshing?"…":"REFRESH"}
           </button>
         </div>
       </div>
 
-      {/* ── Content ── */}
-      <div style={{ padding: "18px 20px", maxWidth: 1800 }}>
-        {error && (
-          <div style={{
-            padding: "10px 14px", borderRadius: 7, marginBottom: 14,
-            background: C.sell + "12", border: `1px solid ${C.sell}40`,
-            fontFamily: C.mono, fontSize: 10, color: C.sell,
-          }}>⚠ {error}</div>
-        )}
+      {/* FILTER BAR */}
+      <div style={{background:T.bg2,borderBottom:`1px solid ${T.border}`,
+        padding:"8px 20px",display:"flex",gap:10,flexWrap:"wrap",alignItems:"center"}}>
+        <div style={{display:"flex",gap:3}}>
+          {["all","crypto","forex","stocks","commodities"].map(f=>(
+            <FBtn key={f} label={f.toUpperCase()} active={filter===f} color={T.blue} onClick={()=>setFilter(f)}/>
+          ))}
+        </div>
+        <div style={{width:1,height:18,background:T.border}}/>
+        <div style={{display:"flex",gap:3}}>
+          {[["bot","SMC BOT"],["basic","BASIC"],["ema_rsi","EMA/RSI"]].map(([v,l])=>(
+            <FBtn key={v} label={l} active={strategy===v} color={T.purple} onClick={()=>setStrategy(v)}/>
+          ))}
+        </div>
+        <span style={{marginLeft:"auto",fontFamily:MONO,fontSize:10,color:T.t2}}>
+          {shown.length} SIGNALS
+        </span>
+      </div>
 
-        <StatsBar signals={signals} />
-        <FilterBar filters={filters} onChange={setFilters} />
-
-        {loading && !signals.length ? (
-          <div style={{ textAlign: "center", padding: 60, fontFamily: C.mono, color: C.t2 }}>
-            <div style={{ fontSize: 28, animation: "spin 1s linear infinite", display: "inline-block", marginBottom: 10 }}>⟳</div>
-            <div>Fetching live signals…</div>
-          </div>
-        ) : filtered.length === 0 ? (
-          <div style={{ textAlign: "center", padding: 40, fontFamily: C.mono, color: C.t2 }}>
-            No signals match current filters.
-          </div>
-        ) : (
-          <div style={{
-            display: "grid",
-            gridTemplateColumns: "repeat(auto-fill, minmax(310px, 1fr))",
-            gap: 12,
-          }}>
-            {filtered.map(s => <SignalCard key={s.symbol} s={s} />)}
-          </div>
-        )}
-
-        {lastUpd && (
-          <div style={{ textAlign: "right", marginTop: 14, fontFamily: C.mono, fontSize: 9, color: C.t2 }}>
-            Last updated: {lastUpd}
+      {/* SIGNAL GRID */}
+      <div style={{padding:"18px 20px"}}>
+        {loading&&<Spinner/>}
+        {error&&<ErrBox msg={error}/>}
+        {!loading&&!error&&(
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(345px,1fr))",gap:14}}>
+            {shown.map(s=>(
+              <SignalCard key={s.symbol} s={s}
+                expanded={expanded===s.symbol}
+                flash={flashing[s.symbol]}
+                onExpand={()=>setExpanded(expanded===s.symbol?null:s.symbol)}/>
+            ))}
+            {shown.length===0&&(
+              <div style={{gridColumn:"1/-1",textAlign:"center",padding:60,
+                color:T.t2,fontFamily:MONO,fontSize:12}}>
+                NO SIGNALS MATCH FILTER
+              </div>
+            )}
           </div>
         )}
       </div>
     </div>
   );
 }
+
+// ── SIGNAL CARD ───────────────────────────────────────────────────────────────
+function SignalCard({s, expanded, onExpand, flash}){
+  const buy  = s.signal==="BUY";
+  const sell = s.signal==="SELL";
+  const dir  = buy?T.green:sell?T.red:T.border;
+  const qc   = qColor(s.quality);
+  const fc   = flash==="up"?T.green:flash==="dn"?T.red:null;
+
+  return (
+    <div style={{background:T.bg3,border:`1px solid ${dir}44`,borderLeft:`3px solid ${buy||sell?dir:T.border}`,
+      borderRadius:6,overflow:"hidden",
+      boxShadow:buy||sell?`0 0 22px ${dir}15`:"none",transition:"box-shadow .3s"}}>
+
+      {/* Header row */}
+      <div style={{padding:"13px 15px",display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+        <div>
+          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:5}}>
+            <span style={{fontFamily:MONO,fontSize:17,color:T.text}}>
+              {s.symbol.replace("USDT","")}<span style={{color:T.t2,fontSize:12}}>{s.symbol.endsWith("USDT")?"/USDT":""}</span>
+            </span>
+            <MBadge market={s.market}/>
+          </div>
+          <div style={{display:"flex",gap:5}}>
+            <Chip label={s.regime||"—"} color={T.t2}/>
+            <Chip label={s.session||"—"} color={T.cyan}/>
+            {s.ema_alignment&&<Chip label={s.ema_alignment.split(" ")[0]} color={buy?T.green:sell?T.red:T.t2}/>}
+          </div>
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:9}}>
+          <span style={{fontFamily:MONO,fontSize:20,fontWeight:700,color:qc,textShadow:`0 0 10px ${qc}`}}>
+            {s.quality||"—"}
+          </span>
+          <SigBadge signal={s.signal} dir={dir}/>
+        </div>
+      </div>
+
+      {/* Live price */}
+      <div style={{padding:"0 15px 10px",display:"flex",alignItems:"baseline",gap:10}}>
+        <span style={{fontFamily:MONO,fontSize:22,color:fc||T.text,
+          textShadow:fc?`0 0 12px ${fc}`:"none",transition:"color .4s,text-shadow .4s",
+          animation:flash?"flash .6s ease":"none"}}>
+          {s.price_display||fmtP(s.price)}
+        </span>
+        <span style={{fontFamily:MONO,fontSize:12,color:s.change_pct>=0?T.green:T.red}}>
+          {s.change_pct>=0?"+":""}{fmt(s.change_pct,2)}%
+        </span>
+      </div>
+
+      {/* Confidence bar */}
+      <div style={{padding:"0 15px 11px"}}>
+        <div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}>
+          <span style={{fontFamily:MONO,fontSize:8,color:T.t2,letterSpacing:2}}>CONFIDENCE</span>
+          <span style={{fontFamily:MONO,fontSize:11,color:dir,fontWeight:600}}>{s.confidence}%</span>
+        </div>
+        <div style={{height:3,background:T.bg2,borderRadius:2}}>
+          <div style={{height:"100%",width:`${s.confidence||0}%`,
+            background:`linear-gradient(90deg,${dir}55,${dir})`,borderRadius:2,transition:"width .6s"}}/>
+        </div>
+      </div>
+
+      {/* 4-stat strip */}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",
+        borderTop:`1px solid ${T.border}`,borderBottom:`1px solid ${T.border}`}}>
+        {[
+          ["ADX", fmt(s.adx,1), s.adx>=25?T.green:s.adx>=20?T.gold:T.red,    s.adx>=25?"STRONG":s.adx>=20?"TREND":"WEAK"],
+          ["RSI", fmt(s.rsi,1), s.rsi>70?T.red:s.rsi<30?T.green:T.text,       s.rsi>70?"OB":s.rsi<30?"OS":"NEUTRAL"],
+          ["SMC", `${s.smc_score}/9`, s.smc_score>=7?T.green:s.smc_score>=5?T.gold:T.t2, "SCORE"],
+          ["RR",  getRR(s.entry,s.sl,s.tp), T.gold, "RATIO"],
+        ].map(([lbl,val,c,sub],i)=>(
+          <div key={lbl} style={{background:i%2===0?T.bg2:T.bg3,padding:"7px 8px",textAlign:"center"}}>
+            <div style={{fontFamily:MONO,fontSize:8,color:T.t2,letterSpacing:1,marginBottom:2}}>{lbl}</div>
+            <div style={{fontFamily:MONO,fontSize:13,color:c,fontWeight:500}}>{val}</div>
+            <div style={{fontFamily:MONO,fontSize:7,color:T.t3,marginTop:1}}>{sub}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* SMC confirmation pills */}
+      <div style={{padding:"9px 15px",display:"flex",gap:4,flexWrap:"wrap"}}>
+        <CPill label="SWEEP"   active={!!s.liquidity_sweep} color={T.blue}/>
+        <CPill label="BOS"     active={!!s.bos}             color={T.purple}/>
+        <CPill label="FVG"     active={!!s.fvg_detected}    color={T.gold}/>
+        <CPill label="HTF ALN" active={s.higher_tf_bias===s.bias&&s.bias!=="Neutral"} color={T.cyan}/>
+        <CPill label="SESSION" active={s.session!=="Closed"&&s.session!=="Off-Hours"} color={T.green}/>
+      </div>
+
+      {/* Trade levels */}
+      {s.entry&&s.signal!=="HOLD"&&(
+        <div style={{padding:"8px 15px 10px",borderTop:`1px solid ${T.border}`}}>
+          <div style={{fontFamily:MONO,fontSize:8,color:T.t2,letterSpacing:2,marginBottom:7}}>TRADE LEVELS</div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:5}}>
+            <LBox label="ENTRY"  val={fmtP(s.entry)} color={T.text}/>
+            <LBox label="STOP"   val={fmtP(s.sl)}    color={T.red}/>
+            <LBox label="TARGET" val={fmtP(s.tp)}    color={T.green}/>
+            <LBox label="R:R"    val={getRR(s.entry,s.sl,s.tp)} color={T.gold}/>
+          </div>
+        </div>
+      )}
+
+      {/* Trade idea */}
+      {s.trade_idea&&s.signal!=="HOLD"&&(
+        <div style={{padding:"7px 15px",borderTop:`1px solid ${T.border}`,
+          fontFamily:MONO,fontSize:10,color:T.t2,letterSpacing:.5}}>
+          ↳ {s.trade_idea}
+        </div>
+      )}
+
+      {/* AI expand button */}
+      <button onClick={onExpand}
+        style={{width:"100%",padding:"9px",background:T.bg2,border:"none",
+          borderTop:`1px solid ${T.border}`,color:T.t2,cursor:"pointer",
+          display:"flex",alignItems:"center",justifyContent:"center",gap:5,
+          fontFamily:MONO,fontSize:10,letterSpacing:1,transition:"background .15s,color .15s"}}
+        onMouseEnter={e=>{e.currentTarget.style.background=T.bg4;e.currentTarget.style.color=T.text}}
+        onMouseLeave={e=>{e.currentTarget.style.background=T.bg2;e.currentTarget.style.color=T.t2}}>
+        {expanded?<ChevronUp size={12}/>:<ChevronDown size={12}/>}
+        {expanded?"HIDE AI ANALYSIS":"SHOW AI ANALYSIS"}
+      </button>
+
+      {expanded&&(
+        <div style={{animation:"slide .2s ease",borderTop:`1px solid ${T.border}`}}>
+          <AIPanel s={s}/>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── AI ANALYSIS PANEL ─────────────────────────────────────────────────────────
+function AIPanel({s}){
+  const buy     = s.signal==="BUY";
+  const dir     = buy?T.green:T.red;
+  const passing = (s.reasons||[]).filter(r=>r.startsWith("✓"));
+  const failing = (s.reasons||[]).filter(r=>r.startsWith("✗"));
+  const engine  = s.smc_score>0?"ICT / SMC SETUP":"EMA + ADX FALLBACK";
+
+  return (
+    <div style={{background:T.bg2,padding:15}}>
+      {/* Engine + count */}
+      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12}}>
+        <span style={{fontFamily:MONO,fontSize:8,color:T.t2,letterSpacing:2}}>ENGINE</span>
+        <span style={{fontFamily:MONO,fontSize:9,padding:"2px 8px",borderRadius:2,
+          background:`${T.purple}20`,border:`1px solid ${T.purple}40`,color:T.purple}}>
+          {engine}
+        </span>
+        <span style={{marginLeft:"auto",fontFamily:MONO,fontSize:9,color:T.t2}}>
+          {passing.length}/{passing.length+failing.length} CHECKS PASSED
+        </span>
+      </div>
+
+      {/* Plain-English explanation */}
+      <div style={{background:T.bg3,border:`1px solid ${T.border}`,borderRadius:4,
+        padding:"10px 12px",marginBottom:12}}>
+        <div style={{fontFamily:MONO,fontSize:8,color:T.t2,letterSpacing:2,marginBottom:7}}>
+          WHY THIS SETUP
+        </div>
+        <p style={{margin:0,fontSize:12,color:T.text,lineHeight:1.75,fontFamily:UI}}>
+          {buildExpl(s)}
+        </p>
+      </div>
+
+      {/* Confirmations grid */}
+      <div style={{marginBottom:12}}>
+        <div style={{fontFamily:MONO,fontSize:8,color:T.t2,letterSpacing:2,marginBottom:7}}>
+          CONFIRMATION CHECKLIST
+        </div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:4}}>
+          {passing.map((r,i)=>(
+            <div key={i} style={{display:"flex",alignItems:"center",gap:5,fontFamily:MONO,fontSize:10,color:T.green}}>
+              <CheckCircle size={11}/>{r.slice(2)}
+            </div>
+          ))}
+          {failing.map((r,i)=>(
+            <div key={i} style={{display:"flex",alignItems:"center",gap:5,fontFamily:MONO,fontSize:10,color:T.t3}}>
+              <XCircle size={11}/>{r.slice(2)}
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Confidence breakdown */}
+      <div style={{marginBottom:12}}>
+        <div style={{fontFamily:MONO,fontSize:8,color:T.t2,letterSpacing:2,marginBottom:7}}>
+          CONFIDENCE SCORE BREAKDOWN
+        </div>
+        <CBar label="SMC Alignment (0–20)"  val={Math.round((s.smc_score/9)*20)} max={20} color={dir}/>
+        <CBar label="ADX Strength (0–10)"   val={s.adx>=30?10:s.adx>=25?7:s.adx>=20?4:0} max={10} color={T.blue}/>
+        <CBar label="Volume Surge (0–10)"   val={s.confidence>78?9:s.confidence>70?6:4} max={10} color={T.gold}/>
+        <CBar label="Candle Body (0–10)"    val={s.confidence>82?10:7} max={10} color={T.purple}/>
+        <CBar label="EMA Alignment (0–10)"  val={
+          (s.ema_alignment?.startsWith("Bull")&&buy)||(s.ema_alignment?.startsWith("Bear")&&!buy)?10:0
+        } max={10} color={T.cyan}/>
+      </div>
+
+      {/* Sweep / BOS / FVG cards */}
+      {(s.liquidity_sweep||s.bos||s.fvg_detected)&&(
+        <div style={{display:"flex",gap:5,marginBottom:12}}>
+          {s.liquidity_sweep&&(
+            <div style={{flex:1,background:T.bg3,borderRadius:3,padding:"7px 10px",border:`1px solid ${T.blue}35`}}>
+              <div style={{fontFamily:MONO,fontSize:7,color:T.t2,letterSpacing:1,marginBottom:3}}>LIQUIDITY SWEEP</div>
+              <div style={{fontFamily:MONO,fontSize:11,color:T.blue}}>
+                {s.liquidity_sweep==="BUY_SWEEP"?"↗ Buy-Side":"↘ Sell-Side"}
+              </div>
+            </div>
+          )}
+          {s.bos&&(
+            <div style={{flex:1,background:T.bg3,borderRadius:3,padding:"7px 10px",border:`1px solid ${T.purple}35`}}>
+              <div style={{fontFamily:MONO,fontSize:7,color:T.t2,letterSpacing:1,marginBottom:3}}>BREAK OF STRUCTURE</div>
+              <div style={{fontFamily:MONO,fontSize:11,color:T.purple}}>
+                {s.bos==="BULLISH_BOS"?"↑ Bullish BOS":"↓ Bearish BOS"}
+              </div>
+            </div>
+          )}
+          {s.fvg_detected&&(
+            <div style={{flex:1,background:T.bg3,borderRadius:3,padding:"7px 10px",border:`1px solid ${T.gold}35`}}>
+              <div style={{fontFamily:MONO,fontSize:7,color:T.t2,letterSpacing:1,marginBottom:3}}>FAIR VALUE GAP</div>
+              <div style={{fontFamily:MONO,fontSize:11,color:T.gold}}>
+                {s.fvg_direction==="BUY"?"↗ Bullish FVG":"↘ Bearish FVG"}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Context row */}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:5}}>
+        <IBox label="SESSION"   val={s.session||"—"}/>
+        <IBox label="STRUCTURE" val={(s.structure||"—").replace(" Structure","")}/>
+        <IBox label="HTF BIAS"  val={s.higher_tf_bias||"—"}/>
+        <IBox label="REGIME"    val={s.regime||"—"}/>
+      </div>
+    </div>
+  );
+}
+
+// ── EXPLANATION BUILDER ───────────────────────────────────────────────────────
+function buildExpl(s){
+  const {signal,regime,higher_tf_bias,liquidity_sweep,bos,smc_score,adx,rsi,
+         ema_alignment,confidence,session,quality,min_smc_score}=s;
+  if(signal==="HOLD"){
+    if((adx||0)<20) return`ADX is ${(adx||0).toFixed(1)} — the market has no directional trend. The bot requires ADX ≥ 20 before entering. This filter protects capital in choppy sideways conditions.`;
+    return`Only ${smc_score}/9 SMC conditions aligned (threshold: ${min_smc_score||6}). Missing key confirmations — waiting for a higher-quality setup before risking capital.`;
+  }
+  const dir=signal==="BUY"?"long":"short";
+  const parts=[];
+  if(higher_tf_bias) parts.push(`${s.higher_tf||"higher timeframe"} shows ${higher_tf_bias.toLowerCase()} momentum`);
+  if(liquidity_sweep) parts.push(`a ${liquidity_sweep==="BUY_SWEEP"?"buy-side":"sell-side"} liquidity sweep confirmed institutional interest`);
+  if(bos) parts.push(`a ${bos==="BULLISH_BOS"?"bullish":"bearish"} break of structure validated the directional bias`);
+  if(regime) parts.push(`market is in a "${regime}" regime`);
+  const ctx=parts.length?parts.map((p,i)=>i===0?p[0].toUpperCase()+p.slice(1):p).join(", ")+". ":"";
+  const conf=confidence>=85?"High-conviction setup":confidence>=75?"Moderate-confidence setup":"Lower-confidence — reduce position size";
+  const ema=ema_alignment?.startsWith("Bull")?"EMAs stack bullishly (9>21>50) confirming uptrend.":ema_alignment?.startsWith("Bear")?"EMAs stack bearishly (9<21<50) confirming downtrend.":"EMAs in mixed alignment — trend is developing.";
+  const rsiV=(rsi||50);
+  const rsiStr=rsiV>70?`RSI ${rsiV.toFixed(0)} is overbought — expect the move to be pullback/corrective.`:rsiV<30?`RSI ${rsiV.toFixed(0)} is oversold — potential bounce or reversal.`:`RSI ${rsiV.toFixed(0)} is neutral — momentum aligned with ${dir} direction.`;
+  const adxV=(adx||0);
+  const adxStr=adxV>=25?`ADX ${adxV.toFixed(1)} confirms strong trend.`:adxV>=20?`ADX ${adxV.toFixed(1)} confirms trend is present but still developing.`:`ADX ${adxV.toFixed(1)} is at minimum threshold — reduce trade size.`;
+  return`${ctx}${conf} — ${smc_score}/9 SMC confirmations (${quality||"—"} grade). ${ema} ${rsiStr} ${adxStr} Active session: ${session||"Unknown"}.`;
+}
+
+// ── SMALL COMPONENTS ──────────────────────────────────────────────────────────
+const FBtn=({label,active,color,onClick})=>(
+  <button onClick={onClick} style={{padding:"4px 11px",borderRadius:3,cursor:"pointer",
+    border:`1px solid ${active?color:T.border}`,background:active?`${color}20`:"transparent",
+    color:active?color:T.t2,fontFamily:MONO,fontSize:10,fontWeight:700,letterSpacing:1}}>
+    {label}
+  </button>
+);
+
+const MBadge=({market})=>{
+  const c={crypto:T.gold,forex:T.blue,stocks:T.green,commodities:T.purple}[market]||T.t2;
+  return<span style={{fontFamily:MONO,fontSize:8,padding:"2px 6px",borderRadius:2,letterSpacing:1,
+    background:`${c}18`,border:`1px solid ${c}44`,color:c}}>{(market||"").toUpperCase()}</span>;
+};
+
+const SigBadge=({signal,dir})=>(
+  <div style={{padding:"4px 12px",borderRadius:3,fontFamily:MONO,fontWeight:700,fontSize:12,letterSpacing:2,
+    background:signal==="HOLD"?`${T.t2}15`:`${dir}20`,
+    border:`1px solid ${signal==="HOLD"?T.border:dir+"55"}`,
+    color:signal==="HOLD"?T.t2:dir,
+    textShadow:signal==="HOLD"?"none":`0 0 8px ${dir}`}}>
+    {signal==="BUY"?"▲ BUY":signal==="SELL"?"▼ SELL":"— HOLD"}
+  </div>
+);
+
+const Chip=({label,color})=>(
+  <span style={{fontFamily:MONO,fontSize:8,padding:"1px 5px",borderRadius:2,letterSpacing:1,
+    background:`${color}15`,border:`1px solid ${color}35`,color}}>{label}</span>
+);
+
+const CPill=({label,active,color})=>(
+  <span style={{fontFamily:MONO,fontSize:8,padding:"2px 7px",borderRadius:2,letterSpacing:1,
+    background:active?`${color}18`:T.bg,border:`1px solid ${active?color+"50":T.border}`,
+    color:active?color:T.t3}}>
+    {active?"✓":"✗"} {label}
+  </span>
+);
+
+const LBox=({label,val,color})=>(
+  <div style={{background:T.bg,borderRadius:3,padding:"5px 7px",textAlign:"center"}}>
+    <div style={{fontFamily:MONO,fontSize:8,color:T.t2,letterSpacing:1,marginBottom:2}}>{label}</div>
+    <div style={{fontFamily:MONO,fontSize:11,color,fontWeight:500}}>{val}</div>
+  </div>
+);
+
+const CBar=({label,val,max,color})=>(
+  <div style={{display:"flex",alignItems:"center",gap:9,marginBottom:5}}>
+    <span style={{fontFamily:MONO,fontSize:9,color:T.t2,width:160,flexShrink:0}}>{label}</span>
+    <div style={{flex:1,height:3,background:T.bg,borderRadius:2}}>
+      <div style={{height:"100%",width:`${Math.max(0,Math.min(100,(val/max)*100))}%`,
+        background:color,borderRadius:2,transition:"width .5s"}}/>
+    </div>
+    <span style={{fontFamily:MONO,fontSize:9,color,width:30,textAlign:"right"}}>{val}/{max}</span>
+  </div>
+);
+
+const IBox=({label,val})=>(
+  <div style={{background:T.bg,borderRadius:3,padding:"6px 8px",textAlign:"center"}}>
+    <div style={{fontFamily:MONO,fontSize:8,color:T.t2,letterSpacing:1,marginBottom:2}}>{label}</div>
+    <div style={{fontFamily:MONO,fontSize:10,color:T.t2}}>{val}</div>
+  </div>
+);
+
+const Spinner=()=>(
+  <div style={{display:"flex",flexDirection:"column",alignItems:"center",
+    justifyContent:"center",height:280,gap:14,color:T.t2}}>
+    <div style={{width:36,height:36,border:`2px solid ${T.border}`,
+      borderTop:`2px solid ${T.blue}`,borderRadius:"50%",animation:"spin 1s linear infinite"}}/>
+    <span style={{fontFamily:MONO,fontSize:11,letterSpacing:3}}>FETCHING SIGNALS…</span>
+  </div>
+);
+
+const ErrBox=({msg})=>(
+  <div style={{background:`${T.red}12`,border:`1px solid ${T.red}40`,borderRadius:5,
+    padding:14,color:T.red,fontFamily:MONO,fontSize:12}}>⚠ {msg}</div>
+);
