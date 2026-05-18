@@ -1,75 +1,49 @@
 /**
- * src/utils/api.js
- *
- * Central API configuration.
- * Set VITE_API_URL (Vite) or REACT_APP_API_URL (CRA) in your Render env vars
- * to point at the Flask backend.
- *
- * Example: VITE_API_URL=https://your-flask-app.onrender.com
- *
- * In development with a proxy configured in vite.config.js or package.json
- * you can leave these unset (falls back to same-origin "").
+ * src/utils/api.js — NexusBot
+ * CRA / craco compatible. No import.meta (Vite-only).
+ * Set REACT_APP_API_URL in Vercel/Render env vars.
+ * Example: REACT_APP_API_URL=https://your-flask.onrender.com
  */
-
-export const API_BASE =
-  (typeof import.meta !== "undefined" && import.meta.env?.VITE_API_URL) ||
-  (typeof process !== "undefined" && process.env?.REACT_APP_API_URL) ||
-  "";
+export const API_BASE = process.env.REACT_APP_API_URL || "";
 
 /**
- * Wrapper around fetch that:
- * 1. Prepends API_BASE to the URL
- * 2. Attaches the auth token header automatically
- * 3. Reads the body ONCE (fixes "body stream already read" error)
- * 4. Throws a proper Error if the response is not JSON or not ok
- *
- * Usage:
- *   const data = await apiFetch("/api/signals?strategy=bot");
- *   const data = await apiFetch("/api/backtest", { method: "POST", body: JSON.stringify(payload) });
+ * Fetch wrapper — attaches auth token, reads body ONCE, throws on error.
+ * Returns parsed JSON. Never returns a Response object.
  */
 export async function apiFetch(path, options = {}) {
   const token = localStorage.getItem("token");
   const headers = {
     "Content-Type": "application/json",
-    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    ...(token ? { Authorization: "Bearer " + token } : {}),
     ...(options.headers || {}),
   };
 
-  const url = `${API_BASE}${path}`;
-
+  const url = API_BASE + path;
   let response;
   try {
     response = await fetch(url, { ...options, headers });
-  } catch (networkError) {
-    throw new Error(`Network error — is the backend running? (${networkError.message})`);
+  } catch (err) {
+    throw new Error("Network error — is the backend reachable? (" + err.message + ")");
   }
 
-  // Read body exactly once
-  const contentType = response.headers.get("content-type") || "";
+  const ct = response.headers.get("content-type") || "";
   let data;
-
-  if (contentType.includes("application/json")) {
+  if (ct.includes("application/json")) {
     data = await response.json();
   } else {
-    // If we get HTML back, the backend URL is wrong — give a helpful error
     const text = await response.text();
     if (text.trim().startsWith("<")) {
       throw new Error(
-        `API returned HTML instead of JSON. ` +
-        `Check that VITE_API_URL is set correctly in Render environment variables ` +
-        `and points to your Flask backend. URL tried: ${url}`
+        "API returned HTML — set REACT_APP_API_URL in your Vercel environment variables " +
+        "to point at your Flask backend. Tried: " + url
       );
     }
-    try {
-      data = JSON.parse(text);
-    } catch {
-      throw new Error(`Unexpected response from server: ${text.slice(0, 120)}`);
-    }
+    try { data = JSON.parse(text); }
+    catch { throw new Error("Unexpected response: " + text.slice(0, 100)); }
   }
 
   if (!response.ok) {
-    throw new Error(data?.error || data?.message || `HTTP ${response.status}`);
+    throw new Error((data && (data.error || data.message)) || "HTTP " + response.status);
   }
-
   return data;
 }
