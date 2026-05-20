@@ -865,17 +865,27 @@ def detect_break_of_structure(df):
 
 
 def price_in_discount_zone(df):
+    """Price ≤ 38.2% Fibonacci level of the 30-bar range (true discount territory)."""
     if df is None or len(df) < 30:
         return False
-    rh, rl = df["high"].tail(30).max(), df["low"].tail(30).min()
-    return df.iloc[-1]["close"] <= (rh + rl) / 2
+    rh  = df["high"].tail(30).max()
+    rl  = df["low"].tail(30).min()
+    rng = rh - rl
+    if rng <= 0:
+        return False
+    return df.iloc[-1]["close"] <= rl + rng * 0.382
 
 
 def price_in_premium_zone(df):
+    """Price ≥ 61.8% Fibonacci level of the 30-bar range (true premium territory)."""
     if df is None or len(df) < 30:
         return False
-    rh, rl = df["high"].tail(30).max(), df["low"].tail(30).min()
-    return df.iloc[-1]["close"] >= (rh + rl) / 2
+    rh  = df["high"].tail(30).max()
+    rl  = df["low"].tail(30).min()
+    rng = rh - rl
+    if rng <= 0:
+        return False
+    return df.iloc[-1]["close"] >= rl + rng * 0.618
 
 
 # ── Section 5: extended FVG lookback with interval param ──────────────────
