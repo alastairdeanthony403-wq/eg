@@ -18,7 +18,7 @@ export default function Login({ mode = "login" }) {
       else await login(form.email, form.password);
       nav("/dashboard");
     } catch (e) {
-      setErr(e?.response?.data?.error || "Failed");
+      setErr(e.message || "Failed");
     }
   };
 
