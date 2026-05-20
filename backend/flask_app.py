@@ -719,15 +719,53 @@ def get_structure(df):
 
 
 def get_market_regime(df):
-    if df is None or len(df) < 20:
+    """
+    6-state regime classifier using ADX, EMA slope, and volatility ratio.
+    States: Strong Bull | Strong Bear | Trending Bull | Trending Bear |
+            High Volatility | Active | Range / Quiet | Unknown
+    """
+    if df is None or len(df) < 50:
         return "Unknown"
-    rh  = df["high"].tail(20).max()
-    rl  = df["low"].tail(20).min()
-    avg = df["close"].tail(20).mean()
-    if avg == 0:
+    try:
+        closes   = df["close"]
+        highs_l  = df["high"].tolist()
+        lows_l   = df["low"].tolist()
+        closes_l = closes.tolist()
+
+        # ATR-based volatility ratio vs 50-bar history
+        atr_s     = _atr_series(highs_l, lows_l, closes_l, 14)
+        valid_atr = [v for v in atr_s if v is not None]
+        if len(valid_atr) >= 20:
+            cur_atr   = valid_atr[-1]
+            hist_avg  = sum(valid_atr[-50:]) / len(valid_atr[-50:])
+            vol_ratio = cur_atr / hist_avg if hist_avg > 0 else 1.0
+        else:
+            vol_ratio = 1.0
+
+        # EMA slope for direction
+        ema20    = closes.ewm(span=20, adjust=False).mean()
+        ema50    = closes.ewm(span=50, adjust=False).mean()
+        e20_now  = float(ema20.iloc[-1])
+        e20_prev = float(ema20.iloc[-5])
+        e50_now  = float(ema50.iloc[-1])
+        going_up = e20_now > e50_now and e20_now > e20_prev
+        going_dn = e20_now < e50_now and e20_now < e20_prev
+
+        adx = calculate_adx(df)
+
+        if vol_ratio > 2.0:
+            return "High Volatility"        # turbulence — gate everything
+        if adx >= 30:
+            if going_up: return "Strong Bull"
+            if going_dn: return "Strong Bear"
+            return "Trending"
+        if adx >= 20:
+            if going_up: return "Trending Bull"
+            if going_dn: return "Trending Bear"
+            return "Active"
+        return "Range / Quiet"
+    except Exception:
         return "Unknown"
-    rng = ((rh - rl) / avg) * 100
-    return "Trending" if rng > 2.5 else "Active" if rng > 1.0 else "Range / Quiet"
 
 
 # ── Section 2: ATR calculation (pandas-based) ─────────────────────────────
@@ -1035,6 +1073,17 @@ def evaluate_bot_window(df, strategy="bot", symbol="BTCUSDT", interval="5m",
             "reasons": [f"ADX {adx:.1f} < 20 — no trend, signal blocked"],
         }
 
+    # ── Turbulence gate — extreme volatility blocks all new signals ────
+    if regime == "High Volatility":
+        return {
+            "signal": "HOLD", "bias": "Neutral", "structure": structure,
+            "regime": regime, "confidence": 35, "adx": adx,
+            "trade_idea": "High-volatility turbulence detected — new signals paused",
+            "higher_tf": higher_tf, "higher_tf_bias": higher_tf_bias,
+            "liquidity_sweep": sweep, "bos": bos, "smc_score": 0,
+            "reasons": ["ATR ratio >2× historical average — turbulence gate active"],
+        }
+
     final, idea, smc_score, confidence, reasons = \
         "HOLD", "Wait for clearer confirmation", 0, 50, []
 
@@ -1060,10 +1109,14 @@ def evaluate_bot_window(df, strategy="bot", symbol="BTCUSDT", interval="5m",
 
     else:   # smart_money / bot
         # ── Section 8: dynamic SMC threshold ─────────────────────────
-        if regime == "Trending":
-            dynamic_min = max(7, cfg["min_smc_score"] - 1)   # easier in clear trends
+        if regime in ["Strong Bull", "Strong Bear"]:
+            dynamic_min = max(7, cfg["min_smc_score"] - 1)    # strong trend → slightly easier
+        elif regime in ["Trending Bull", "Trending Bear", "Trending"]:
+            dynamic_min = cfg["min_smc_score"]                 # normal threshold
+        elif regime == "High Volatility":
+            dynamic_min = cfg["min_smc_score"] + 2             # turbulence → very strict
         elif regime in ["Range / Quiet", "Unknown"]:
-            dynamic_min = cfg["min_smc_score"] + 1            # harder in ranging
+            dynamic_min = cfg["min_smc_score"] + 1             # ranging → harder
         else:
             dynamic_min = cfg["min_smc_score"]
 
@@ -1097,7 +1150,7 @@ def evaluate_bot_window(df, strategy="bot", symbol="BTCUSDT", interval="5m",
             ("Price in discount zone",                 price_in_discount_zone(df)),
             ("FVG retracement long",                   detect_fvg_retrace(df, "BUY", interval)),
             (f"Confidence ≥ {cfg['min_confidence']}%", prelim_conf >= cfg["min_confidence"]),
-            ("Trending / active regime",               regime not in ["Range / Quiet", "Unknown"]),
+            ("Trending / active regime",               regime not in ["Range / Quiet", "Unknown", "High Volatility"]),
             ("Clear structure (not range)",            structure != "Range / Mixed"),
             ("Active session window",                  session_allowed(cfg)),
             (f"RSI not overbought (RSI {rsi_now:.0f} < 65)", rsi_now < 65),
@@ -1110,7 +1163,7 @@ def evaluate_bot_window(df, strategy="bot", symbol="BTCUSDT", interval="5m",
             ("Price in premium zone",                  price_in_premium_zone(df)),
             ("FVG retracement short",                  detect_fvg_retrace(df, "SELL", interval)),
             (f"Confidence ≥ {cfg['min_confidence']}%", prelim_conf >= cfg["min_confidence"]),
-            ("Trending / active regime",               regime not in ["Range / Quiet", "Unknown"]),
+            ("Trending / active regime",               regime not in ["Range / Quiet", "Unknown", "High Volatility"]),
             ("Clear structure (not range)",            structure != "Range / Mixed"),
             ("Active session window",                  session_allowed(cfg)),
             (f"RSI not oversold (RSI {rsi_now:.0f} > 35)",   rsi_now > 35),
@@ -1823,6 +1876,28 @@ def _rsi_series(values, period=14):
         avg_l = (avg_l * (period - 1) + losses[i]) / period
         result.append(100 - 100 / (1 + avg_g / avg_l) if avg_l else 100.0)
     return result
+
+
+def _kelly_fraction(trades, default=0.01, cap=0.03):
+    """
+    Half-Kelly position-sizing fraction from a list of {'pnl': float} dicts.
+    Requires at least 10 closed trades; falls back to `default` otherwise.
+    Returns a float (e.g. 0.015 = 1.5% of account per trade).
+    """
+    if not trades or len(trades) < 10:
+        return default
+    wins   = [t["pnl"] for t in trades if t.get("pnl", 0) > 0]
+    losses = [abs(t["pnl"]) for t in trades if t.get("pnl", 0) <= 0]
+    if not wins or not losses:
+        return default
+    w_rate  = len(wins) / len(trades)
+    avg_win = sum(wins)  / len(wins)
+    avg_los = sum(losses)/ len(losses)
+    if avg_los == 0:
+        return default
+    b     = avg_win / avg_los            # payoff ratio
+    kelly = (w_rate * b - (1 - w_rate)) / b
+    return max(0.005, min(cap, kelly / 2.0))   # half-Kelly, capped at `cap`
 
 
 def _adx_series(highs, lows, closes, period=14):
@@ -2960,12 +3035,19 @@ def stats():
     c.execute(
         "SELECT pnl FROM trades WHERE user_id=%s AND status='CLOSED'",
         (g.user_id,))
-    pnls   = [float(r[0] or 0) for r in c.fetchall()]
+    rows   = c.fetchall()
     conn.close()
+    pnls   = [float(r[0] or 0) for r in rows]
     total  = len(pnls)
     wins   = [p for p in pnls if p > 0]
     losses = [p for p in pnls if p < 0]
     cfg    = get_user_config()
+    kelly  = _kelly_fraction(
+        [{"pnl": p} for p in pnls],
+        default=cfg.get("risk_percent", 1) / 100,
+    )
+    avg_win  = round(sum(wins)  / len(wins),   2) if wins   else 0
+    avg_loss = round(sum(losses)/ len(losses), 2) if losses else 0
     return jsonify({
         "total_trades":     total,
         "wins":             len(wins),
@@ -2974,6 +3056,78 @@ def stats():
         "net_pnl":          round(sum(pnls), 2),
         "balance":          round(cfg["starting_balance"] + sum(pnls), 2),
         "starting_balance": cfg["starting_balance"],
+        "avg_win":          avg_win,
+        "avg_loss":         avg_loss,
+        "kelly_fraction":   round(kelly * 100, 2),   # expressed as % of account
+        "kelly_note":       "Half-Kelly — suggested max risk % per trade",
+    })
+
+
+# ─────────────────────────────────────────────
+# MONTE CARLO SIMULATION
+# ─────────────────────────────────────────────
+
+@app.route("/api/monte-carlo", methods=["POST", "OPTIONS"])
+@auth_required
+def monte_carlo():
+    """
+    Block-bootstrap Monte Carlo over a list of trade PnL values.
+    Body: { "pnl_list": [...], "starting_balance": 10000, "iterations": 5000 }
+    Uses blocks of 5 trades to preserve serial correlation.
+    """
+    body      = request.get_json(silent=True) or {}
+    pnl_list  = [float(x) for x in body.get("pnl_list", [])]
+    balance0  = float(body.get("starting_balance", 10000))
+    iters     = min(int(body.get("iterations", 5000)), 10000)
+
+    if len(pnl_list) < 5:
+        return jsonify({"error": "Need at least 5 trades"}), 400
+
+    import random as _rnd
+    n           = len(pnl_list)
+    block_size  = 5
+    finals      = []
+    max_dds     = []
+
+    for _ in range(iters):
+        sample = []
+        while len(sample) < n:
+            start = _rnd.randint(0, max(0, n - block_size))
+            sample.extend(pnl_list[start:start + block_size])
+        sample = sample[:n]
+
+        bal  = balance0
+        peak = bal
+        mdd  = 0.0
+        for pnl in sample:
+            bal += pnl
+            if bal > peak:
+                peak = bal
+            dd = (peak - bal) / peak if peak > 0 else 0.0
+            if dd > mdd:
+                mdd = dd
+        finals.append(bal)
+        max_dds.append(mdd * 100)
+
+    finals.sort()
+    max_dds.sort()
+
+    def pct(lst, p):
+        return round(lst[max(0, min(int(len(lst) * p / 100), len(lst) - 1))], 2)
+
+    return jsonify({
+        "iterations":          iters,
+        "starting_balance":    balance0,
+        "mean_final":          round(sum(finals) / len(finals), 2),
+        "median_final":        pct(finals, 50),
+        "p10_final":           pct(finals, 10),
+        "p25_final":           pct(finals, 25),
+        "p75_final":           pct(finals, 75),
+        "p90_final":           pct(finals, 90),
+        "profit_probability":  round(sum(1 for b in finals if b > balance0) / iters * 100, 1),
+        "ruin_probability":    round(sum(1 for b in finals if b < balance0 * 0.5) / iters * 100, 1),
+        "median_max_drawdown": pct(max_dds, 50),
+        "p90_max_drawdown":    pct(max_dds, 90),
     })
 
 
