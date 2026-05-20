@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import api from "@/lib/api";
+import { apiFetch, API_BASE } from "@/lib/api";
 import { Save, Settings as SettingsIcon, Shield, Brain, Globe } from "lucide-react";
 
 // FIX 6: All 18 symbols across all markets — was only showing 4 crypto

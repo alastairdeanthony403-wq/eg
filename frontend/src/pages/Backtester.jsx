@@ -4,7 +4,7 @@
  * strategy comparison, learn-from-mistakes panel, historical metadata.
  * FIX: response body is read exactly once — no "body stream already read" error.
  */
-import { apiFetch } from "../utils/api";
+import { apiFetch } from "../lib/api";
 import { useState, useEffect, useCallback } from "react";
 import {
   AreaChart, Area, BarChart, Bar,
@@ -158,7 +158,7 @@ export default function Backtester() {
   };
 
   // ── Learn from mistakes ─────────────────────────────────────────────────────
-  const runLearn = async () => {
+  const handleRunLearn = async () => {
   setLearning(true);
   try {
     const d = await apiFetch("/api/learn", {
@@ -365,7 +365,7 @@ export default function Backtester() {
                     to reduce future losses.
                   </p>
                 </div>
-                <button onClick={runLearn} disabled={learning}
+                <button onClick={handleRunLearn} disabled={learning}>
                   style={{background:`${T.purple}18`,border:`1px solid ${T.purple}44`,color:T.purple,
                     borderRadius:4,padding:"9px 20px",cursor:"pointer",fontFamily:MONO,fontSize:11,
                     letterSpacing:1,whiteSpace:"nowrap",flexShrink:0,display:"flex",alignItems:"center",gap:6}}>

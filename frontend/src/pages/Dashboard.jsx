@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from "react";
-import api from "@/lib/api";
+import { apiFetch, API_BASE } from "@/lib/api";
 import { createChart, CandlestickSeries } from "lightweight-charts";
 import { ArrowUpRight, ArrowDownRight, Minus, Zap, RefreshCw, CheckCircle2, XCircle, BookmarkPlus } from "lucide-react";
 
