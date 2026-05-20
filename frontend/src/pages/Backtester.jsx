@@ -84,6 +84,7 @@ export default function Backtester() {
   const PAGE = 20;
 
   const token = localStorage.getItem("token");
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   const hdrs  = { "Content-Type":"application/json", Authorization:`Bearer ${token}` };
 
   // ── Run backtest ────────────────────────────────────────────────────────────
@@ -105,12 +106,13 @@ export default function Backtester() {
   };
 
   // ── Load run history ────────────────────────────────────────────────────────
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   const loadHistory = useCallback(async () => {
     try {
       const r = await apiFetch("/api/backtest-runs", {headers:hdrs});
       if(r.ok) setHistory(Array.isArray(d)?d:[]);
     } catch{}
-  },[]);
+  }, [hdrs]);
 
   // ── Load learn history ──────────────────────────────────────────────────────
   const loadLearnHistory = useCallback(async () => {
@@ -118,9 +120,10 @@ export default function Backtester() {
       const r = await apiFetch("/api/learn/history", {headers:hdrs});
       if(r.ok) setLearnHistory(d.history||[]);
     } catch{}
-  },[]);
+  }, [hdrs]);
 
   // ── Strategy comparison ─────────────────────────────────────────────────────
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   const runCompare = async () => {
     setComparing(true);
     setCompare(null);
@@ -176,7 +179,11 @@ export default function Backtester() {
   }
 };
 
-  useEffect(()=>{ loadHistory(); loadLearnHistory(); },[]);
+  useEffect(() => {
+    loadHistory();
+    loadLearnHistory();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hdrs]);
 
   // ── Derived data ────────────────────────────────────────────────────────────
   const trades    = result?.trades || [];
