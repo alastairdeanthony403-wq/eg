@@ -851,15 +851,67 @@ def detect_liquidity_sweep(df):
     return None
 
 
+def _find_swing_pivots(df, lookback=50, pivot_bars=3):
+    """
+    Return (last_swing_high, last_swing_low) — the most recent confirmed
+    pivot high and pivot low in the prior `lookback` bars (current bar excluded).
+
+    A pivot high requires all `pivot_bars` bars on EACH side to have a
+    strictly lower high.  A pivot low requires all `pivot_bars` bars on
+    each side to have a strictly higher low.  Scans newest-first so we
+    always return the most recent confirmed pivots.
+    """
+    if df is None or len(df) < pivot_bars * 2 + 3:
+        return None, None
+
+    end   = len(df) - 1                        # exclude current bar
+    start = max(0, end - lookback)
+    window = df.iloc[start:end].reset_index(drop=True)
+    n = len(window)
+
+    last_sh = last_sl = None
+
+    for i in range(n - pivot_bars - 1, pivot_bars - 1, -1):
+        h = float(window.iloc[i]["high"])
+        l = float(window.iloc[i]["low"])
+
+        if last_sh is None:
+            left_h  = window["high"].iloc[i - pivot_bars : i]
+            right_h = window["high"].iloc[i + 1 : i + pivot_bars + 1]
+            if (left_h < h).all() and (right_h < h).all():
+                last_sh = h
+
+        if last_sl is None:
+            left_l  = window["low"].iloc[i - pivot_bars : i]
+            right_l = window["low"].iloc[i + 1 : i + pivot_bars + 1]
+            if (left_l > l).all() and (right_l > l).all():
+                last_sl = l
+
+        if last_sh is not None and last_sl is not None:
+            break
+
+    return last_sh, last_sl
+
+
 def detect_break_of_structure(df):
-    if df is None or len(df) < 30:
+    """
+    Bullish BOS: current close breaks above the most recent confirmed
+    swing-high pivot (3-bar confirmation, 50-bar lookback).
+    Bearish BOS: current close breaks below the most recent confirmed
+    swing-low pivot.
+
+    Unlike a simple range-max check this won't fire every bar in a
+    trending market — it requires a genuine structural level to be broken.
+    """
+    if df is None or len(df) < 20:
         return None
-    rh    = df["high"].iloc[-15:-1].max()
-    rl    = df["low"].iloc[-15:-1].min()
-    close = df.iloc[-1]["close"]
-    if close > rh:
+
+    swing_high, swing_low = _find_swing_pivots(df, lookback=50, pivot_bars=3)
+    close = float(df.iloc[-1]["close"])
+
+    if swing_high is not None and close > swing_high:
         return "BULLISH_BOS"
-    if close < rl:
+    if swing_low  is not None and close < swing_low:
         return "BEARISH_BOS"
     return None
 
