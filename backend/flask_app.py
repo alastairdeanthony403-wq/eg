@@ -1689,9 +1689,13 @@ def run_simple_ma_strategy(candles, starting_balance=1000,
         return trades, balance
 
     closes = [float(c[4]) for c in candles]
+    highs  = [float(c[2]) for c in candles]
+    lows   = [float(c[3]) for c in candles]
 
     def sma(arr, n):
         return sum(arr[-n:]) / n if len(arr) >= n else None
+
+    atr_all = _atr_series(highs, lows, closes, 14)
 
     position = None
 
@@ -1707,26 +1711,32 @@ def run_simple_ma_strategy(candles, starting_balance=1000,
 
         price      = closes[i]
         entry_time = _ts_to_str(candles[i][0])
+        atr        = atr_all[i] if (atr_all and i < len(atr_all) and atr_all[i]) else price * 0.003
 
         if position is None:
             crossed_up   = prev_fast <= prev_slow and fast > slow
             crossed_down = prev_fast >= prev_slow and fast < slow
             if crossed_up:
-                ep = price * (1 + slip_rate)
+                ep      = price * (1 + slip_rate)
+                sl_dist = atr * 1.5
                 position = {"side": "BUY",  "entry": ep, "time": entry_time,
-                            "sl": ep * 0.997, "tp": ep * 1.006}
+                            "sl": ep - sl_dist, "tp": ep + sl_dist * 2,
+                            "sl_dist": sl_dist}
             elif crossed_down:
-                ep = price * (1 - slip_rate)
+                ep      = price * (1 - slip_rate)
+                sl_dist = atr * 1.5
                 position = {"side": "SELL", "entry": ep, "time": entry_time,
-                            "sl": ep * 1.003, "tp": ep * 0.994}
+                            "sl": ep + sl_dist, "tp": ep - sl_dist * 2,
+                            "sl_dist": sl_dist}
             continue
 
-        side = position["side"]
-        ep   = position["entry"]
-        sl   = position["sl"]
-        tp   = position["tp"]
-        hi   = float(candles[i][2])
-        lo   = float(candles[i][3])
+        side    = position["side"]
+        ep      = position["entry"]
+        sl      = position["sl"]
+        tp      = position["tp"]
+        sl_dist = position["sl_dist"]
+        hi      = float(candles[i][2])
+        lo      = float(candles[i][3])
 
         exit_price  = None
         exit_reason = "Held"
@@ -1741,13 +1751,14 @@ def run_simple_ma_strategy(candles, starting_balance=1000,
             elif fast > slow: exit_price, exit_reason = price, "Signal reversal"
 
         if exit_price is not None:
-            ret       = ((exit_price - ep) / ep) if side == "BUY" \
-                         else ((ep - exit_price) / ep)
-            risk_amt  = balance * risk_pct
-            gross_pnl = risk_amt * (ret / 0.003)
-            fee       = risk_amt * fee_rate * 2
-            net_pnl   = gross_pnl - fee
-            balance  += net_pnl
+            size     = (balance * risk_pct) / sl_dist if sl_dist > 0 else 0
+            if side == "BUY":
+                raw_pnl = (exit_price - ep) * size
+            else:
+                raw_pnl = (ep - exit_price) * size
+            fee      = ep * size * fee_rate * 2
+            net_pnl  = raw_pnl - fee
+            balance += net_pnl
             trades.append({
                 "side":       side,
                 "entry":      round(ep,         6),
