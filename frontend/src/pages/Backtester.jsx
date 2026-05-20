@@ -648,7 +648,7 @@ function TradeTable({trades,sortField,sortDir,onSort}){
               </td>
               <td style={{padding:"7px 10px",color:T.cyan,fontSize:10}}>{t.session||"—"}</td>
               <td style={{padding:"7px 10px",color:T.gold}}>{t.confidence?t.confidence+"%":"—"}</td>
-              <td style={{padding:"7px 10px",color:T.t2}}>{t.smc_score!=null?`${t.smc_score}/9`:"—"}</td>
+              <td style={{padding:"7px 10px",color:T.t2}}>{t.smc_score!=null?`${t.smc_score}/11`:"—"}</td>
               <td style={{padding:"7px 10px",color:T.gold}}>{t.rr?fmt(t.rr,1)+"R":"—"}</td>
             </tr>
           ))}

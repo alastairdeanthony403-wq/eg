@@ -62,7 +62,7 @@ function SignalCard({ s, active, onClick }) {
       </div>
       <div className="meter mb-3"><span style={{ width: `${s.confidence}%` }} /></div>
       <div className="flex items-center justify-between text-xs text-[var(--text-dim)]">
-        <span>SMC <span className="mono font-bold text-[var(--text)]">{s.smc_score}/9</span></span>
+        <span>SMC <span className="mono font-bold text-[var(--text)]">{s.smc_score}/11</span></span>
         <span>{s.regime}</span>
       </div>
     </button>

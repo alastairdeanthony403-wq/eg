@@ -134,7 +134,7 @@ DEFAULT_CONFIG = {
     "avoid_quiet_market":       True,
     "avoid_sideways_market":    True,
     "min_volume_multiplier":    0.8,
-    "min_smc_score":            6,
+    "min_smc_score":            7,
     "blocked_crypto_hours_utc": [0, 1, 2, 3, 22, 23],   # extended late-night dead zones
     "blocked_sessions":         [],                       # e.g. ["Asia"] — populated by learning
     "atr_multiplier":           1.5,                      # v2: ATR stop distance multiplier
@@ -999,7 +999,7 @@ def evaluate_bot_window(df, strategy="bot", symbol="BTCUSDT", interval="5m",
     else:   # smart_money / bot
         # ── Section 8: dynamic SMC threshold ─────────────────────────
         if regime == "Trending":
-            dynamic_min = max(6, cfg["min_smc_score"] - 1)   # easier in clear trends
+            dynamic_min = max(7, cfg["min_smc_score"] - 1)   # easier in clear trends
         elif regime in ["Range / Quiet", "Unknown"]:
             dynamic_min = cfg["min_smc_score"] + 1            # harder in ranging
         else:
@@ -1008,42 +1008,64 @@ def evaluate_bot_window(df, strategy="bot", symbol="BTCUSDT", interval="5m",
         # Preliminary confidence (no SMC alignment bonus yet — avoids circular dep)
         prelim_conf = estimate_confidence(df, raw_signal, smc_checks_passed=0)
 
+        # ── RSI filter (14-period) ─────────────────────────────────────
+        rsi_now = 50.0
+        try:
+            rsi_s = _rsi_series(df["close"].tolist(), 14)
+            if rsi_s and rsi_s[-1] is not None:
+                rsi_now = round(float(rsi_s[-1]), 1)
+        except Exception:
+            pass
+
+        # ── Volume confirmation ────────────────────────────────────────
+        volume_ok = True
+        try:
+            avg_vol = float(df["volume"].rolling(20).mean().iloc[-1])
+            cur_vol = float(df["volume"].iloc[-1])
+            if pd.notna(avg_vol) and avg_vol > 0:
+                min_mult = cfg.get("min_volume_multiplier", 0.8)
+                volume_ok = cur_vol >= avg_vol * min_mult
+        except Exception:
+            pass
+
         buy_checks = [
-            ("HTF bias bullish",              higher_tf_bias == "Bullish"),
-            ("Buy-side liquidity sweep",       sweep == "BUY_SWEEP"),
-            ("Bullish break of structure",     bos == "BULLISH_BOS"),
-            ("Price in discount zone",         price_in_discount_zone(df)),
-            ("FVG retracement long",           detect_fvg_retrace(df, "BUY", interval)),
-            (f"Confidence ≥ {cfg['min_confidence']}%",
-                                               prelim_conf >= cfg["min_confidence"]),
-            ("Trending / active regime",       regime not in ["Range / Quiet", "Unknown"]),
-            ("Clear structure (not range)",    structure != "Range / Mixed"),
-            ("Active session window",          session_allowed(cfg)),
+            ("HTF bias bullish",                      higher_tf_bias == "Bullish"),
+            ("Buy-side liquidity sweep",               sweep == "BUY_SWEEP"),
+            ("Bullish break of structure",             bos == "BULLISH_BOS"),
+            ("Price in discount zone",                 price_in_discount_zone(df)),
+            ("FVG retracement long",                   detect_fvg_retrace(df, "BUY", interval)),
+            (f"Confidence ≥ {cfg['min_confidence']}%", prelim_conf >= cfg["min_confidence"]),
+            ("Trending / active regime",               regime not in ["Range / Quiet", "Unknown"]),
+            ("Clear structure (not range)",            structure != "Range / Mixed"),
+            ("Active session window",                  session_allowed(cfg)),
+            (f"RSI not overbought (RSI {rsi_now:.0f} < 65)", rsi_now < 65),
+            ("Volume above threshold",                 volume_ok),
         ]
         sell_checks = [
-            ("HTF bias bearish",              higher_tf_bias == "Bearish"),
-            ("Sell-side liquidity sweep",      sweep == "SELL_SWEEP"),
-            ("Bearish break of structure",     bos == "BEARISH_BOS"),
-            ("Price in premium zone",          price_in_premium_zone(df)),
-            ("FVG retracement short",          detect_fvg_retrace(df, "SELL", interval)),
-            (f"Confidence ≥ {cfg['min_confidence']}%",
-                                               prelim_conf >= cfg["min_confidence"]),
-            ("Trending / active regime",       regime not in ["Range / Quiet", "Unknown"]),
-            ("Clear structure (not range)",    structure != "Range / Mixed"),
-            ("Active session window",          session_allowed(cfg)),
+            ("HTF bias bearish",                      higher_tf_bias == "Bearish"),
+            ("Sell-side liquidity sweep",              sweep == "SELL_SWEEP"),
+            ("Bearish break of structure",             bos == "BEARISH_BOS"),
+            ("Price in premium zone",                  price_in_premium_zone(df)),
+            ("FVG retracement short",                  detect_fvg_retrace(df, "SELL", interval)),
+            (f"Confidence ≥ {cfg['min_confidence']}%", prelim_conf >= cfg["min_confidence"]),
+            ("Trending / active regime",               regime not in ["Range / Quiet", "Unknown"]),
+            ("Clear structure (not range)",            structure != "Range / Mixed"),
+            ("Active session window",                  session_allowed(cfg)),
+            (f"RSI not oversold (RSI {rsi_now:.0f} > 35)",   rsi_now > 35),
+            ("Volume above threshold",                 volume_ok),
         ]
         bs = sum(1 for _, ok in buy_checks  if ok)
         ss = sum(1 for _, ok in sell_checks if ok)
 
         if bs >= dynamic_min:
             smc_score  = bs
-            confidence = max(estimate_confidence(df, "BUY",  smc_checks_passed=bs), 80)
+            confidence = max(estimate_confidence(df, "BUY",  smc_checks_passed=bs, total_checks=11), 80)
             final, idea = "BUY", "HTF bullish + sweep + BOS + retracement entry"
             reasons = ([f"✓ {n}" for n, ok in buy_checks  if ok] +
                        [f"✗ {n}" for n, ok in buy_checks  if not ok])
         elif ss >= dynamic_min:
             smc_score  = ss
-            confidence = max(estimate_confidence(df, "SELL", smc_checks_passed=ss), 80)
+            confidence = max(estimate_confidence(df, "SELL", smc_checks_passed=ss, total_checks=11), 80)
             final, idea = "SELL", "HTF bearish + sweep + BOS + retracement entry"
             reasons = ([f"✓ {n}" for n, ok in sell_checks if ok] +
                        [f"✗ {n}" for n, ok in sell_checks if not ok])
@@ -1122,11 +1144,11 @@ def get_symbol_summary(symbol, strategy="bot", interval=SIGNALS_INTERVAL, cfg=No
 
     # Quality rating
     conf_q = ev["confidence"]; smc_q = ev["smc_score"]
-    if   conf_q >= 88 and smc_q >= 8: q_label = "A+"
-    elif conf_q >= 80 and smc_q >= 7: q_label = "A"
-    elif conf_q >= 70 and smc_q >= 6: q_label = "B"
-    elif conf_q >= 60:                 q_label = "C"
-    else:                              q_label = "D"
+    if   conf_q >= 88 and smc_q >= 10: q_label = "A+"
+    elif conf_q >= 80 and smc_q >= 9:  q_label = "A"
+    elif conf_q >= 70 and smc_q >= 7:  q_label = "B"
+    elif conf_q >= 60:                  q_label = "C"
+    else:                               q_label = "D"
 
     # R:R ratio
     try:
