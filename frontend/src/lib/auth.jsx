@@ -12,7 +12,7 @@ export function AuthProvider({ children }) {
   useEffect(() => {
     const token = localStorage.getItem("ate_token");
     if (token && !user) {
-      api.get("/auth/me").then((r) => {
+      apiFetch("/auth/me").then((r) => {
         localStorage.setItem("ate_user", JSON.stringify(r.data));
         setUser(r.data);
       }).catch((err) => console.error("auth/me failed:", err));
