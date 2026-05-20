@@ -1,5 +1,5 @@
 import { createContext, useContext, useEffect, useState } from "react";
-import { apiFetch, API_BASE } from "@/lib/api";
+import { apiFetch } from "@/lib/api";
 
 const AuthCtx = createContext(null);
 
@@ -10,11 +10,11 @@ export function AuthProvider({ children }) {
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
-    const token = localStorage.getItem("ate_token");
+    const token = localStorage.getItem("token");
     if (token && !user) {
-      apiFetch("/auth/me").then((r) => {
-        localStorage.setItem("ate_user", JSON.stringify(r.data));
-        setUser(r.data);
+      apiFetch("/api/auth/me").then((r) => {
+        localStorage.setItem("ate_user", JSON.stringify(r));
+        setUser(r);
       }).catch((err) => console.error("auth/me failed:", err));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -23,8 +23,10 @@ export function AuthProvider({ children }) {
   const login = async (email, password) => {
     setLoading(true);
     try {
-      const { data } = await api.post("/auth/login", { email, password });
-      localStorage.setItem("ate_token", data.token);
+      const data = await apiFetch("/api/auth/login", {
+        method: "POST", body: JSON.stringify({ email, password }),
+      });
+      localStorage.setItem("token", data.token);
       localStorage.setItem("ate_user", JSON.stringify(data.user));
       setUser(data.user);
       return data.user;
@@ -34,8 +36,10 @@ export function AuthProvider({ children }) {
   const register = async (email, password, name) => {
     setLoading(true);
     try {
-      const { data } = await api.post("/auth/register", { email, password, name });
-      localStorage.setItem("ate_token", data.token);
+      const data = await apiFetch("/api/auth/register", {
+        method: "POST", body: JSON.stringify({ email, password, name }),
+      });
+      localStorage.setItem("token", data.token);
       localStorage.setItem("ate_user", JSON.stringify(data.user));
       setUser(data.user);
       return data.user;
@@ -43,7 +47,7 @@ export function AuthProvider({ children }) {
   };
 
   const logout = () => {
-    localStorage.removeItem("ate_token");
+    localStorage.removeItem("token");
     localStorage.removeItem("ate_user");
     setUser(null);
   };

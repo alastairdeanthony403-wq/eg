@@ -4,6 +4,7 @@
  * emotional notes, and strategy/market filters.
  */
 import React, { useState, useEffect, useCallback } from "react";
+import { apiFetch } from "@/lib/api";
 
 const C = {
   bg0: "#020917", bg1: "#071428", bg2: "#0c1d3a", bg3: "#11264a",
@@ -14,13 +15,6 @@ const C = {
   ui:   "'Outfit','DM Sans',system-ui,sans-serif",
 };
 
-const api = (url, opts = {}) => {
-  const tok = localStorage.getItem("token") || "";
-  return fetch(url, {
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${tok}`, ...opts.headers },
-    ...opts,
-  });
-};
 
 const fn  = (v, d = 2) => v == null ? "—" : Number(v).toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d });
 const inp = { width: "100%", fontFamily: C.mono, fontSize: 10, padding: "7px 10px",
@@ -62,7 +56,7 @@ const NewEntry = ({ onSaved, prefill }) => {
         form.strategy      ? `\n[STRATEGY] ${form.strategy}` : "",
       ].filter(Boolean).join("");
 
-      await api("/api/journal", {
+      await apiFetch("/api/journal", {
         method: "POST",
         body: JSON.stringify({
           symbol: form.symbol.toUpperCase(),
@@ -391,8 +385,7 @@ export default function Journal() {
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const r = await api("/api/journal");
-      const d = await r.json();
+      const d = await apiFetch("/api/journal");
       setEntries(Array.isArray(d) ? d : []);
     } finally { setLoading(false); }
   }, []);
@@ -401,7 +394,7 @@ export default function Journal() {
 
   const del = async id => {
     if (!window.confirm("Delete this entry?")) return;
-    await api(`/api/journal/${id}`, { method: "DELETE" });
+    await apiFetch(`/api/journal/${id}`, { method: "DELETE" });
     load();
   };
 

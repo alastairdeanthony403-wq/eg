@@ -110,7 +110,7 @@ export default function Backtester() {
   const loadHistory = useCallback(async () => {
     try {
       const r = await apiFetch("/api/backtest-runs", {headers:hdrs});
-      if(r.ok) setHistory(Array.isArray(d)?d:[]);
+      setHistory(Array.isArray(r) ? r : []);
     } catch{}
   }, [hdrs]);
 
@@ -118,7 +118,7 @@ export default function Backtester() {
   const loadLearnHistory = useCallback(async () => {
     try {
       const r = await apiFetch("/api/learn/history", {headers:hdrs});
-      if(r.ok) setLearnHistory(d.history||[]);
+      setLearnHistory(r.history || []);
     } catch{}
   }, [hdrs]);
 
@@ -372,7 +372,7 @@ export default function Backtester() {
                     to reduce future losses.
                   </p>
                 </div>
-                <button onClick={handleRunLearn} disabled={learning}>
+                <button onClick={handleRunLearn} disabled={learning}
                   style={{background:`${T.purple}18`,border:`1px solid ${T.purple}44`,color:T.purple,
                     borderRadius:4,padding:"9px 20px",cursor:"pointer",fontFamily:MONO,fontSize:11,
                     letterSpacing:1,whiteSpace:"nowrap",flexShrink:0,display:"flex",alignItems:"center",gap:6}}>

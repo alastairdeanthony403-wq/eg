@@ -91,7 +91,7 @@ export default function Dashboard() {
 
   const loadSignals = useCallback(async () => {
     try {
-      const { data } = await api.get(`/signals?interval=${interval}`);
+      const data = await apiFetch(`/api/signals?interval=${interval}`);
       setSignals(data.signals || []);
     } catch (e) {
       console.error("loadSignals failed:", e);
@@ -102,9 +102,9 @@ export default function Dashboard() {
 
   const loadTrades = useCallback(async () => {
     try {
-      const [t, s] = await Promise.all([api.get("/trades"), api.get("/stats")]);
-      setOpenTrades((t.data || []).filter((x) => x.status === "OPEN"));
-      setStats(s.data);
+      const [t, s] = await Promise.all([apiFetch("/api/trades"), apiFetch("/api/stats")]);
+      setOpenTrades((Array.isArray(t) ? t : []).filter((x) => x.status === "OPEN"));
+      setStats(s);
     } catch (e) {
       console.error("loadTrades failed:", e);
     }
@@ -141,8 +141,8 @@ export default function Dashboard() {
 
   useEffect(() => {
     if (!seriesRef.current) return;
-    api.get(`/chart-candles?symbol=${active}&interval=${interval}&limit=300`)
-      .then(({ data }) => {
+    apiFetch(`/api/chart-candles?symbol=${active}&interval=${interval}&limit=300`)
+      .then((data) => {
         if (data?.ok && data.data?.length && seriesRef.current) {
           seriesRef.current.setData(data.data);
           chartRef.current?.timeScale().fitContent();
@@ -155,15 +155,15 @@ export default function Dashboard() {
 
   const openPaper = async (side) => {
     try {
-      await api.post("/trades", { symbol: active, side });
+      await apiFetch("/api/trades", { method: "POST", body: JSON.stringify({ symbol: active, side }) });
       loadTrades();
     } catch (e) {
-      alert(e?.response?.data?.error || "Failed");
+      alert(e.message || "Failed");
     }
   };
 
   const closeTrade = async (id) => {
-    try { await api.post(`/trades/${id}/close`); loadTrades(); } catch {}
+    try { await apiFetch(`/api/trades/${id}/close`, { method: "POST" }); loadTrades(); } catch {}
   };
 
   // Price display helper for the chart panel

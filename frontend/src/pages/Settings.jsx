@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { apiFetch, API_BASE } from "@/lib/api";
+import { apiFetch } from "@/lib/api";
 import { Save, Settings as SettingsIcon, Shield, Brain, Globe } from "lucide-react";
 
 // FIX 6: All 18 symbols across all markets — was only showing 4 crypto
@@ -16,8 +16,8 @@ export default function Settings() {
   const [savedAt, setSavedAt] = useState(null);
 
   useEffect(() => {
-    api.get("/settings")
-      .then(({ data }) => setCfg(data))
+    apiFetch("/api/settings")
+      .then((data) => setCfg(data))
       .catch((err) => console.error("settings load failed:", err));
   }, []);
 
@@ -33,7 +33,7 @@ export default function Settings() {
   const save = async () => {
     setSaving(true);
     try {
-      const { data } = await api.post("/settings", cfg);
+      const data = await apiFetch("/api/settings", { method: "POST", body: JSON.stringify(cfg) });
       setCfg(data);
       setSavedAt(new Date());
     } catch (err) {
