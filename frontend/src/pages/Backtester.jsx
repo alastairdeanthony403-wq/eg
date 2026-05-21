@@ -48,10 +48,10 @@ const durStr  = (s)   => {
 };
 
 const STRATEGIES = [
-  {value:"bot",        label:"SMC Unified Bot"},
-  {value:"basic",      label:"Basic SMC"},
-  {value:"ema_rsi",    label:"EMA + RSI"},
-  {value:"sma_cross",  label:"SMA Crossover"},
+  {value:"unified_bot", label:"SMC Unified Bot"},
+  {value:"basic",       label:"Basic SMC"},
+  {value:"ema_rsi",     label:"EMA + RSI"},
+  {value:"sma_cross",   label:"SMA Crossover"},
 ];
 
 // ── MAIN COMPONENT ────────────────────────────────────────────────────────────
@@ -83,17 +83,13 @@ export default function Backtester() {
   const [page,        setPage]      = useState(0);
   const PAGE = 20;
 
-  const token = localStorage.getItem("token");
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  const hdrs  = { "Content-Type":"application/json", Authorization:`Bearer ${token}` };
-
   // ── Run backtest ────────────────────────────────────────────────────────────
   const run = async () => {
     setRunning(true); setError(null); setResult(null);
     setCompare(null); setLearnResult(null); setPage(0);
     try {
       const d = await apiFetch("/api/backtest", {
-        method:"POST", headers:hdrs,
+        method:"POST",
         body:JSON.stringify({ symbol, strategy, period_days:Number(days),
           starting_balance:Number(balance), fee_percent:Number(fee),
           slippage_percent:Number(slip), random_window:rndWindow }),
@@ -106,24 +102,22 @@ export default function Backtester() {
   };
 
   // ── Load run history ────────────────────────────────────────────────────────
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   const loadHistory = useCallback(async () => {
     try {
-      const r = await apiFetch("/api/backtest-runs", {headers:hdrs});
+      const r = await apiFetch("/api/backtest-runs");
       setHistory(Array.isArray(r) ? r : []);
     } catch{}
-  }, [hdrs]);
+  }, []);
 
   // ── Load learn history ──────────────────────────────────────────────────────
   const loadLearnHistory = useCallback(async () => {
     try {
-      const r = await apiFetch("/api/learn/history", {headers:hdrs});
+      const r = await apiFetch("/api/learn/history");
       setLearnHistory(r.history || []);
     } catch{}
-  }, [hdrs]);
+  }, []);
 
   // ── Strategy comparison ─────────────────────────────────────────────────────
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   const runCompare = async () => {
     setComparing(true);
     setCompare(null);
@@ -134,7 +128,6 @@ export default function Backtester() {
       try {
         const d = await apiFetch("/api/backtest", {
           method: "POST",
-          headers: hdrs,
           body: JSON.stringify({
             symbol,
             strategy: s.value,
@@ -166,7 +159,6 @@ export default function Backtester() {
   try {
     const d = await apiFetch("/api/learn", {
       method: "POST",
-      headers: hdrs,
       body: JSON.stringify({ auto_apply: true, symbol }),
     });
 
@@ -182,8 +174,7 @@ export default function Backtester() {
   useEffect(() => {
     loadHistory();
     loadLearnHistory();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hdrs]);
+  }, [loadHistory, loadLearnHistory]);
 
   // ── Derived data ────────────────────────────────────────────────────────────
   const trades    = result?.trades || [];
@@ -224,9 +215,18 @@ export default function Backtester() {
         <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(160px,1fr))",gap:12}}>
           <Field label="SYMBOL">
             <select value={symbol} onChange={e=>setSymbol(e.target.value)} style={selStyle}>
-              {["BTCUSDT","ETHUSDT","EURUSD","GBPUSD","AAPL","XAUUSD"].map(s=>(
-                <option key={s} value={s}>{s}</option>
-              ))}
+              <optgroup label="Crypto">
+                {["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT"].map(s=><option key={s} value={s}>{s}</option>)}
+              </optgroup>
+              <optgroup label="Forex">
+                {["EURUSD","GBPUSD","USDJPY","AUDUSD","USDCAD"].map(s=><option key={s} value={s}>{s}</option>)}
+              </optgroup>
+              <optgroup label="Stocks">
+                {["AAPL","TSLA","NVDA","MSFT","AMZN","SPY"].map(s=><option key={s} value={s}>{s}</option>)}
+              </optgroup>
+              <optgroup label="Commodities">
+                {["XAUUSD","XAGUSD","USOIL","UKOIL"].map(s=><option key={s} value={s}>{s}</option>)}
+              </optgroup>
             </select>
           </Field>
           <Field label="STRATEGY">

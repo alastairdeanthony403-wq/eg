@@ -2855,7 +2855,7 @@ def api_backtest():
     _wml_pct = cfg.get("weekly_max_loss_percent",      2.0)
 
     try:
-        if strategy == "unified_bot":
+        if strategy in ("unified_bot", "bot"):   # "bot" kept as legacy alias
             trades, ending_balance = run_unified_bot_strategy(
                 candles, sb, fee_pct, slip_pct,
                 weekly_win_goal=_ww_goal,
