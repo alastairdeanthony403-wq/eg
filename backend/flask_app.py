@@ -2155,6 +2155,59 @@ def _adx_series(highs, lows, closes, period=14):
     return adx_out[:n]
 
 
+def _sma_series(values, period):
+    """Simple moving average — returns same-length list with None for warmup."""
+    n = len(values)
+    result = [None] * (period - 1)
+    for i in range(period - 1, n):
+        result.append(sum(values[i - period + 1: i + 1]) / period)
+    return result
+
+
+def _macd_line(closes, fast=12, slow=26):
+    """MACD line (fast EMA − slow EMA)."""
+    fe = _ema_series(closes, fast)
+    se = _ema_series(closes, slow)
+    return [
+        (f - s) if (f is not None and s is not None) else None
+        for f, s in zip(fe, se)
+    ]
+
+
+def _bb_series(closes, period=20, std_mult=2.0):
+    """Bollinger Bands — returns (upper, mid, lower) as three lists."""
+    n = len(closes)
+    upper, mid, lower = [None] * n, [None] * n, [None] * n
+    for i in range(period - 1, n):
+        w = closes[i - period + 1: i + 1]
+        m = sum(w) / period
+        std = (sum((x - m) ** 2 for x in w) / period) ** 0.5
+        mid[i]   = m
+        upper[i] = m + std * std_mult
+        lower[i] = m - std * std_mult
+    return upper, mid, lower
+
+
+def _dynamic_rr(score, regime="Unknown", adx_val=0):
+    """
+    Return a dynamic R:R ratio based on confluence score and market regime.
+    Score 3 → 2.0, 4 → 2.5, 5 → 3.0, 6 → 3.5, 7+ → 4.0
+    Strong trend regimes get a 0.5 bonus.
+    """
+    base = {3: 2.0, 4: 2.5, 5: 3.0, 6: 3.5}.get(min(score, 6), 4.0)
+    bonus = 0.5 if ("Strong" in str(regime) or adx_val >= 35) else 0.0
+    return round(base + bonus, 1)
+
+
+def _dynamic_risk_pct(score, base_risk=0.01):
+    """
+    Scale position risk by confluence score.
+    score 3 → 0.8%, 4 → 1.0%, 5 → 1.2%, 6 → 1.5%
+    """
+    scale = {3: 0.80, 4: 1.00, 5: 1.20, 6: 1.50}.get(min(score, 6), 1.50)
+    return base_risk * scale
+
+
 # ─────────────────────────────────────────────
 # UNIFIED BOT STRATEGY  v3
 # ─────────────────────────────────────────────
@@ -2548,35 +2601,53 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
         return trades, balance
 
     # ====================================================================
-    # PATH B — DAILY BARS with EMA + ADX + RSI
-    # Section 6: trailing stop activates at 1R profit
+    # PATH B — DAILY BARS: AI Multi-Strategy Confluence Engine
+    # Uses 7 independent strategy signals; enters when ≥4 agree.
+    # R:R and position size scale dynamically with the confluence score.
+    # Trailing stop activates at 1R profit.
     # ====================================================================
     closes  = [float(c[4]) for c in candles]
     highs   = [float(c[2]) for c in candles]
     lows    = [float(c[3]) for c in candles]
     volumes = [float(c[5]) if len(c) > 5 and c[5] else 1.0 for c in candles]
 
-    ema9_s  = _ema_series(closes, 9)
-    ema21_s = _ema_series(closes, 21)
-    ema50_s = _ema_series(closes, 50)
-    atr_s   = _atr_series(highs, lows, closes, 14)
-    rsi_s   = _rsi_series(closes, 14)
-    adx_s   = _adx_series(highs, lows, closes, 14)
+    # ── Compute all strategy indicators ─────────────────────────────────
+    ema9_s   = _ema_series(closes, 9)
+    ema21_s  = _ema_series(closes, 21)
+    ema50_s  = _ema_series(closes, 50)
+    ema200_s = _ema_series(closes, 200)
+    atr_s    = _atr_series(highs, lows, closes, 14)
+    rsi_s    = _rsi_series(closes, 14)
+    adx_s    = _adx_series(highs, lows, closes, 14)
+    sma20_s  = _sma_series(closes, 20)
+    macd_s   = _macd_line(closes, 12, 26)   # MACD line
+    macd_sig = _ema_series(                  # MACD signal line
+        [m if m is not None else 0.0 for m in macd_s], 9
+    )
+    bb_up, bb_mid, bb_lo = _bb_series(closes, 20, 2.0)
+
+    CONFLUENCE_MIN = 4    # min signals to enter (out of 7)
 
     position       = None
     current_day    = None
     day_wins       = 0
     day_losses     = 0
-    current_week   = None   # (iso_year, iso_week)
+    current_week   = None
     week_wins      = 0
     week_losses    = 0
     week_pnl       = 0.0
     week_paused    = False
 
     for i in range(WARMUP, len(candles)):
-        e9    = ema9_s[i];  e21 = ema21_s[i]; e50 = ema50_s[i]
-        atr_v = atr_s[i];  rsi_v = rsi_s[i]; adx_v = adx_s[i]
-        if any(v is None for v in [e9, e21, e50, atr_v, rsi_v, adx_v]) or atr_v <= 0:
+        e9    = ema9_s[i];  e21  = ema21_s[i];  e50  = ema50_s[i]
+        e200  = ema200_s[i]
+        atr_v = atr_s[i];   rsi_v = rsi_s[i];   adx_v = adx_s[i]
+        sma20 = sma20_s[i]; mac   = macd_s[i];   mac_sig = macd_sig[i]
+        bb_m  = bb_mid[i]
+
+        # Skip bars with missing indicators
+        if any(v is None for v in [e9, e21, e50, atr_v, rsi_v, adx_v, sma20, mac]) \
+                or atr_v <= 0:
             continue
 
         close = closes[i]; hi = highs[i]; lo = lows[i]
@@ -2586,33 +2657,30 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
         if today != current_day:
             current_day = today; day_wins = 0; day_losses = 0
 
-        # ── Weekly reset & limit check ────────────────────────────────
+        # ── Weekly reset ─────────────────────────────────────────────────
         dt_i     = datetime.utcfromtimestamp(int(candles[i][0]) / 1000)
-        iso_week = dt_i.isocalendar()[:2]      # (year, week_number)
+        iso_week = dt_i.isocalendar()[:2]
         if iso_week != current_week:
             current_week = iso_week
             week_wins = 0; week_losses = 0; week_pnl = 0.0; week_paused = False
 
-        # ── Section 6: manage open position with trailing stop ────────
+        # ── Manage open position with trailing stop ───────────────────────
         if position is not None:
-            ep     = position["entry"]
-            sl_p   = position["sl"]
-            tp_p   = position["tp"]
-            side   = position["side"]
-            sz     = position["size"]
-            trail  = position.get("trailing_sl", sl_p)
-            one_r  = abs(ep - sl_p)
+            ep    = position["entry"]
+            sl_p  = position["sl"]
+            tp_p  = position["tp"]
+            side  = position["side"]
+            sz    = position["size"]
+            trail = position.get("trailing_sl", sl_p)
+            one_r = abs(ep - sl_p)
 
             exit_price = exit_reason = None
 
             if side == "BUY":
-                # Advance trailing stop once 1R is reached
                 if one_r > 0 and hi >= ep + one_r:
                     candidate = close - one_r * 0.5
                     if candidate > trail:
-                        trail = candidate
-                        position["trailing_sl"] = trail
-                # Only label as "Trailing stop" if it has moved above the initial SL
+                        trail = candidate; position["trailing_sl"] = trail
                 trail_active = trail > sl_p
                 if trail_active and lo <= trail:
                     exit_price, exit_reason = trail, "Trailing stop"
@@ -2620,12 +2688,11 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                     exit_price, exit_reason = sl_p, "Stop loss"
                 elif hi >= tp_p:
                     exit_price, exit_reason = tp_p, "Take profit"
-            else:  # SELL
+            else:
                 if one_r > 0 and lo <= ep - one_r:
                     candidate = close + one_r * 0.5
                     if candidate < trail:
-                        trail = candidate
-                        position["trailing_sl"] = trail
+                        trail = candidate; position["trailing_sl"] = trail
                 trail_active = trail < sl_p
                 if trail_active and hi >= trail:
                     exit_price, exit_reason = trail, "Trailing stop"
@@ -2638,19 +2705,22 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                 gp  = ((exit_price - ep) if side == "BUY" else (ep - exit_price)) * sz
                 fee = ep * sz * fee_rate * 2
                 net = gp - fee
+                balance += net          # ← FIX: was missing, caused net PnL = $0
                 if net > 0: day_wins  += 1; week_wins   += 1
                 else:       day_losses += 1; week_losses += 1
                 week_pnl += net
                 trades.append({
                     "side": side, "entry": round(ep, 6), "exit": round(exit_price, 6),
-                    "pnl": round(net, 4), "entry_time": position["time"],
-                    "exit_time": t_str, "reason": exit_reason,
+                    "pnl": round(net, 4),
+                    "open_time": position["time"], "close_time": t_str,
+                    "exit_reason": exit_reason,
                     "rr": position.get("rr", 3.0),
                     "sl_pct": position.get("sl_pct", 0),
                     "session": "Daily",
+                    "confluence": position.get("confluence", 0),
+                    "strategy_signals": position.get("strategy_signals", []),
                 })
                 position = None
-                # Re-evaluate weekly pause after each close
                 _wpct = week_pnl / float(starting_balance) * 100
                 if (week_wins  >= weekly_win_goal or
                         _wpct  >= weekly_profit_target_pct or
@@ -2663,43 +2733,98 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
         if week_paused:
             continue
 
-        sl_dist   = max(atr_v * 1.5, close * 0.001)
+        # ── Volume average (20-bar) ───────────────────────────────────────
+        vol_lb  = volumes[max(0, i - 20):i]
+        avg_vol = sum(vol_lb) / len(vol_lb) if vol_lb else 1.0
 
-        # ── Additional filters for higher-quality entries ────────────────
-        # EMA50 slope: trending in the right direction over last 5 bars
-        e50_slope_up   = i >= 5 and ema50_s[i] is not None and ema50_s[i-5] is not None and ema50_s[i] > ema50_s[i-5]
-        e50_slope_down = i >= 5 and ema50_s[i] is not None and ema50_s[i-5] is not None and ema50_s[i] < ema50_s[i-5]
-        # Momentum: close moving in entry direction vs prior bar
-        mom_up   = closes[i] > closes[i-1]
-        mom_down = closes[i] < closes[i-1]
-        # Volume confirmation: current bar volume > 20-bar average * 1.2
-        vol_lookback = volumes[max(0, i-20):i]
-        avg_vol      = (sum(vol_lookback) / len(vol_lookback)) if vol_lookback else 1.0
-        vol_confirm  = volumes[i] >= avg_vol * 1.2 if avg_vol > 0 else True
+        # ── EMA50 5-bar slope ────────────────────────────────────────────
+        e50_prev = ema50_s[i - 5] if i >= 5 and ema50_s[i - 5] is not None else e50
+
+        # ── HTF bias: EMA200 (if available) ─────────────────────────────
+        htf_bull = (e200 is not None and close > e200)
+        htf_bear = (e200 is not None and close < e200)
+
+        # ════════════════════════════════════════════════════════════════
+        # CONFLUENCE SCORING  (7 strategies, each = 1 signal)
+        # ════════════════════════════════════════════════════════════════
+        buy_signals  = []
+        sell_signals = []
+
+        # Signal 1 — EMA trend stack
+        if e9 > e21 > e50:
+            buy_signals.append("EMA stack bullish")
+        if e9 < e21 < e50:
+            sell_signals.append("EMA stack bearish")
+
+        # Signal 2 — ADX trend strength (relaxed to 20)
+        if adx_v >= 20:
+            buy_signals.append("ADX trending")
+            sell_signals.append("ADX trending")
+
+        # Signal 3 — RSI momentum zone
+        if RSI_BUY_LO < rsi_v < RSI_BUY_HI:
+            buy_signals.append("RSI healthy bull")
+        if RSI_SELL_LO < rsi_v < RSI_SELL_HI:
+            sell_signals.append("RSI healthy bear")
+
+        # Signal 4 — EMA50 slope
+        if e50 > e50_prev:
+            buy_signals.append("EMA50 rising")
+        if e50 < e50_prev:
+            sell_signals.append("EMA50 falling")
+
+        # Signal 5 — MACD above/below zero line
+        if mac > 0:
+            buy_signals.append("MACD bullish")
+        if mac < 0:
+            sell_signals.append("MACD bearish")
+
+        # Signal 6 — Price vs SMA20 (medium-term trend)
+        if close > sma20:
+            buy_signals.append("Above SMA20")
+        if close < sma20:
+            sell_signals.append("Below SMA20")
+
+        # Signal 7 — Volume confirmation (volume > 1.1× avg)
+        if avg_vol > 0 and volumes[i] >= avg_vol * 1.1:
+            buy_signals.append("Volume confirmed")
+            sell_signals.append("Volume confirmed")
+
+        # ── Determine direction from confluence ───────────────────────────
+        buy_score  = len(buy_signals)
+        sell_score = len(sell_signals)
 
         direction = None
-        if (e9 > e21 and close > e50 and adx_v >= ADX_MIN_DAILY
-                and RSI_BUY_LO < rsi_v < RSI_BUY_HI
-                and e50_slope_up and mom_up and vol_confirm):
-            direction = "BUY"
-        elif (e9 < e21 and close < e50 and adx_v >= ADX_MIN_DAILY
-                and RSI_SELL_LO < rsi_v < RSI_SELL_HI
-                and e50_slope_down and mom_down and vol_confirm):
-            direction = "SELL"
+        score     = 0
+        signals   = []
+
+        if buy_score >= CONFLUENCE_MIN and buy_score > sell_score and htf_bull is not False:
+            direction = "BUY";  score = buy_score;  signals = buy_signals
+        elif sell_score >= CONFLUENCE_MIN and sell_score > buy_score and htf_bear is not False:
+            direction = "SELL"; score = sell_score; signals = sell_signals
+
         if not direction:
             continue
 
-        ep   = close * (1 + slip_rate) if direction == "BUY" else close * (1 - slip_rate)
-        sl_p = ep - sl_dist if direction == "BUY" else ep + sl_dist
-        tp_p = ep + sl_dist * 3.0 if direction == "BUY" else ep - sl_dist * 3.0
-        sz   = risk_dollar / sl_dist
-        rr_actual = round(abs(tp_p - ep) / abs(ep - sl_p), 2) if abs(ep - sl_p) > 0 else 3.0
-        sl_pct    = round(abs(ep - sl_p) / ep * 100, 3) if ep > 0 else 0
+        # ── Dynamic R:R and position sizing based on score ────────────────
+        dyn_rr      = _dynamic_rr(score, adx_val=adx_v)
+        risk_pct    = _dynamic_risk_pct(score)
+        risk_dollar_dyn = balance * risk_pct
+
+        sl_dist  = max(atr_v * 1.5, close * 0.001)
+        ep       = close * (1 + slip_rate) if direction == "BUY" else close * (1 - slip_rate)
+        sl_p     = ep - sl_dist if direction == "BUY" else ep + sl_dist
+        tp_p     = ep + sl_dist * dyn_rr if direction == "BUY" else ep - sl_dist * dyn_rr
+        sz       = risk_dollar_dyn / sl_dist if sl_dist > 0 else 0
+        rr_calc  = round(abs(tp_p - ep) / abs(ep - sl_p), 2) if abs(ep - sl_p) > 0 else dyn_rr
+        sl_pct   = round(abs(ep - sl_p) / ep * 100, 3) if ep > 0 else 0
+
         position = {
             "side": direction, "entry": ep, "sl": sl_p, "tp": tp_p,
             "size": sz, "time": t_str,
-            "trailing_sl": sl_p,   # Section 6: initialize at SL
-            "rr": rr_actual, "sl_pct": sl_pct,
+            "trailing_sl": sl_p,
+            "rr": rr_calc, "sl_pct": sl_pct,
+            "confluence": score, "strategy_signals": signals,
         }
 
     return trades, balance
@@ -2924,6 +3049,48 @@ def api_backtest():
             "error": f"Strategy '{strategy}' crashed: {e}. "
                      f"Candles available: {len(candles)}"
         }), 500
+
+    # ── Normalize trade field names so frontend always gets consistent keys ──
+    def _parse_ts(s):
+        """Parse 'YYYY-MM-DD HH:MM' or ISO string → epoch seconds, or 0."""
+        if not s:
+            return 0
+        try:
+            for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+                try:
+                    return int(datetime.strptime(str(s), fmt).replace(tzinfo=timezone.utc).timestamp())
+                except ValueError:
+                    continue
+            return int(int(s) / 1000) if str(s).isdigit() else 0
+        except Exception:
+            return 0
+
+    for t in trades:
+        # Unify open_time / entry_time
+        if "open_time" not in t:
+            t["open_time"]  = t.get("entry_time", "")
+        if "entry_time" not in t:
+            t["entry_time"] = t["open_time"]
+        # Unify close_time / exit_time
+        if "close_time" not in t:
+            t["close_time"] = t.get("exit_time", "")
+        if "exit_time" not in t:
+            t["exit_time"]  = t["close_time"]
+        # Unify exit_reason / reason
+        if "exit_reason" not in t:
+            t["exit_reason"] = t.get("reason", "")
+        if "reason" not in t:
+            t["reason"] = t["exit_reason"]
+        # Compute duration_seconds
+        if "duration_seconds" not in t:
+            ts_open  = _parse_ts(t.get("open_time")  or t.get("entry_time"))
+            ts_close = _parse_ts(t.get("close_time") or t.get("exit_time"))
+            t["duration_seconds"] = max(0, ts_close - ts_open)
+        # Ensure rr, sl_pct, session, confluence always present
+        t.setdefault("rr",         0)
+        t.setdefault("sl_pct",     0)
+        t.setdefault("session",    "—")
+        t.setdefault("confluence", 0)
 
     total   = len(trades)
     wins    = [t for t in trades if t["pnl"] > 0]

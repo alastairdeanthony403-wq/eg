@@ -58,7 +58,7 @@ const STRATEGIES = [
 export default function Backtester() {
   // Config
   const [symbol,    setSymbol]   = useState("BTCUSDT");
-  const [strategy,  setStrategy] = useState("bot");
+  const [strategy,  setStrategy] = useState("unified_bot");
   const [days,      setDays]     = useState(30);
   const [balance,   setBalance]  = useState(10000);
   const [fee,       setFee]      = useState(0.04);
@@ -619,8 +619,8 @@ function TradeTable({trades,sortField,sortDir,onSort}){
             <TH f="duration"  label="DURATION"/>
             <TH f="exit_reason"label="EXIT REASON"/>
             <TH f="session"   label="SESSION"/>
-            <TH f="confidence"label="CONF"/>
-            <TH f="smc_score" label="SMC"/>
+            <TH f="confluence" label="SIGNALS"/>
+            <TH f="sl_pct"    label="SL%"/>
             <TH f="rr"        label="R:R"/>
           </tr>
         </thead>
@@ -647,8 +647,10 @@ function TradeTable({trades,sortField,sortDir,onSort}){
                 </span>
               </td>
               <td style={{padding:"7px 10px",color:T.cyan,fontSize:10}}>{t.session||"—"}</td>
-              <td style={{padding:"7px 10px",color:T.gold}}>{t.confidence?t.confidence+"%":"—"}</td>
-              <td style={{padding:"7px 10px",color:T.t2}}>{t.smc_score!=null?`${t.smc_score}/11`:"—"}</td>
+              <td style={{padding:"7px 10px",color:T.cyan}}>
+                {t.confluence>0?`${t.confluence}/7`:"—"}
+              </td>
+              <td style={{padding:"7px 10px",color:T.t2}}>{t.sl_pct?fmt(t.sl_pct,2)+"%":"—"}</td>
               <td style={{padding:"7px 10px",color:T.gold}}>{t.rr?fmt(t.rr,1)+"R":"—"}</td>
             </tr>
           ))}
