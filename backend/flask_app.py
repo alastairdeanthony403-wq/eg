@@ -147,7 +147,7 @@ DEFAULT_CONFIG = {
     # ── Weekly goals ──────────────────────────────────────────────────────
     "weekly_win_goal":               3,     # stop new trades after N wins this week
     "weekly_profit_target_percent":  3.0,   # stop new trades after +3% weekly profit
-    "weekly_max_loss_percent":       2.0,   # stop new trades after -2% weekly loss
+    "weekly_max_loss_percent":       0.8,   # stop new trades after -0.8% weekly loss
 }
 
 JWT_SECRET      = os.environ.get("JWT_SECRET", "ai-trading-engine-secret-change-me")
@@ -1816,7 +1816,7 @@ def run_simple_ma_strategy(candles, starting_balance=1000,
                             fee_pct=0.04, slippage_pct=0.02,
                             weekly_win_goal=3,
                             weekly_profit_target_pct=3.0,
-                            weekly_max_loss_pct=2.0):
+                            weekly_max_loss_pct=0.8):
     trades      = []
     balance     = float(starting_balance)
     risk_pct    = 0.01
@@ -2032,7 +2032,7 @@ def is_weekly_paused(user_id, cfg):
     sb          = float(cfg.get("starting_balance", 10000))
     win_goal    = int(cfg.get("weekly_win_goal", 3))
     profit_tgt  = float(cfg.get("weekly_profit_target_percent", 3.0))
-    max_loss    = float(cfg.get("weekly_max_loss_percent", 2.0))
+    max_loss    = float(cfg.get("weekly_max_loss_percent", 0.8))
 
     profit_pct        = (ws["weekly_pnl"] / sb * 100) if sb > 0 else 0.0
     win_goal_hit      = ws["weekly_wins"]  >= win_goal
@@ -2164,7 +2164,7 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                               fee_pct=0.04, slippage_pct=0.02,
                               weekly_win_goal=3,
                               weekly_profit_target_pct=3.0,
-                              weekly_max_loss_pct=2.0):
+                              weekly_max_loss_pct=0.8):
     """
     ICT — Asian Range → London Push → New York Reversal
 
@@ -2176,7 +2176,7 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
     from collections import defaultdict
 
     RISK_PCT       = 0.01
-    MAX_WINS_DAY   = 3
+    MAX_WINS_DAY   = 2        # tightened: was 3
     MAX_LOSS_DAY   = 1
 
     ASIAN_START    =    0
@@ -2187,13 +2187,13 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
     NY_END         = 1020
     SESSION_CLOSE  = 1200
 
-    DISP_BODY_RATIO = 0.50
+    DISP_BODY_RATIO = 0.65    # tightened: was 0.50
     SL_BUFFER       = 0.0005
 
     WARMUP        = 55
-    ADX_MIN_DAILY = 18
-    RSI_BUY_LO    = 40;  RSI_BUY_HI  = 75
-    RSI_SELL_LO   = 25;  RSI_SELL_HI = 60
+    ADX_MIN_DAILY = 25        # tightened: was 18
+    RSI_BUY_LO    = 45;  RSI_BUY_HI  = 65   # tightened: was 40 / 75
+    RSI_SELL_LO   = 35;  RSI_SELL_HI = 55   # tightened: was 25 / 60
 
     trades      = []
     balance     = float(starting_balance)
@@ -2264,6 +2264,8 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                         "exit": round(lc, 6), "pnl": round(net, 4),
                         "entry_time": position["time"], "exit_time": position["time"],
                         "reason": "End-of-day close",
+                        "rr": position.get("rr", 2.0), "sl_pct": position.get("sl_pct", 0),
+                        "session": position.get("session", "NY"),
                     })
                     position = None
 
@@ -2297,7 +2299,7 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
             if asian_range_size <= 0:
                 continue
             sweep_depth = (l_high - ash) if pushed_above else (asl - l_low)
-            if sweep_depth < asian_range_size * 0.10:
+            if sweep_depth < asian_range_size * 0.20:   # tightened: was 0.10
                 continue
 
             last_london_close = float(london[-1][4])
@@ -2383,6 +2385,9 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
 
             size = risk_dollar / risk_dist
 
+            _pa_tp2_dist = abs(tp2_price - entry_price)
+            _pa_rr = round(_pa_tp2_dist / risk_dist, 2) if risk_dist > 0 else 2.0
+            _pa_sl_pct = round(risk_dist / entry_price * 100, 3) if entry_price > 0 else 0
             position = {
                 "side":     reversal,
                 "entry":    entry_price,
@@ -2393,6 +2398,9 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                 "size_rem": size * 0.5,
                 "scaled":   False,
                 "time":     entry_candle[0],
+                "rr":       _pa_rr,
+                "sl_pct":   _pa_sl_pct,
+                "session":  "NY",
                 "setup":    ("ICT " + ("bear" if reversal == "SELL" else "bull") +
                              " | push " + ("above ASH" if pushed_above else "below ASL") +
                              (" | FVG entry" if fvg_entry_price is not None
@@ -2423,6 +2431,8 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                             "exit": round(ep, 6), "pnl": round(net, 4),
                             "entry_time": position["time"], "exit_time": t,
                             "reason": "TP1 — Asian midpoint (50%)",
+                            "rr": position.get("rr", 2.0), "sl_pct": position.get("sl_pct", 0),
+                            "session": position.get("session", "NY"),
                         })
                         position["scaled"] = True
                         position["sl"]     = position["entry"]
@@ -2438,6 +2448,8 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                             "exit": round(ep, 6), "pnl": round(net, 4),
                             "entry_time": position["time"], "exit_time": t,
                             "reason": "TP2 — Opposite Asian boundary (ASL)",
+                            "rr": position.get("rr", 2.0), "sl_pct": position.get("sl_pct", 0),
+                            "session": position.get("session", "NY"),
                         })
                         day_wins += 1; position = None
 
@@ -2454,6 +2466,8 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                             "entry_time": position["time"], "exit_time": t,
                             "reason": ("Stop loss (at breakeven)"
                                        if position["scaled"] else "Stop loss"),
+                            "rr": position.get("rr", 2.0), "sl_pct": position.get("sl_pct", 0),
+                            "session": position.get("session", "NY"),
                         })
                         if not position["scaled"]: day_losses += 1
                         position = None
@@ -2470,6 +2484,8 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                             "exit": round(ep, 6), "pnl": round(net, 4),
                             "entry_time": position["time"], "exit_time": t,
                             "reason": "TP1 — Asian midpoint (50%)",
+                            "rr": position.get("rr", 2.0), "sl_pct": position.get("sl_pct", 0),
+                            "session": position.get("session", "NY"),
                         })
                         position["scaled"] = True
                         position["sl"]     = position["entry"]
@@ -2485,6 +2501,8 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                             "exit": round(ep, 6), "pnl": round(net, 4),
                             "entry_time": position["time"], "exit_time": t,
                             "reason": "TP2 — Opposite Asian boundary (ASH)",
+                            "rr": position.get("rr", 2.0), "sl_pct": position.get("sl_pct", 0),
+                            "session": position.get("session", "NY"),
                         })
                         day_wins += 1; position = None
 
@@ -2501,6 +2519,8 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                             "entry_time": position["time"], "exit_time": t,
                             "reason": ("Stop loss (at breakeven)"
                                        if position["scaled"] else "Stop loss"),
+                            "rr": position.get("rr", 2.0), "sl_pct": position.get("sl_pct", 0),
+                            "session": position.get("session", "NY"),
                         })
                         if not position["scaled"]: day_losses += 1
                         position = None
@@ -2520,6 +2540,8 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                         "exit": round(lc, 6), "pnl": round(net, 4),
                         "entry_time": position["time"], "exit_time": last[0],
                         "reason": "Session-end close (20:00 GMT)",
+                        "rr": position.get("rr", 2.0), "sl_pct": position.get("sl_pct", 0),
+                        "session": position.get("session", "NY"),
                     })
                     position = None
 
@@ -2529,9 +2551,10 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
     # PATH B — DAILY BARS with EMA + ADX + RSI
     # Section 6: trailing stop activates at 1R profit
     # ====================================================================
-    closes = [float(c[4]) for c in candles]
-    highs  = [float(c[2]) for c in candles]
-    lows   = [float(c[3]) for c in candles]
+    closes  = [float(c[4]) for c in candles]
+    highs   = [float(c[2]) for c in candles]
+    lows    = [float(c[3]) for c in candles]
+    volumes = [float(c[5]) if len(c) > 5 and c[5] else 1.0 for c in candles]
 
     ema9_s  = _ema_series(closes, 9)
     ema21_s = _ema_series(closes, 21)
@@ -2622,6 +2645,9 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                     "side": side, "entry": round(ep, 6), "exit": round(exit_price, 6),
                     "pnl": round(net, 4), "entry_time": position["time"],
                     "exit_time": t_str, "reason": exit_reason,
+                    "rr": position.get("rr", 3.0),
+                    "sl_pct": position.get("sl_pct", 0),
+                    "session": "Daily",
                 })
                 position = None
                 # Re-evaluate weekly pause after each close
@@ -2638,10 +2664,27 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
             continue
 
         sl_dist   = max(atr_v * 1.5, close * 0.001)
+
+        # ── Additional filters for higher-quality entries ────────────────
+        # EMA50 slope: trending in the right direction over last 5 bars
+        e50_slope_up   = i >= 5 and ema50_s[i] is not None and ema50_s[i-5] is not None and ema50_s[i] > ema50_s[i-5]
+        e50_slope_down = i >= 5 and ema50_s[i] is not None and ema50_s[i-5] is not None and ema50_s[i] < ema50_s[i-5]
+        # Momentum: close moving in entry direction vs prior bar
+        mom_up   = closes[i] > closes[i-1]
+        mom_down = closes[i] < closes[i-1]
+        # Volume confirmation: current bar volume > 20-bar average * 1.2
+        vol_lookback = volumes[max(0, i-20):i]
+        avg_vol      = (sum(vol_lookback) / len(vol_lookback)) if vol_lookback else 1.0
+        vol_confirm  = volumes[i] >= avg_vol * 1.2 if avg_vol > 0 else True
+
         direction = None
-        if e9 > e21 and close > e50 and adx_v >= ADX_MIN_DAILY and RSI_BUY_LO < rsi_v < RSI_BUY_HI:
+        if (e9 > e21 and close > e50 and adx_v >= ADX_MIN_DAILY
+                and RSI_BUY_LO < rsi_v < RSI_BUY_HI
+                and e50_slope_up and mom_up and vol_confirm):
             direction = "BUY"
-        elif e9 < e21 and close < e50 and adx_v >= ADX_MIN_DAILY and RSI_SELL_LO < rsi_v < RSI_SELL_HI:
+        elif (e9 < e21 and close < e50 and adx_v >= ADX_MIN_DAILY
+                and RSI_SELL_LO < rsi_v < RSI_SELL_HI
+                and e50_slope_down and mom_down and vol_confirm):
             direction = "SELL"
         if not direction:
             continue
@@ -2650,10 +2693,13 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
         sl_p = ep - sl_dist if direction == "BUY" else ep + sl_dist
         tp_p = ep + sl_dist * 3.0 if direction == "BUY" else ep - sl_dist * 3.0
         sz   = risk_dollar / sl_dist
+        rr_actual = round(abs(tp_p - ep) / abs(ep - sl_p), 2) if abs(ep - sl_p) > 0 else 3.0
+        sl_pct    = round(abs(ep - sl_p) / ep * 100, 3) if ep > 0 else 0
         position = {
             "side": direction, "entry": ep, "sl": sl_p, "tp": tp_p,
             "size": sz, "time": t_str,
             "trailing_sl": sl_p,   # Section 6: initialize at SL
+            "rr": rr_actual, "sl_pct": sl_pct,
         }
 
     return trades, balance
@@ -2852,7 +2898,7 @@ def api_backtest():
     cfg = get_user_config()
     _ww_goal = cfg.get("weekly_win_goal",             3)
     _wpt_pct = cfg.get("weekly_profit_target_percent", 3.0)
-    _wml_pct = cfg.get("weekly_max_loss_percent",      2.0)
+    _wml_pct = cfg.get("weekly_max_loss_percent",      0.8)
 
     try:
         if strategy in ("unified_bot", "bot"):   # "bot" kept as legacy alias
