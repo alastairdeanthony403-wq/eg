@@ -832,6 +832,9 @@ function parseTradeTime(str) {
 }
 
 function BacktestChart({ candles, trades, symbol }) {
+  // ── ALL hooks must be called before any early return ──────────────────
+  const [hovered, setHovered] = React.useState(null);
+
   if (!candles?.length) return (
     <div style={{background:T.bg3,border:`1px solid ${T.border}`,borderRadius:5,
       padding:40,textAlign:"center",color:T.t2,fontFamily:MONO,fontSize:12}}>
@@ -846,7 +849,7 @@ function BacktestChart({ candles, trades, symbol }) {
     label: new Date(c.t).toLocaleDateString("en-GB",{month:"short",day:"numeric"}),
   }));
 
-  // Map trades to chart entries/exits (match to nearest candle timestamp)
+  // Map trades to chart entries/exits
   const tradeMarkers = trades.map((t, i) => {
     const tEntry = parseTradeTime(t.open_time  || t.entry_time);
     const tExit  = parseTradeTime(t.close_time || t.exit_time);
@@ -897,9 +900,6 @@ function BacktestChart({ candles, trades, symbol }) {
   const xTickCount = Math.min(6, lineData.length);
   const xTickStep  = Math.floor(lineData.length / xTickCount);
   const xTicks     = lineData.filter((_, i) => i % xTickStep === 0);
-
-  // Custom tooltip state
-  const [hovered, setHovered] = React.useState(null);
 
   return (
     <div style={{background:T.bg3,border:`1px solid ${T.border}`,borderRadius:6,
