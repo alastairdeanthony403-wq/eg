@@ -648,7 +648,7 @@ function TradeTable({trades,sortField,sortDir,onSort}){
               </td>
               <td style={{padding:"7px 10px",color:T.cyan,fontSize:10}}>{t.session||"—"}</td>
               <td style={{padding:"7px 10px",color:T.cyan}}>
-                {t.confluence>0?`${t.confluence}/7`:"—"}
+                {t.confluence>0?`${t.confluence}/9`:"—"}
               </td>
               <td style={{padding:"7px 10px",color:T.t2}}>{t.sl_pct?fmt(t.sl_pct,2)+"%":"—"}</td>
               <td style={{padding:"7px 10px",color:T.gold}}>{t.rr?fmt(t.rr,1)+"R":"—"}</td>

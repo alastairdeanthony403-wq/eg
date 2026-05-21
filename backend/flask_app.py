@@ -629,7 +629,7 @@ def fetch_non_crypto_backtest_candles(symbol, period_days, random_window=False):
         cached = candles
 
     all_candles = cached
-    WARMUP_BARS = 80
+    WARMUP_BARS = 250   # increased: EMA200 needs 200 bars to initialize
 
     if random_window and len(all_candles) > period_days + WARMUP_BARS + 5:
         max_start  = len(all_candles) - period_days - 1
@@ -2190,21 +2190,21 @@ def _bb_series(closes, period=20, std_mult=2.0):
 
 def _dynamic_rr(score, regime="Unknown", adx_val=0):
     """
-    Return a dynamic R:R ratio based on confluence score and market regime.
-    Score 3 → 2.0, 4 → 2.5, 5 → 3.0, 6 → 3.5, 7+ → 4.0
-    Strong trend regimes get a 0.5 bonus.
+    Return a dynamic R:R ratio based on confluence score (out of 9 signals).
+    score 5 → 2.0R, 6 → 2.5R, 7 → 3.0R, 8 → 3.5R, 9 → 4.0R
+    ADX >= 35 or Strong regime adds 0.5R bonus.
     """
-    base = {3: 2.0, 4: 2.5, 5: 3.0, 6: 3.5}.get(min(score, 6), 4.0)
+    base = {5: 2.0, 6: 2.5, 7: 3.0, 8: 3.5}.get(min(score, 8), 4.0)
     bonus = 0.5 if ("Strong" in str(regime) or adx_val >= 35) else 0.0
     return round(base + bonus, 1)
 
 
 def _dynamic_risk_pct(score, base_risk=0.01):
     """
-    Scale position risk by confluence score.
-    score 3 → 0.8%, 4 → 1.0%, 5 → 1.2%, 6 → 1.5%
+    Scale position risk by confluence score (out of 9 signals).
+    score 5 → 0.8%, 6 → 1.0%, 7 → 1.2%, 8+ → 1.5%
     """
-    scale = {3: 0.80, 4: 1.00, 5: 1.20, 6: 1.50}.get(min(score, 6), 1.50)
+    scale = {5: 0.80, 6: 1.00, 7: 1.20, 8: 1.50}.get(min(score, 8), 1.50)
     return base_risk * scale
 
 
@@ -2243,10 +2243,10 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
     DISP_BODY_RATIO = 0.65    # tightened: was 0.50
     SL_BUFFER       = 0.0005
 
-    WARMUP        = 55
-    ADX_MIN_DAILY = 25        # tightened: was 18
-    RSI_BUY_LO    = 45;  RSI_BUY_HI  = 65   # tightened: was 40 / 75
-    RSI_SELL_LO   = 35;  RSI_SELL_HI = 55   # tightened: was 25 / 60
+    WARMUP        = 210   # increased: allows EMA200 to initialize (needs 200 bars)
+    ADX_MIN_DAILY = 18    # used in PATH A only; confluence scoring handles PATH B
+    RSI_BUY_LO    = 40;  RSI_BUY_HI  = 72   # PATH B signals use these
+    RSI_SELL_LO   = 28;  RSI_SELL_HI = 60
 
     trades      = []
     balance     = float(starting_balance)
@@ -2626,7 +2626,7 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
     )
     bb_up, bb_mid, bb_lo = _bb_series(closes, 20, 2.0)
 
-    CONFLUENCE_MIN = 4    # min signals to enter (out of 7)
+    CONFLUENCE_MIN = 5    # min signals to enter (out of up to 9)
 
     position       = None
     current_day    = None
@@ -2643,7 +2643,6 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
         e200  = ema200_s[i]
         atr_v = atr_s[i];   rsi_v = rsi_s[i];   adx_v = adx_s[i]
         sma20 = sma20_s[i]; mac   = macd_s[i];   mac_sig = macd_sig[i]
-        bb_m  = bb_mid[i]
 
         # Skip bars with missing indicators
         if any(v is None for v in [e9, e21, e50, atr_v, rsi_v, adx_v, sma20, mac]) \
@@ -2733,62 +2732,85 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
         if week_paused:
             continue
 
-        # ── Volume average (20-bar) ───────────────────────────────────────
+        # ── Volume & ATR rolling averages (20-bar) ───────────────────────
         vol_lb  = volumes[max(0, i - 20):i]
         avg_vol = sum(vol_lb) / len(vol_lb) if vol_lb else 1.0
+        atr_lb  = [x for x in atr_s[max(0, i - 20):i] if x is not None]
+        avg_atr = sum(atr_lb) / len(atr_lb) if atr_lb else atr_v
 
         # ── EMA50 5-bar slope ────────────────────────────────────────────
         e50_prev = ema50_s[i - 5] if i >= 5 and ema50_s[i - 5] is not None else e50
 
-        # ── HTF bias: EMA200 (if available) ─────────────────────────────
-        htf_bull = (e200 is not None and close > e200)
-        htf_bear = (e200 is not None and close < e200)
+        # ── HTF bias: permissive when EMA200 data unavailable ────────────
+        # FIX: e200 is None when window < 200 bars → was blocking ALL trades
+        htf_ok_buy  = (e200 is None) or (close > e200)
+        htf_ok_sell = (e200 is None) or (close < e200)
+
+        # ── Market activity gate: skip dead-flat bars ─────────────────────
+        # Require ATR to be at least 60% of its 20-bar average
+        if avg_atr > 0 and atr_v < avg_atr * 0.60:
+            continue   # market too quiet — skip
 
         # ════════════════════════════════════════════════════════════════
-        # CONFLUENCE SCORING  (7 strategies, each = 1 signal)
+        # CONFLUENCE SCORING  (9 signals, need ≥5 to enter)
+        # More signals = higher conviction = wider R:R + larger position
         # ════════════════════════════════════════════════════════════════
         buy_signals  = []
         sell_signals = []
 
-        # Signal 1 — EMA trend stack
+        # Signal 1 — EMA trend stack (all three aligned)
         if e9 > e21 > e50:
             buy_signals.append("EMA stack bullish")
         if e9 < e21 < e50:
             sell_signals.append("EMA stack bearish")
 
-        # Signal 2 — ADX trend strength (relaxed to 20)
-        if adx_v >= 20:
+        # Signal 2 — ADX trend strength (market is trending, not flat)
+        if adx_v >= 18:
             buy_signals.append("ADX trending")
             sell_signals.append("ADX trending")
 
-        # Signal 3 — RSI momentum zone
-        if RSI_BUY_LO < rsi_v < RSI_BUY_HI:
+        # Signal 3 — RSI in healthy momentum zone (wider for more signals)
+        if 40 < rsi_v < 72:
             buy_signals.append("RSI healthy bull")
-        if RSI_SELL_LO < rsi_v < RSI_SELL_HI:
+        if 28 < rsi_v < 60:
             sell_signals.append("RSI healthy bear")
 
-        # Signal 4 — EMA50 slope
+        # Signal 4 — EMA50 slope (trend direction confirmed over 5 bars)
         if e50 > e50_prev:
             buy_signals.append("EMA50 rising")
         if e50 < e50_prev:
             sell_signals.append("EMA50 falling")
 
-        # Signal 5 — MACD above/below zero line
+        # Signal 5 — MACD line above/below zero (momentum direction)
         if mac > 0:
             buy_signals.append("MACD bullish")
         if mac < 0:
             sell_signals.append("MACD bearish")
 
-        # Signal 6 — Price vs SMA20 (medium-term trend)
+        # Signal 6 — Price vs SMA20 (medium-term trend filter)
         if close > sma20:
             buy_signals.append("Above SMA20")
         if close < sma20:
             sell_signals.append("Below SMA20")
 
-        # Signal 7 — Volume confirmation (volume > 1.1× avg)
-        if avg_vol > 0 and volumes[i] >= avg_vol * 1.1:
-            buy_signals.append("Volume confirmed")
-            sell_signals.append("Volume confirmed")
+        # Signal 7 — ATR expansion: trade when market is actively moving
+        # This directly targets the "more market movement" requirement
+        if avg_atr > 0 and atr_v >= avg_atr * 1.05:
+            buy_signals.append("ATR expanding — market active")
+            sell_signals.append("ATR expanding — market active")
+
+        # Signal 8 — Bollinger Band position (price above/below midline)
+        bb_m = bb_mid[i]
+        if bb_m is not None and close > bb_m:
+            buy_signals.append("Above BB midline")
+        if bb_m is not None and close < bb_m:
+            sell_signals.append("Below BB midline")
+
+        # Signal 9 (bonus) — EMA200 HTF alignment when data available
+        if e200 is not None and close > e200:
+            buy_signals.append("Above EMA200 HTF")
+        if e200 is not None and close < e200:
+            sell_signals.append("Below EMA200 HTF")
 
         # ── Determine direction from confluence ───────────────────────────
         buy_score  = len(buy_signals)
@@ -2798,9 +2820,9 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
         score     = 0
         signals   = []
 
-        if buy_score >= CONFLUENCE_MIN and buy_score > sell_score and htf_bull is not False:
+        if buy_score >= CONFLUENCE_MIN and buy_score > sell_score and htf_ok_buy:
             direction = "BUY";  score = buy_score;  signals = buy_signals
-        elif sell_score >= CONFLUENCE_MIN and sell_score > buy_score and htf_bear is not False:
+        elif sell_score >= CONFLUENCE_MIN and sell_score > buy_score and htf_ok_sell:
             direction = "SELL"; score = sell_score; signals = sell_signals
 
         if not direction:
