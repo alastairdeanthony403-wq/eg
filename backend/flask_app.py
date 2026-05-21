@@ -539,6 +539,44 @@ def fetch_binance_range(symbol, interval, start_ms, end_ms, limit=1000):
     return data
 
 
+# Interval → milliseconds map for pagination
+_INTERVAL_MS = {
+    "1m":  60_000,   "3m":  180_000,  "5m":   300_000,
+    "15m": 900_000,  "30m": 1_800_000,"1h":  3_600_000,
+    "4h":  14_400_000,"1d": 86_400_000,
+}
+
+def fetch_binance_range_paginated(symbol, interval, start_ms, end_ms, max_candles=10000):
+    """
+    Fetch ALL candles in [start_ms, end_ms] for a crypto symbol, making
+    multiple Binance API calls (1000 per page) as needed.
+    Binance hard-limits each request to 1000 candles, so 30 days of 5m data
+    (8640 candles) requires ~9 sequential requests.
+    """
+    iv_ms       = _INTERVAL_MS.get(interval, 300_000)
+    all_candles = []
+    cur_start   = int(start_ms)
+    end_ms      = int(end_ms)
+
+    while cur_start < end_ms and len(all_candles) < max_candles:
+        chunk = fetch_binance_range(symbol, interval, cur_start, end_ms, 1000)
+        if not chunk:
+            break
+        all_candles.extend(chunk)
+        if len(chunk) < 1000:
+            break   # received fewer than a full page → no more data
+        # Advance start to just after the last received candle
+        cur_start = int(chunk[-1][0]) + iv_ms
+
+    # Deduplicate by open-timestamp (safety net) and trim to max
+    seen, deduped = set(), []
+    for c in all_candles:
+        ts = int(c[0])
+        if ts not in seen:
+            seen.add(ts); deduped.append(c)
+    return deduped[:max_candles]
+
+
 # ─────────────────────────────────────────────
 # POLYGON.IO (FOREX / STOCKS / COMMODITIES)
 # ─────────────────────────────────────────────
@@ -2233,7 +2271,8 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                               fee_pct=0.04, slippage_pct=0.02,
                               weekly_win_goal=3,
                               weekly_profit_target_pct=3.0,
-                              weekly_max_loss_pct=0.8):
+                              weekly_max_loss_pct=0.8,
+                              user_cfg=None):
     """
     ICT — Asian Range → London Push → New York Reversal
 
@@ -2256,12 +2295,13 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
     NY_END         = 1020
     SESSION_CLOSE  = 1200
 
-    DISP_BODY_RATIO = 0.65    # tightened: was 0.50
+    DISP_BODY_RATIO = 0.52    # relaxed from 0.65 — crypto 5m needs looser threshold
     SL_BUFFER       = 0.0005
+    SWEEP_DEPTH_PCT = 0.12    # relaxed from 0.20 — allow shallower liquidity grabs
 
-    WARMUP        = 210   # increased: allows EMA200 to initialize (needs 200 bars)
-    ADX_MIN_DAILY = 18    # used in PATH A only; confluence scoring handles PATH B
-    RSI_BUY_LO    = 40;  RSI_BUY_HI  = 72   # PATH B signals use these
+    WARMUP        = 210   # PATH B: allows EMA200 to initialize (needs 200 bars)
+    ADX_MIN_DAILY = 18    # PATH A fallback; PATH B uses confluence scoring
+    RSI_BUY_LO    = 40;  RSI_BUY_HI  = 72   # PATH B confluence RSI bands
     RSI_SELL_LO   = 28;  RSI_SELL_HI = 60
 
     trades      = []
@@ -2368,7 +2408,7 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
             if asian_range_size <= 0:
                 continue
             sweep_depth = (l_high - ash) if pushed_above else (asl - l_low)
-            if sweep_depth < asian_range_size * 0.20:   # tightened: was 0.10
+            if sweep_depth < asian_range_size * SWEEP_DEPTH_PCT:
                 continue
 
             last_london_close = float(london[-1][4])
@@ -2642,7 +2682,10 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
     )
     bb_up, bb_mid, bb_lo = _bb_series(closes, 20, 2.0)
 
-    CONFLUENCE_MIN = 5    # min signals to enter (out of up to 9)
+    # Allow learn-adjusted values to override hardcoded defaults
+    _ucfg = user_cfg or {}
+    CONFLUENCE_MIN  = int(_ucfg.get("confluence_min",  5))    # learn can lower this
+    _DISP_BODY      = float(_ucfg.get("disp_body_ratio", DISP_BODY_RATIO))  # learn can adjust
 
     position       = None
     current_day    = None
@@ -3007,7 +3050,8 @@ def api_backtest():
     try:
         if market == "crypto":
             iv_minutes  = {"1m": 1, "5m": 5, "15m": 15, "1h": 60, "4h": 240}[interval]
-            target_rows = max(100, min(int(period_days * 24 * 60 / iv_minutes), 1000))
+            # Full candle count for the period (no artificial cap — pagination handles it)
+            target_rows = int(period_days * 24 * 60 / iv_minutes)
             period_ms   = period_days * 24 * 60 * 60 * 1000
             now_utc     = datetime.now(timezone.utc)
 
@@ -3023,7 +3067,6 @@ def api_backtest():
                     start_dt = earliest
                 end_dt = start_dt + timedelta(days=period_days)
             else:
-                # Section 7: when random_window=False, always use most recent period
                 end_ms   = int(now_utc.timestamp() * 1000)
                 start_ms = end_ms - period_ms
                 start_dt = datetime.utcfromtimestamp(start_ms / 1000)
@@ -3034,7 +3077,10 @@ def api_backtest():
             start_date = start_dt.strftime("%Y-%m-%d")
             end_date   = end_dt.strftime("%Y-%m-%d")
 
-            candles = fetch_binance_range(symbol, interval, start_ms, end_ms, target_rows)
+            # Paginated fetch — overcomes Binance 1000-candle per-request limit
+            candles = fetch_binance_range_paginated(
+                symbol, interval, start_ms, end_ms, max_candles=target_rows
+            )
 
             if not candles or len(candles) < 60:
                 return jsonify({
@@ -3070,6 +3116,7 @@ def api_backtest():
                 weekly_win_goal=_ww_goal,
                 weekly_profit_target_pct=_wpt_pct,
                 weekly_max_loss_pct=_wml_pct,
+                user_cfg=cfg,   # pass learn-adjusted config
             )
         elif strategy == "orb_0dte":
             trades, ending_balance = run_orb_strategy(candles, sb, fee_pct, slip_pct)
@@ -3777,20 +3824,44 @@ def _analyze_losing_trades(losing_trades, backtest_runs, cfg):
                 f"High SL hit rate → min_confidence {cur_conf} → {cur_conf + 5}"
             )
 
-    # ── 4. Low average win rate → raise min_smc_score ────────────────
+    # ── 4a. Zero trades in most runs → filters too restrictive ──────────
     wrs = [float(r.get("win_rate") or 0) for r in backtest_runs]
+    zero_trade_runs = [r for r in backtest_runs if int(r.get("total_trades", 0) if "total_trades" in r else 0) == 0]
+    if len(zero_trade_runs) >= max(1, len(backtest_runs) * 0.6):
+        cur_cm = int(cfg.get("confluence_min", 5))
+        new_cm = max(3, cur_cm - 1)   # relax threshold, floor at 3
+        if new_cm < cur_cm:
+            patterns.append(
+                f"{len(zero_trade_runs)}/{len(backtest_runs)} runs placed 0 trades "
+                f"— entry filters too restrictive, reducing confluence requirement"
+            )
+            adjustments["confluence_min"] = new_cm
+            adjustments["_r_confluence"] = (
+                f"0-trade runs → confluence_min {cur_cm} → {new_cm}"
+            )
+        # Also relax DISP_BODY_RATIO for PATH A
+        cur_db = float(cfg.get("disp_body_ratio", 0.52))
+        new_db = round(max(0.40, cur_db - 0.05), 2)
+        if new_db < cur_db:
+            adjustments["disp_body_ratio"] = new_db
+            adjustments["_r_disp"] = (
+                f"0-trade runs → disp_body_ratio {cur_db} → {new_db}"
+            )
+
+    # ── 4b. Low average win rate (trades exist but mostly losing) ────────
     if wrs:
         avg_wr = sum(wrs) / len(wrs)
-        if avg_wr < 40:
+        if avg_wr < 40 and len(zero_trade_runs) < len(backtest_runs):
             patterns.append(
                 f"Average win rate is {avg_wr:.1f}% across {len(wrs)} runs "
                 f"— signal selectivity too low"
             )
-            cur_smc = int(cfg.get("min_smc_score", 6))
-            if "min_smc_score" not in adjustments and cur_smc < 9:
-                adjustments["min_smc_score"] = cur_smc + 1
-                adjustments["_r_smc"] = (
-                    f"Low avg win rate → min_smc_score {cur_smc} → {cur_smc + 1}"
+            # Raise confluence_min to be more selective (opposite of 4a)
+            cur_cm2 = int(cfg.get("confluence_min", 5))
+            if "confluence_min" not in adjustments and cur_cm2 < 8:
+                adjustments["confluence_min"] = cur_cm2 + 1
+                adjustments["_r_cm2"] = (
+                    f"Low win rate → confluence_min {cur_cm2} → {cur_cm2 + 1}"
                 )
 
     # ── 5. Directional bias ───────────────────────────────────────────
@@ -3848,7 +3919,8 @@ def learn_from_mistakes():
     # ── Pull recent backtest runs ──────────────────────────────────────
     conn = get_conn(); cur = conn.cursor()
     query  = """SELECT id, symbol, interval, strategy, win_rate, net_pnl,
-                       profit_factor, trades_json, summary_json, created_at
+                       profit_factor, trades_json, summary_json, created_at,
+                       total_trades
                 FROM backtest_runs
                 WHERE user_id = %s"""
     params = [g.user_id]
@@ -3881,6 +3953,7 @@ def learn_from_mistakes():
             "net_pnl":       row[5],
             "profit_factor": row[6],
             "created_at":    str(row[9]),
+            "total_trades":  int(row[10] or 0),
         }
         backtest_runs.append(run)
         try:
