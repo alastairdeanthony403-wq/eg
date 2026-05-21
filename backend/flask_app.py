@@ -152,7 +152,7 @@ DEFAULT_CONFIG = {
 
 JWT_SECRET      = os.environ.get("JWT_SECRET", "ai-trading-engine-secret-change-me")
 JWT_ALGO        = "HS256"
-JWT_EXPIRY_DAYS = 7
+JWT_EXPIRY_DAYS = 30   # was 7 — tokens were expiring too quickly
 
 MARKET_DATA_TTL_SECONDS  = 30
 SUMMARY_TTL_SECONDS      = 90
@@ -341,6 +341,22 @@ def me():
     if not row:
         return jsonify({"error": "User not found"}), 404
     return jsonify({"id": row[0], "email": row[1], "name": row[2], "created_at": row[3]})
+
+
+@app.route("/api/auth/refresh", methods=["POST", "GET"])
+@auth_required
+def refresh_token():
+    """Issue a fresh JWT token for an already-authenticated user."""
+    conn = get_conn(); c = conn.cursor()
+    c.execute("SELECT id, email, name FROM users WHERE id=%s", (g.user_id,))
+    row = c.fetchone(); conn.close()
+    if not row:
+        return jsonify({"error": "User not found"}), 404
+    new_token = make_token(row[0], row[1])
+    return jsonify({
+        "token": new_token,
+        "user": {"id": row[0], "email": row[1], "name": row[2]},
+    })
 
 
 # ─────────────────────────────────────────────

@@ -1,8 +1,11 @@
 /**
- * src/utils/api.js — NexusBot
+ * src/lib/api.js — NexusBot
  * CRA / craco compatible. No import.meta (Vite-only).
  * Set REACT_APP_API_URL in Vercel/Render env vars.
  * Example: REACT_APP_API_URL=https://your-flask.onrender.com
+ *
+ * Auto-logout on 401: dispatches "auth:expired" event so AuthProvider
+ * can clear state and redirect to login.
  */
 export const API_BASE = process.env.REACT_APP_API_URL || "";
 
@@ -43,6 +46,13 @@ export async function apiFetch(path, options = {}) {
   }
 
   if (!response.ok) {
+    // On 401 — token expired or invalid: clear session and signal logout
+    if (response.status === 401) {
+      localStorage.removeItem("token");
+      localStorage.removeItem("ate_user");
+      window.dispatchEvent(new Event("auth:expired"));
+      throw new Error("Session expired — please log in again");
+    }
     throw new Error((data && (data.error || data.message)) || "HTTP " + response.status);
   }
   return data;
