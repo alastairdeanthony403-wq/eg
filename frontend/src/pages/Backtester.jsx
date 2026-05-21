@@ -4,8 +4,8 @@
  * strategy comparison, learn-from-mistakes panel, historical metadata.
  * FIX: response body is read exactly once — no "body stream already read" error.
  */
+import React, { useState, useEffect, useCallback } from "react";
 import { apiFetch } from "../lib/api";
-import { useState, useEffect, useCallback } from "react";
 import {
   AreaChart, Area, BarChart, Bar,
   XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
@@ -70,6 +70,7 @@ export default function Backtester() {
   const [running,   setRunning]  = useState(false);
   const [error,     setError]    = useState(null);
   const [tab,       setTab]      = useState("results");
+  const [chartCandles, setChartCandles] = useState([]);
 
   // Sub-features
   const [history,     setHistory]   = useState([]);
@@ -96,6 +97,7 @@ export default function Backtester() {
       });
       // ← read body ONCE
       setResult(d);
+      setChartCandles(d.candles_chart || []);
       loadHistory();
     } catch(e){ setError(e.message); }
     finally{ setRunning(false); }
@@ -272,7 +274,7 @@ export default function Backtester() {
 
       {/* Tabs */}
       <div style={{margin:"0 20px",borderBottom:`1px solid ${T.border}`,display:"flex",gap:0}}>
-        {["results","trades","compare","learn","history"].map(t=>(
+        {["results","chart","trades","compare","learn","history"].map(t=>(
           <button key={t} onClick={()=>setTab(t)}
             style={{padding:"9px 18px",background:"none",border:"none",borderBottom:`2px solid ${tab===t?T.blue:"transparent"}`,
               color:tab===t?T.blue:T.t2,cursor:"pointer",fontFamily:MONO,fontSize:10,
@@ -307,6 +309,16 @@ export default function Backtester() {
                   <ChartTitle>DAILY P&L</ChartTitle>
                   <DailyPnlChart data={dailyPnl}/>
                 </div>
+              </div>
+        )}
+
+        {/* CHART TAB */}
+        {tab==="chart"&&(
+          !result
+            ? <EmptyState text="Run a backtest to see the price chart."/>
+            : <div style={{animation:"slide .25s ease"}}>
+                <TestMeta result={result}/>
+                <BacktestChart candles={chartCandles} trades={trades} symbol={result.symbol}/>
               </div>
         )}
 
@@ -805,6 +817,251 @@ function LearnResult({data:d}){
               </tbody>
             </table>
           </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── BACKTEST PRICE CHART ──────────────────────────────────────────────────────
+function parseTradeTime(str) {
+  if (!str) return 0;
+  // "YYYY-MM-DD HH:MM" or "YYYY-MM-DD HH:MM:SS"
+  const d = new Date(str.replace(" ", "T") + (str.length <= 16 ? ":00Z" : "Z"));
+  return isNaN(d.getTime()) ? 0 : d.getTime();
+}
+
+function BacktestChart({ candles, trades, symbol }) {
+  if (!candles?.length) return (
+    <div style={{background:T.bg3,border:`1px solid ${T.border}`,borderRadius:5,
+      padding:40,textAlign:"center",color:T.t2,fontFamily:MONO,fontSize:12}}>
+      Chart data unavailable for this run.
+    </div>
+  );
+
+  // Build close-price line from sampled candles
+  const lineData = candles.map(c => ({
+    t:     c.t,
+    close: c.c,
+    label: new Date(c.t).toLocaleDateString("en-GB",{month:"short",day:"numeric"}),
+  }));
+
+  // Map trades to chart entries/exits (match to nearest candle timestamp)
+  const tradeMarkers = trades.map((t, i) => {
+    const tEntry = parseTradeTime(t.open_time  || t.entry_time);
+    const tExit  = parseTradeTime(t.close_time || t.exit_time);
+    const win = (t.pnl || 0) > 0;
+    return {
+      id:       i,
+      tEntry,
+      tExit,
+      entry:    t.entry,
+      exit:     t.exit,
+      side:     t.side,
+      pnl:      t.pnl,
+      win,
+      reason:   t.exit_reason || t.reason || "—",
+      session:  t.session || "—",
+    };
+  });
+
+  const minT  = lineData[0]?.t || 0;
+  const maxT  = lineData[lineData.length - 1]?.t || 1;
+  const tSpan = maxT - minT || 1;
+  const prices  = lineData.map(d => d.close);
+  const minP  = Math.min(...prices);
+  const maxP  = Math.max(...prices);
+  const pSpan = maxP - minP || 1;
+
+  // SVG dimensions
+  const W = 900; const H = 340;
+  const PAD = { top: 20, right: 20, bottom: 36, left: 70 };
+  const cW = W - PAD.left - PAD.right;
+  const cH = H - PAD.top  - PAD.bottom;
+
+  const tx = t  => PAD.left + ((t  - minT) / tSpan) * cW;
+  const ty = p  => PAD.top  + cH - ((p - minP) / pSpan) * cH;
+
+  // Build SVG path for close-price line
+  const path = lineData.map((d, i) =>
+    `${i === 0 ? "M" : "L"}${tx(d.t).toFixed(1)},${ty(d.close).toFixed(1)}`
+  ).join(" ");
+
+  // Y-axis tick values
+  const yTicks = 5;
+  const yTickVals = Array.from({length: yTicks}, (_, i) =>
+    minP + (pSpan * i / (yTicks - 1))
+  );
+
+  // X-axis tick labels (sample ~6 dates)
+  const xTickCount = Math.min(6, lineData.length);
+  const xTickStep  = Math.floor(lineData.length / xTickCount);
+  const xTicks     = lineData.filter((_, i) => i % xTickStep === 0);
+
+  // Custom tooltip state
+  const [hovered, setHovered] = React.useState(null);
+
+  return (
+    <div style={{background:T.bg3,border:`1px solid ${T.border}`,borderRadius:6,
+      padding:"16px 10px 10px",marginBottom:14}}>
+      <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:12,padding:"0 10px"}}>
+        <span style={{fontFamily:MONO,fontSize:10,color:T.blue,letterSpacing:2}}>
+          PRICE CHART — {symbol}
+        </span>
+        <span style={{fontFamily:MONO,fontSize:9,color:T.t2}}>
+          {candles.length} sampled candles
+        </span>
+        <div style={{marginLeft:"auto",display:"flex",gap:16}}>
+          <span style={{fontFamily:MONO,fontSize:9,color:T.green}}>▲ BUY entry</span>
+          <span style={{fontFamily:MONO,fontSize:9,color:T.red}}>▼ SELL entry</span>
+          <span style={{fontFamily:MONO,fontSize:9,color:T.green}}>◆ Win exit</span>
+          <span style={{fontFamily:MONO,fontSize:9,color:T.red}}>◆ Loss exit</span>
+        </div>
+      </div>
+
+      <div style={{width:"100%",overflowX:"auto"}}>
+        <svg width="100%" viewBox={`0 0 ${W} ${H}`} style={{display:"block",minWidth:400}}>
+          {/* Background */}
+          <rect x={PAD.left} y={PAD.top} width={cW} height={cH}
+            fill={T.bg2} rx="3"/>
+
+          {/* Y-axis grid + labels */}
+          {yTickVals.map((v, i) => {
+            const yy = ty(v);
+            const lbl = v >= 1000
+              ? v.toLocaleString("en",{maximumFractionDigits:0})
+              : v < 0.01 ? v.toExponential(2)
+              : v.toFixed(v < 1 ? 4 : 2);
+            return (
+              <g key={i}>
+                <line x1={PAD.left} y1={yy} x2={PAD.left + cW} y2={yy}
+                  stroke={T.border} strokeDasharray="3 3" strokeWidth="0.5"/>
+                <text x={PAD.left - 6} y={yy + 4} textAnchor="end"
+                  fill={T.t2} fontSize="9" fontFamily={MONO}>{lbl}</text>
+              </g>
+            );
+          })}
+
+          {/* X-axis labels */}
+          {xTicks.map((d, i) => (
+            <text key={i} x={tx(d.t)} y={H - PAD.bottom + 14} textAnchor="middle"
+              fill={T.t2} fontSize="9" fontFamily={MONO}>{d.label}</text>
+          ))}
+
+          {/* Price line gradient fill */}
+          <defs>
+            <linearGradient id="chartFill" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%"   stopColor={T.blue} stopOpacity="0.25"/>
+              <stop offset="100%" stopColor={T.blue} stopOpacity="0.02"/>
+            </linearGradient>
+            <clipPath id="chartClip">
+              <rect x={PAD.left} y={PAD.top} width={cW} height={cH}/>
+            </clipPath>
+          </defs>
+
+          {/* Area fill */}
+          <path d={path + ` L${tx(maxT).toFixed(1)},${PAD.top+cH} L${tx(minT).toFixed(1)},${PAD.top+cH} Z`}
+            fill="url(#chartFill)" clipPath="url(#chartClip)"/>
+
+          {/* Price line */}
+          <path d={path} fill="none" stroke={T.blue} strokeWidth="1.5"
+            clipPath="url(#chartClip)"/>
+
+          {/* Trade entry/exit markers */}
+          {tradeMarkers.map(m => {
+            const xe = tx(m.tEntry);
+            const xx = tx(m.tExit);
+            const ye = ty(m.entry);
+            const yx = ty(m.exit);
+            const isBuy  = m.side === "BUY";
+            const eColor = isBuy ? T.green : T.red;
+            const xColor = m.win  ? T.green : T.red;
+            const inBounds = (v) => v >= PAD.left && v <= PAD.left + cW;
+            return (
+              <g key={m.id} clipPath="url(#chartClip)">
+                {/* Thin connector line entry→exit */}
+                {inBounds(xe) && inBounds(xx) && (
+                  <line x1={xe} y1={ye} x2={xx} y2={yx}
+                    stroke={xColor} strokeWidth="0.8" strokeDasharray="4 2" strokeOpacity="0.5"/>
+                )}
+                {/* Entry vertical tick */}
+                {inBounds(xe) && (
+                  <line x1={xe} y1={PAD.top} x2={xe} y2={PAD.top + cH}
+                    stroke={eColor} strokeWidth="1" strokeOpacity="0.3"/>
+                )}
+                {/* Entry triangle */}
+                {inBounds(xe) && (
+                  <polygon
+                    points={isBuy
+                      ? `${xe},${ye-10} ${xe-6},${ye+2} ${xe+6},${ye+2}`
+                      : `${xe},${ye+10} ${xe-6},${ye-2} ${xe+6},${ye-2}`}
+                    fill={eColor}
+                    opacity="0.9"
+                    style={{cursor:"pointer"}}
+                    onMouseEnter={() => setHovered({...m, kind:"entry", x:xe, y:ye})}
+                    onMouseLeave={() => setHovered(null)}
+                  />
+                )}
+                {/* Exit diamond */}
+                {inBounds(xx) && (
+                  <polygon
+                    points={`${xx},${yx-7} ${xx+7},${yx} ${xx},${yx+7} ${xx-7},${yx}`}
+                    fill={xColor} opacity="0.85"
+                    style={{cursor:"pointer"}}
+                    onMouseEnter={() => setHovered({...m, kind:"exit", x:xx, y:yx})}
+                    onMouseLeave={() => setHovered(null)}
+                  />
+                )}
+              </g>
+            );
+          })}
+
+          {/* Hover tooltip */}
+          {hovered && (() => {
+            const bx = Math.min(hovered.x + 12, W - 165);
+            const by = Math.max(hovered.y - 60, PAD.top + 4);
+            const lines = hovered.kind === "entry"
+              ? [`${hovered.side} @ ${fmt(hovered.entry,4)}`,
+                 `Session: ${hovered.session}`,
+                 `PnL: ${fmtPnl(hovered.pnl)}`]
+              : [`Exit @ ${fmt(hovered.exit,4)}`,
+                 `${hovered.reason}`,
+                 `PnL: ${fmtPnl(hovered.pnl)}`];
+            return (
+              <g>
+                <rect x={bx} y={by} width="155" height={lines.length*16+12}
+                  rx="3" fill={T.bg2} stroke={T.border} strokeWidth="1"/>
+                {lines.map((l,i)=>(
+                  <text key={i} x={bx+8} y={by+16+i*16}
+                    fill={i===2?(hovered.pnl>0?T.green:T.red):T.text}
+                    fontSize="10" fontFamily={MONO}>{l}</text>
+                ))}
+              </g>
+            );
+          })()}
+
+          {/* Axes borders */}
+          <line x1={PAD.left} y1={PAD.top} x2={PAD.left} y2={PAD.top+cH}
+            stroke={T.border} strokeWidth="1"/>
+          <line x1={PAD.left} y1={PAD.top+cH} x2={PAD.left+cW} y2={PAD.top+cH}
+            stroke={T.border} strokeWidth="1"/>
+        </svg>
+      </div>
+
+      {/* Trade summary strip below chart */}
+      {trades.length > 0 && (
+        <div style={{display:"flex",gap:8,flexWrap:"wrap",padding:"10px 10px 0",
+          borderTop:`1px solid ${T.border}`,marginTop:8}}>
+          {trades.map((t,i)=>(
+            <div key={i} title={`${t.side} @ ${fmt(t.entry,4)} → ${fmtPnl(t.pnl)}`}
+              style={{background:(t.pnl||0)>0?`${T.green}18`:`${T.red}18`,
+                border:`1px solid ${(t.pnl||0)>0?T.green:T.red}44`,
+                borderRadius:3,padding:"3px 8px",
+                fontFamily:MONO,fontSize:9,
+                color:(t.pnl||0)>0?T.green:T.red,cursor:"default",whiteSpace:"nowrap"}}>
+              {t.side==="BUY"?"▲":"▼"} {fmtPnl(t.pnl)}
+            </div>
+          ))}
         </div>
       )}
     </div>

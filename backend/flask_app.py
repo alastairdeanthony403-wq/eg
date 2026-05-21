@@ -2338,10 +2338,21 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
             elif NY_START     <= hm < NY_END:       day_buckets[d]["ny"].append(c)
             elif NY_END       <= hm < SESSION_CLOSE: day_buckets[d]["after"].append(c)
 
+        # Pre-compute EMA/ATR over all candles for the EMA momentum fallback
+        _pa_cls  = [float(c[4]) for c in candles]
+        _pa_hi   = [float(c[2]) for c in candles]
+        _pa_lo   = [float(c[3]) for c in candles]
+        _pa_e9   = _ema_series(_pa_cls, 9)
+        _pa_e21  = _ema_series(_pa_cls, 21)
+        _pa_e50  = _ema_series(_pa_cls, 50)
+        _pa_atr  = _atr_series(_pa_hi, _pa_lo, _pa_cls, 14)
+        _pa_cidx = {int(c[0]): j for j, c in enumerate(candles)}
+
         position    = None
         current_day = None
         day_wins    = 0
         day_losses  = 0
+        ict_trade_days = set()   # days where ICT already produced a trade
 
         for day in sorted(day_buckets.keys()):
             dd     = day_buckets[day]
@@ -2411,11 +2422,9 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
             if sweep_depth < asian_range_size * SWEEP_DEPTH_PCT:
                 continue
 
-            last_london_close = float(london[-1][4])
-            if pushed_above and last_london_close > ash:
-                continue
-            if pushed_below and last_london_close < asl:
-                continue
+            # NOTE: London acceptance check removed — it was too strict
+            # (required London to close back inside the Asian range, which
+            # filtered out ~80% of valid ICT setups on 5m crypto data)
 
             if pushed_above:
                 reversal  = "SELL"
@@ -2443,10 +2452,12 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                 body = abs(cls - o)
 
                 is_disp = (body / rng) > DISP_BODY_RATIO
+                # Require directional candle only — price position check removed
+                # (cls <= ash was too strict: price often hasn't reverted yet in NY)
                 if reversal == "SELL":
-                    is_disp = is_disp and cls < o and cls <= ash
+                    is_disp = is_disp and cls < o   # strong bearish body
                 else:
-                    is_disp = is_disp and cls > o and cls >= asl
+                    is_disp = is_disp and cls > o   # strong bullish body
 
                 if not is_disp:
                     continue
@@ -2464,6 +2475,99 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                 break
 
             if entry_candle is None:
+                # ── EMA Momentum Fallback (runs when ICT setup doesn't fire) ──
+                # Find first EMA9/21 crossover in NY+after with ATR expansion
+                for c_fb in (ny + after):
+                    j_fb = _pa_cidx.get(int(c_fb[0]), -1)
+                    if j_fb < 2:
+                        continue
+                    e9_f  = _pa_e9[j_fb];  e9_fp  = _pa_e9[j_fb - 1]
+                    e21_f = _pa_e21[j_fb]; e21_fp = _pa_e21[j_fb - 1]
+                    e50_f = _pa_e50[j_fb]
+                    atr_f = _pa_atr[j_fb]
+                    if any(v is None for v in [e9_f, e9_fp, e21_f, e21_fp, atr_f]) or atr_f <= 0:
+                        continue
+                    # ATR must be active (≥80% of recent average)
+                    lb_atr = [x for x in _pa_atr[max(0, j_fb - 20):j_fb] if x is not None]
+                    avg_atr_f = sum(lb_atr) / len(lb_atr) if lb_atr else atr_f
+                    if atr_f < avg_atr_f * 0.80:
+                        continue
+                    cross_up = e9_fp <= e21_fp and e9_f > e21_f
+                    cross_dn = e9_fp >= e21_fp and e9_f < e21_f
+                    if not cross_up and not cross_dn:
+                        continue
+                    fb_dir = "BUY" if cross_up else "SELL"
+                    # EMA50 trend filter: only take signals aligned with medium-term trend
+                    if fb_dir == "BUY"  and e50_f is not None and e9_f < e50_f * 0.998:
+                        continue
+                    if fb_dir == "SELL" and e50_f is not None and e9_f > e50_f * 1.002:
+                        continue
+                    fb_c   = float(c_fb[4])
+                    fb_ep  = fb_c * (1 + slip_rate) if fb_dir == "BUY" else fb_c * (1 - slip_rate)
+                    fb_sl_d = max(atr_f * 1.5, fb_ep * 0.002)
+                    fb_tp_d = fb_sl_d * 2.5
+                    fb_sl  = fb_ep - fb_sl_d if fb_dir == "BUY" else fb_ep + fb_sl_d
+                    fb_tp  = fb_ep + fb_tp_d if fb_dir == "BUY" else fb_ep - fb_tp_d
+                    fb_sz  = risk_dollar / fb_sl_d if fb_sl_d > 0 else 0
+                    if fb_sz <= 0:
+                        continue
+                    position = {
+                        "side": fb_dir, "entry": fb_ep, "sl": fb_sl,
+                        "tp1": fb_tp, "tp2": fb_tp,
+                        "size": fb_sz, "size_rem": fb_sz * 0.5, "scaled": False,
+                        "time": c_fb[0],
+                        "rr":     round(fb_tp_d / fb_sl_d, 2) if fb_sl_d > 0 else 2.5,
+                        "sl_pct": round(fb_sl_d / fb_ep * 100, 3) if fb_ep > 0 else 0,
+                        "session": "NY-Momentum",
+                    }
+                    ict_trade_days.add(day)
+                    try:
+                        k_fb_start = (ny + after).index(c_fb) + 1
+                    except ValueError:
+                        k_fb_start = len(ny + after)
+                    remaining = (ny + after)[k_fb_start:]
+                    for c_r in remaining:
+                        if position is None:
+                            break
+                        h_r = float(c_r[2]); lo_r = float(c_r[3]); t_r = c_r[0]
+                        sd  = position["side"]
+                        if sd == "SELL":
+                            if not position["scaled"] and lo_r <= position["tp1"]:
+                                ep_r = position["tp1"]; sz_r = position["size"] * 0.5
+                                net_r = (position["entry"] - ep_r) * sz_r - position["entry"] * sz_r * fee_rate * 2
+                                balance += net_r; day_wins += 1
+                                trades.append({"side":"SELL","entry":round(position["entry"],6),"exit":round(ep_r,6),"pnl":round(net_r,4),"entry_time":position["time"],"exit_time":t_r,"reason":"Take profit","rr":position.get("rr",2.5),"sl_pct":position.get("sl_pct",0),"session":position.get("session","NY")})
+                                position = None
+                            elif h_r >= position["sl"]:
+                                ep_r = position["sl"]; sz_r = position["size_rem"] if position["scaled"] else position["size"]
+                                net_r = (position["entry"] - ep_r) * sz_r - position["entry"] * sz_r * fee_rate * 2
+                                balance += net_r
+                                if not position["scaled"]: day_losses += 1
+                                trades.append({"side":"SELL","entry":round(position["entry"],6),"exit":round(ep_r,6),"pnl":round(net_r,4),"entry_time":position["time"],"exit_time":t_r,"reason":"Stop loss","rr":position.get("rr",2.5),"sl_pct":position.get("sl_pct",0),"session":position.get("session","NY")})
+                                position = None
+                        else:
+                            if not position["scaled"] and h_r >= position["tp1"]:
+                                ep_r = position["tp1"]; sz_r = position["size"] * 0.5
+                                net_r = (ep_r - position["entry"]) * sz_r - position["entry"] * sz_r * fee_rate * 2
+                                balance += net_r; day_wins += 1
+                                trades.append({"side":"BUY","entry":round(position["entry"],6),"exit":round(ep_r,6),"pnl":round(net_r,4),"entry_time":position["time"],"exit_time":t_r,"reason":"Take profit","rr":position.get("rr",2.5),"sl_pct":position.get("sl_pct",0),"session":position.get("session","NY")})
+                                position = None
+                            elif lo_r <= position["sl"]:
+                                ep_r = position["sl"]; sz_r = position["size_rem"] if position["scaled"] else position["size"]
+                                net_r = (ep_r - position["entry"]) * sz_r - position["entry"] * sz_r * fee_rate * 2
+                                balance += net_r
+                                if not position["scaled"]: day_losses += 1
+                                trades.append({"side":"BUY","entry":round(position["entry"],6),"exit":round(ep_r,6),"pnl":round(net_r,4),"entry_time":position["time"],"exit_time":t_r,"reason":"Stop loss","rr":position.get("rr",2.5),"sl_pct":position.get("sl_pct",0),"session":position.get("session","NY")})
+                                position = None
+                    if position is not None:
+                        last_r = (after or ny)[-1] if (after or ny) else None
+                        if last_r:
+                            lc_r = float(last_r[4]); sz_r = position["size_rem"] if position["scaled"] else position["size"]
+                            net_r = ((lc_r - position["entry"]) if position["side"] == "BUY" else (position["entry"] - lc_r)) * sz_r - position["entry"] * sz_r * fee_rate * 2
+                            balance += net_r
+                            trades.append({"side":position["side"],"entry":round(position["entry"],6),"exit":round(lc_r,6),"pnl":round(net_r,4),"entry_time":position["time"],"exit_time":last_r[0],"reason":"Session-end close","rr":position.get("rr",2.5),"sl_pct":position.get("sl_pct",0),"session":position.get("session","NY")})
+                            position = None
+                    break   # processed one fallback trade for this day
                 continue
 
             ec = float(entry_candle[4])
@@ -2515,6 +2619,7 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                              (" | FVG entry" if fvg_entry_price is not None
                               else " | aggressive entry")),
             }
+            ict_trade_days.add(day)   # mark day as traded by ICT
 
             try:
                 k_start = ny.index(entry_candle) + 1
@@ -3231,6 +3336,19 @@ def api_backtest():
         "trades_per_day":   round(total / days, 2),
     }
 
+    # Sample up to 400 candles for the chart (keep response size reasonable)
+    _step = max(1, len(candles) // 400)
+    candles_chart = [
+        {
+            "t": int(c[0]),
+            "o": round(float(c[1]), 6),
+            "h": round(float(c[2]), 6),
+            "l": round(float(c[3]), 6),
+            "c": round(float(c[4]), 6),
+        }
+        for c in candles[::_step]
+    ]
+
     return jsonify({
         "ok":             True,
         "id":             run_id,
@@ -3250,6 +3368,7 @@ def api_backtest():
         "trades_per_day": round(total / days, 2),
         "trades":         trades,
         "summary":        summary,
+        "candles_chart":  candles_chart,
     })
 
 
