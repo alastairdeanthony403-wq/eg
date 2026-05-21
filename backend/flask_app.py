@@ -137,10 +137,17 @@ DEFAULT_CONFIG = {
     "min_smc_score":            7,
     "blocked_crypto_hours_utc": [0, 1, 2, 3, 22, 23],   # extended late-night dead zones
     "blocked_sessions":         [],                       # e.g. ["Asia"] — populated by learning
-    "atr_multiplier":           1.5,                      # v2: ATR stop distance multiplier
-    "enable_trailing_stop":     True,                     # v2: trailing stop in backtester
-    "enable_fallback_strategy": True,                     # v2: allow EMA fallback when SMC fails
-    "trading_mode":             "local_paper",
+    "atr_multiplier":                1.5,   # v2: ATR stop distance multiplier
+    "enable_trailing_stop":          True,  # v2: trailing stop in backtester
+    "enable_fallback_strategy":      True,  # v2: allow EMA fallback when SMC fails
+    "trading_mode":                  "local_paper",
+    # ── Risk / reward ─────────────────────────────────────────────────────
+    "min_rr_ratio":                  3.0,   # minimum R:R — every trade ≥ 1:3
+    "max_sl_pct":                    2.0,   # reject trade if SL > 2% of entry price
+    # ── Weekly goals ──────────────────────────────────────────────────────
+    "weekly_win_goal":               3,     # stop new trades after N wins this week
+    "weekly_profit_target_percent":  3.0,   # stop new trades after +3% weekly profit
+    "weekly_max_loss_percent":       2.0,   # stop new trades after -2% weekly loss
 }
 
 JWT_SECRET      = os.environ.get("JWT_SECRET", "ai-trading-engine-secret-change-me")
@@ -1012,25 +1019,93 @@ def session_allowed(cfg):
     return True
 
 
-# ── Section 2: ATR-based stop loss (6 decimal places for forex) ───────────
-def calculate_trade_levels(df, signal, rr=2, atr_multiplier=1.5):
+# ── Section 2: Structure-based SL with minimum 1:3 R:R enforcement ────────
+def calculate_trade_levels(df, signal, rr=None, atr_multiplier=1.5, cfg=None):
+    """
+    Compute entry / SL / TP for a signal.
+
+    Stop Loss  — placed just beyond the most recent swing pivot (2-bar
+                 confirmation, 30-bar lookback), with a 0.3 ATR buffer.
+                 Falls back to ATR × atr_multiplier when no pivot is found.
+
+    Take Profit — entry ± SL_dist × rr  (minimum rr = cfg["min_rr_ratio"])
+
+    Rejection   — rr_valid=False when SL distance > cfg["max_sl_pct"]% of price.
+
+    Returns a dict with: entry, sl, tp, sl_distance, tp_distance, sl_pct,
+                         rr, rr_valid, rejection_reason
+    """
+    cfg       = cfg or DEFAULT_CONFIG
+    min_rr    = float(cfg.get("min_rr_ratio", 3.0))
+    max_sl_pct = float(cfg.get("max_sl_pct", 2.0))
+    # Honour the caller's rr but never go below the configured minimum
+    if rr is None:
+        rr = min_rr
+    else:
+        rr = max(float(rr), min_rr)
+
     lc = float(df.iloc[-1]["close"])
     try:
         atr = calculate_atr(df)
     except Exception:
-        # Fallback: use 0.5% of price if ATR fails (e.g. insufficient history)
         atr = lc * 0.005
 
-    if signal == "BUY":
-        sl = lc - (atr * atr_multiplier)
-        tp = lc + ((lc - sl) * rr)
-    elif signal == "SELL":
-        sl = lc + (atr * atr_multiplier)
-        tp = lc - ((sl - lc) * rr)
-    else:
-        sl, tp = lc, lc
+    # Structure-based SL: find recent swing pivot (shallow lookback = 30 bars)
+    swing_high, swing_low = _find_swing_pivots(df, lookback=30, pivot_bars=2)
+    buf = atr * 0.3   # small buffer beyond the pivot
 
-    return {"entry": round(lc, 6), "sl": round(sl, 6), "tp": round(tp, 6)}
+    sl = tp = lc
+    sl_dist = 0.0
+
+    if signal == "BUY":
+        # SL just below most recent swing low; fall back to ATR
+        if swing_low is not None and swing_low < lc:
+            sl = swing_low - buf
+        else:
+            sl = lc - atr * atr_multiplier
+        sl_dist = max(lc - sl, atr * 0.5)   # floor at 0.5 ATR
+        sl      = lc - sl_dist
+        tp      = lc + sl_dist * rr
+
+    elif signal == "SELL":
+        # SL just above most recent swing high; fall back to ATR
+        if swing_high is not None and swing_high > lc:
+            sl = swing_high + buf
+        else:
+            sl = lc + atr * atr_multiplier
+        sl_dist = max(sl - lc, atr * 0.5)
+        sl      = lc + sl_dist
+        tp      = lc - sl_dist * rr
+
+    sl_pct = (sl_dist / lc * 100) if lc > 0 else 0.0
+
+    # Validate trade quality
+    rr_valid = True
+    rejection_reason = None
+    if signal not in ("BUY", "SELL"):
+        rr_valid = False
+        rejection_reason = "No directional signal"
+    elif sl_dist == 0:
+        rr_valid = False
+        rejection_reason = "Zero SL distance — cannot size position"
+    elif sl_pct > max_sl_pct:
+        rr_valid = False
+        rejection_reason = (
+            f"SL too wide: {sl_pct:.2f}% of price "
+            f"(max allowed {max_sl_pct:.1f}%)"
+        )
+
+    return {
+        "entry":            round(lc, 6),
+        "sl":               round(sl, 6),
+        "tp":               round(tp, 6),
+        "sl_distance":      round(sl_dist, 6),
+        "tp_distance":      round(sl_dist * rr, 6),
+        "sl_pct":           round(sl_pct, 4),
+        "rr":               round(rr, 2),
+        "rr_valid":         rr_valid,
+        "rejection_reason": rejection_reason,
+    }
 
 
 # ── Sections 4, 8: ADX gate + dynamic SMC threshold in evaluate_bot_window ─
@@ -1227,6 +1302,7 @@ def get_symbol_summary(symbol, strategy="bot", interval=SIGNALS_INTERVAL, cfg=No
         df, ev["signal"],
         cfg.get("risk_reward", 2),
         cfg.get("atr_multiplier", 1.5),
+        cfg,
     )
 
     # ── v2 enriched fields for the frontend ───────────────────────────
@@ -1293,9 +1369,15 @@ def get_symbol_summary(symbol, strategy="bot", interval=SIGNALS_INTERVAL, cfg=No
         "smc_score":       ev["smc_score"],
         "adx":             ev.get("adx", 0),
         "reasons":         ev["reasons"],
-        "entry":           levels["entry"],
-        "sl":              levels["sl"],
-        "tp":              levels["tp"],
+        "entry":              levels["entry"],
+        "sl":                 levels["sl"],
+        "tp":                 levels["tp"],
+        "sl_distance":        levels["sl_distance"],
+        "tp_distance":        levels["tp_distance"],
+        "sl_pct":             levels["sl_pct"],
+        "risk_reward_ratio":  levels["rr"],
+        "rr_valid":           levels["rr_valid"],
+        "rejection_reason":   levels["rejection_reason"],
         # v2 enriched
         "rsi":             rsi_val,
         "ema_alignment":   ema_align,
@@ -1303,7 +1385,7 @@ def get_symbol_summary(symbol, strategy="bot", interval=SIGNALS_INTERVAL, cfg=No
         "fvg_detected":    bool(fvg_buy or fvg_sell),
         "fvg_direction":   fvg_dir,
         "quality":         q_label,
-        "rr":              rr_val,
+        "rr":              levels["rr"],
         "atr_multiplier":  cfg.get("atr_multiplier", 1.5),
         "min_smc_score":   cfg.get("min_smc_score", 6),
     })
@@ -1731,7 +1813,10 @@ def run_vwap_ema_strategy(candles, starting_balance=1000,
 # ─────────────────────────────────────────────
 
 def run_simple_ma_strategy(candles, starting_balance=1000,
-                            fee_pct=0.04, slippage_pct=0.02):
+                            fee_pct=0.04, slippage_pct=0.02,
+                            weekly_win_goal=3,
+                            weekly_profit_target_pct=3.0,
+                            weekly_max_loss_pct=2.0):
     trades      = []
     balance     = float(starting_balance)
     risk_pct    = 0.01
@@ -1748,9 +1833,16 @@ def run_simple_ma_strategy(candles, starting_balance=1000,
     def sma(arr, n):
         return sum(arr[-n:]) / n if len(arr) >= n else None
 
-    atr_all = _atr_series(highs, lows, closes, 14)
+    atr_all      = _atr_series(highs, lows, closes, 14)
+    position     = None
+    current_week = None
+    week_wins    = 0
+    week_losses  = 0
+    week_pnl     = 0.0
+    week_paused  = False
 
-    position = None
+    def _iso_week(ts):
+        return datetime.utcfromtimestamp(int(ts) / 1000).isocalendar()[:2]
 
     for i in range(30, len(candles)):
         fast = sma(closes[:i], 10)
@@ -1762,11 +1854,19 @@ def run_simple_ma_strategy(candles, starting_balance=1000,
         if prev_fast is None or prev_slow is None:
             continue
 
+        # Weekly reset & pause check
+        iso_w = _iso_week(candles[i][0])
+        if iso_w != current_week:
+            current_week = iso_w
+            week_wins = 0; week_losses = 0; week_pnl = 0.0; week_paused = False
+
         price      = closes[i]
         entry_time = _ts_to_str(candles[i][0])
         atr        = atr_all[i] if (atr_all and i < len(atr_all) and atr_all[i]) else price * 0.003
 
         if position is None:
+            if week_paused:
+                continue
             crossed_up   = prev_fast <= prev_slow and fast > slow
             crossed_down = prev_fast >= prev_slow and fast < slow
             if crossed_up:
@@ -1812,6 +1912,9 @@ def run_simple_ma_strategy(candles, starting_balance=1000,
             fee      = ep * size * fee_rate * 2
             net_pnl  = raw_pnl - fee
             balance += net_pnl
+            if net_pnl > 0: week_wins   += 1
+            else:           week_losses += 1
+            week_pnl += net_pnl
             trades.append({
                 "side":       side,
                 "entry":      round(ep,         6),
@@ -1822,6 +1925,17 @@ def run_simple_ma_strategy(candles, starting_balance=1000,
                 "reason":     exit_reason,
             })
             position = None
+            # Check weekly pause after closing
+            _wpct = week_pnl / float(starting_balance) * 100
+            if (week_wins  >= weekly_win_goal or
+                    _wpct  >= weekly_profit_target_pct or
+                    _wpct  <= -weekly_max_loss_pct):
+                week_paused = True
+            continue
+
+        # Skip new entries if weekly limit reached
+        if position is None and week_paused:
+            continue
 
     return trades, balance
 
@@ -1876,6 +1990,89 @@ def _rsi_series(values, period=14):
         avg_l = (avg_l * (period - 1) + losses[i]) / period
         result.append(100 - 100 / (1 + avg_g / avg_l) if avg_l else 100.0)
     return result
+
+
+def _week_start():
+    """Monday 00:00:00 UTC of the current ISO week, as a 'YYYY-MM-DD HH:MM:SS' string."""
+    now = datetime.now(timezone.utc)
+    monday = now - timedelta(
+        days=now.weekday(),
+        hours=now.hour, minutes=now.minute,
+        seconds=now.second, microseconds=now.microsecond,
+    )
+    return monday.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def get_weekly_stats(user_id):
+    """Return wins/losses/PnL for closed trades opened since Monday 00:00 UTC."""
+    ws = _week_start()
+    conn = get_conn(); c = conn.cursor()
+    c.execute(
+        "SELECT pnl FROM trades WHERE user_id=%s AND status='CLOSED' AND time >= %s",
+        (user_id, ws),
+    )
+    pnls = [float(r[0] or 0) for r in c.fetchall()]
+    conn.close()
+    wins   = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p < 0]
+    return {
+        "weekly_wins":   len(wins),
+        "weekly_losses": len(losses),
+        "weekly_trades": len(pnls),
+        "weekly_pnl":    round(sum(pnls), 2),
+    }
+
+
+def is_weekly_paused(user_id, cfg):
+    """
+    Check whether the bot should stop opening new trades this week.
+    Returns a dict suitable for embedding in API responses.
+    """
+    ws          = get_weekly_stats(user_id)
+    sb          = float(cfg.get("starting_balance", 10000))
+    win_goal    = int(cfg.get("weekly_win_goal", 3))
+    profit_tgt  = float(cfg.get("weekly_profit_target_percent", 3.0))
+    max_loss    = float(cfg.get("weekly_max_loss_percent", 2.0))
+
+    profit_pct        = (ws["weekly_pnl"] / sb * 100) if sb > 0 else 0.0
+    win_goal_hit      = ws["weekly_wins"]  >= win_goal
+    profit_target_hit = profit_pct >= profit_tgt
+    max_loss_hit      = profit_pct <= -max_loss
+
+    paused = max_loss_hit or win_goal_hit or profit_target_hit
+    if max_loss_hit:
+        reason = (
+            f"Weekly max loss reached "
+            f"({profit_pct:.1f}% ≤ -{max_loss}%) — trading paused until next week"
+        )
+    elif win_goal_hit:
+        reason = (
+            f"Weekly win goal reached "
+            f"({ws['weekly_wins']}/{win_goal} wins) — trading paused until next week"
+        )
+    elif profit_target_hit:
+        reason = (
+            f"Weekly profit target reached "
+            f"({profit_pct:.1f}% ≥ {profit_tgt}%) — trading paused until next week"
+        )
+    else:
+        reason = None
+
+    return {
+        "weekly_trading_paused":   paused,
+        "pause_reason":            reason,
+        "weekly_wins":             ws["weekly_wins"],
+        "weekly_losses":           ws["weekly_losses"],
+        "weekly_trades":           ws["weekly_trades"],
+        "weekly_pnl":              ws["weekly_pnl"],
+        "weekly_profit_pct":       round(profit_pct, 2),
+        "weekly_profit_target":    profit_tgt,
+        "weekly_max_loss":         max_loss,
+        "weekly_win_goal":         win_goal,
+        "profit_target_hit":       profit_target_hit,
+        "win_goal_hit":            win_goal_hit,
+        "max_loss_hit":            max_loss_hit,
+    }
 
 
 def _kelly_fraction(trades, default=0.01, cap=0.03):
@@ -1964,13 +2161,17 @@ def _adx_series(highs, lows, closes, period=14):
 # Section 6: trailing stop added to PATH B (daily bars fallback)
 
 def run_unified_bot_strategy(candles, starting_balance=1000,
-                              fee_pct=0.04, slippage_pct=0.02):
+                              fee_pct=0.04, slippage_pct=0.02,
+                              weekly_win_goal=3,
+                              weekly_profit_target_pct=3.0,
+                              weekly_max_loss_pct=2.0):
     """
     ICT — Asian Range → London Push → New York Reversal
 
     PATH A : intraday candles  (gap < 20 h)
     PATH B : daily bars fallback with EMA/ADX/RSI trend-follow
              Section 6 trailing stop activates at 1R profit.
+    Weekly limits: stop new entries when win goal / profit target / max loss hit.
     """
     from collections import defaultdict
 
@@ -2339,10 +2540,15 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
     rsi_s   = _rsi_series(closes, 14)
     adx_s   = _adx_series(highs, lows, closes, 14)
 
-    position    = None
-    current_day = None
-    day_wins    = 0
-    day_losses  = 0
+    position       = None
+    current_day    = None
+    day_wins       = 0
+    day_losses     = 0
+    current_week   = None   # (iso_year, iso_week)
+    week_wins      = 0
+    week_losses    = 0
+    week_pnl       = 0.0
+    week_paused    = False
 
     for i in range(WARMUP, len(candles)):
         e9    = ema9_s[i];  e21 = ema21_s[i]; e50 = ema50_s[i]
@@ -2356,6 +2562,13 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
 
         if today != current_day:
             current_day = today; day_wins = 0; day_losses = 0
+
+        # ── Weekly reset & limit check ────────────────────────────────
+        dt_i     = datetime.utcfromtimestamp(int(candles[i][0]) / 1000)
+        iso_week = dt_i.isocalendar()[:2]      # (year, week_number)
+        if iso_week != current_week:
+            current_week = iso_week
+            week_wins = 0; week_losses = 0; week_pnl = 0.0; week_paused = False
 
         # ── Section 6: manage open position with trailing stop ────────
         if position is not None:
@@ -2402,17 +2615,26 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                 gp  = ((exit_price - ep) if side == "BUY" else (ep - exit_price)) * sz
                 fee = ep * sz * fee_rate * 2
                 net = gp - fee
-                if net > 0: day_wins   += 1
-                else:       day_losses += 1
+                if net > 0: day_wins  += 1; week_wins   += 1
+                else:       day_losses += 1; week_losses += 1
+                week_pnl += net
                 trades.append({
                     "side": side, "entry": round(ep, 6), "exit": round(exit_price, 6),
                     "pnl": round(net, 4), "entry_time": position["time"],
                     "exit_time": t_str, "reason": exit_reason,
                 })
                 position = None
+                # Re-evaluate weekly pause after each close
+                _wpct = week_pnl / float(starting_balance) * 100
+                if (week_wins  >= weekly_win_goal or
+                        _wpct  >= weekly_profit_target_pct or
+                        _wpct  <= -weekly_max_loss_pct):
+                    week_paused = True
             continue
 
         if day_losses >= MAX_LOSS_DAY or day_wins >= MAX_WINS_DAY:
+            continue
+        if week_paused:
             continue
 
         sl_dist   = max(atr_v * 1.5, close * 0.001)
@@ -2488,11 +2710,18 @@ def signals():
     order = {sym: i for i, sym in enumerate(ALL_SYMBOLS)}
     out.sort(key=lambda s: order.get(s["symbol"], 999))
 
+    weekly = {}
+    try:
+        weekly = is_weekly_paused(g.user_id, cfg)
+    except Exception:
+        pass
+
     return jsonify({
         "signals":     out,
         "last_update": now_str(),
         "errors":      errors,
         "config":      cfg,
+        "weekly":      weekly,
     })
 
 
@@ -2620,15 +2849,30 @@ def api_backtest():
             "error": f"Unexpected error fetching candles for {symbol}: {e}"
         }), 500
 
+    cfg = get_user_config()
+    _ww_goal = cfg.get("weekly_win_goal",             3)
+    _wpt_pct = cfg.get("weekly_profit_target_percent", 3.0)
+    _wml_pct = cfg.get("weekly_max_loss_percent",      2.0)
+
     try:
         if strategy == "unified_bot":
-            trades, ending_balance = run_unified_bot_strategy(candles, sb, fee_pct, slip_pct)
+            trades, ending_balance = run_unified_bot_strategy(
+                candles, sb, fee_pct, slip_pct,
+                weekly_win_goal=_ww_goal,
+                weekly_profit_target_pct=_wpt_pct,
+                weekly_max_loss_pct=_wml_pct,
+            )
         elif strategy == "orb_0dte":
             trades, ending_balance = run_orb_strategy(candles, sb, fee_pct, slip_pct)
         elif strategy == "vwap_ema":
             trades, ending_balance = run_vwap_ema_strategy(candles, sb, fee_pct, slip_pct)
         else:
-            trades, ending_balance = run_simple_ma_strategy(candles, sb, fee_pct, slip_pct)
+            trades, ending_balance = run_simple_ma_strategy(
+                candles, sb, fee_pct, slip_pct,
+                weekly_win_goal=_ww_goal,
+                weekly_profit_target_pct=_wpt_pct,
+                weekly_max_loss_pct=_wml_pct,
+            )
     except Exception as e:
         return jsonify({
             "error": f"Strategy '{strategy}' crashed: {e}. "
@@ -2957,15 +3201,40 @@ def open_paper_trade():
     d    = request.get_json(force=True) or {}
     sym  = (d.get("symbol") or "BTCUSDT").upper()
     side = d.get("side", "BUY").upper()
-    df   = fetch_df_for_symbol(sym, SIGNALS_INTERVAL, 200)
+    cfg  = get_user_config()
+
+    # ── Weekly pause gate ─────────────────────────────────────────────
+    weekly = is_weekly_paused(g.user_id, cfg)
+    if weekly["weekly_trading_paused"]:
+        return jsonify({
+            "error":          "Weekly trading paused",
+            "pause_reason":   weekly["pause_reason"],
+            "weekly_trading_paused": True,
+            "weekly":         weekly,
+        }), 403
+
+    df = fetch_df_for_symbol(sym, SIGNALS_INTERVAL, 200)
     if df is None:
         return jsonify({"error": f"No market data for {sym}"}), 400
-    cfg    = get_user_config()
-    levels = calculate_trade_levels(df, side, cfg.get("risk_reward", 2))
-    price  = float(df.iloc[-1]["close"])
-    risk_amt  = cfg["starting_balance"] * (cfg["risk_percent"] / 100)
-    stop_dist = abs(price - levels["sl"])
-    size = risk_amt / stop_dist if stop_dist else 0
+
+    levels = calculate_trade_levels(df, side, cfg.get("risk_reward", 2),
+                                    cfg.get("atr_multiplier", 1.5), cfg)
+
+    # ── R:R quality gate ──────────────────────────────────────────────
+    if not levels["rr_valid"]:
+        return jsonify({
+            "error":            "Trade rejected — R:R quality check failed",
+            "rejection_reason": levels["rejection_reason"],
+            "rr":               levels["rr"],
+            "sl_pct":           levels["sl_pct"],
+            "rr_valid":         False,
+        }), 422
+
+    price     = levels["entry"]
+    stop_dist = levels["sl_distance"]
+    risk_amt  = cfg["starting_balance"] * (cfg.get("risk_percent", 1) / 100)
+    size      = risk_amt / stop_dist if stop_dist else 0
+
     tid  = str(uuid.uuid4())
     conn = get_conn(); c = conn.cursor()
     c.execute(
@@ -2973,8 +3242,12 @@ def open_paper_trade():
         (tid, g.user_id, sym, side, price, levels["sl"], levels["tp"], size, now_str()))
     conn.commit(); conn.close()
     add_alert(g.user_id, f"OPEN {sym} {side} @ {format_price(price, sym)}")
-    return jsonify({"ok": True, "id": tid, "entry": price,
-                    "sl": levels["sl"], "tp": levels["tp"], "size": size})
+    return jsonify({
+        "ok":    True, "id": tid,
+        "entry": price, "sl": levels["sl"], "tp": levels["tp"],
+        "size":  size,  "rr": levels["rr"],
+        "sl_pct": levels["sl_pct"], "rr_valid": True,
+    })
 
 
 @app.route("/api/trades/<tid>/close", methods=["POST"])
@@ -3061,6 +3334,17 @@ def stats():
         "kelly_fraction":   round(kelly * 100, 2),   # expressed as % of account
         "kelly_note":       "Half-Kelly — suggested max risk % per trade",
     })
+
+
+# ─────────────────────────────────────────────
+# WEEKLY STATS
+# ─────────────────────────────────────────────
+
+@app.route("/api/weekly-stats", methods=["GET"])
+@auth_required
+def weekly_stats_route():
+    cfg = get_user_config()
+    return jsonify(is_weekly_paused(g.user_id, cfg))
 
 
 # ─────────────────────────────────────────────

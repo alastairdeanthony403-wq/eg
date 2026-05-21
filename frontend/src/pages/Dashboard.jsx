@@ -1,7 +1,11 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { apiFetch, API_BASE } from "@/lib/api";
 import { createChart, CandlestickSeries } from "lightweight-charts";
-import { ArrowUpRight, ArrowDownRight, Minus, Zap, RefreshCw, CheckCircle2, XCircle, BookmarkPlus } from "lucide-react";
+import {
+  ArrowUpRight, ArrowDownRight, Minus, Zap, RefreshCw,
+  CheckCircle2, XCircle, BookmarkPlus,
+  ShieldAlert, Target, Trophy, TrendingUp,
+} from "lucide-react";
 
 // FIX 6: All 18 symbols — matches backend ALL_SYMBOLS
 const SYMBOLS = [
@@ -26,28 +30,37 @@ function symbolLabel(sym) {
   return sym;
 }
 
-function SignalCard({ s, active, onClick }) {
-  const isBuy  = s.signal === "BUY";
-  const isSell = s.signal === "SELL";
-  const PillIcon = isBuy ? ArrowUpRight : isSell ? ArrowDownRight : Minus;
+function SignalCard({ s, active, onClick, weeklyPaused }) {
+  const isBuy      = s.signal === "BUY";
+  const isSell     = s.signal === "SELL";
+  const isBlocked  = weeklyPaused || s.rr_valid === false;
+  const PillIcon   = isBuy ? ArrowUpRight : isSell ? ArrowDownRight : Minus;
 
-  // Format price appropriately — forex pairs are small numbers
-  const priceDisplay = s.price
-    ? s.price < 100
-      ? s.price.toFixed(4)
-      : s.price.toLocaleString()
-    : "—";
+  // Format price adaptively
+  const fmt = (v) => {
+    if (!v && v !== 0) return "—";
+    return v < 100 ? Number(v).toFixed(4) : Number(v).toLocaleString();
+  };
 
   return (
     <button
       onClick={onClick}
       data-testid={`signal-card-${s.symbol}`}
-      className={`panel p-5 text-left w-full transition-all ${active ? "border-[var(--accent)]" : ""}`}
+      className={`panel p-4 text-left w-full transition-all relative ${active ? "border-[var(--accent)]" : ""}`}
       style={active ? { borderColor: "var(--accent)", boxShadow: "var(--glow-mint)" } : {}}>
-      <div className="flex items-center justify-between mb-3">
+
+      {/* Blocked overlay badge */}
+      {isBlocked && (
+        <div className="absolute top-2 right-2 flex items-center gap-1 bg-[var(--bg-3)] rounded px-2 py-0.5 text-[10px] font-semibold text-[var(--sell)]">
+          <ShieldAlert size={10} /> {weeklyPaused ? "WEEKLY LIMIT" : "RR BLOCKED"}
+        </div>
+      )}
+
+      <div className="flex items-center justify-between mb-2">
         <div className="flex items-center gap-2">
-          <div className="font-bold text-base">{symbolLabel(s.symbol)}</div>
-          <div className={`pill ${isBuy ? "pill-buy" : isSell ? "pill-sell" : "pill-hold"}`}>
+          <div className="font-bold text-sm">{symbolLabel(s.symbol)}</div>
+          <div className={`pill ${isBuy ? "pill-buy" : isSell ? "pill-sell" : "pill-hold"}`}
+               style={isBlocked ? { opacity: 0.5 } : {}}>
             <PillIcon size={11} /> {s.signal}
           </div>
         </div>
@@ -55,16 +68,49 @@ function SignalCard({ s, active, onClick }) {
           {s.change_pct >= 0 ? "+" : ""}{s.change_pct?.toFixed(2)}%
         </div>
       </div>
-      <div className="mono text-2xl font-bold mb-3">{priceDisplay}</div>
-      <div className="flex items-center justify-between mb-2">
+
+      <div className="mono text-xl font-bold mb-2">{fmt(s.price)}</div>
+
+      {/* Entry / SL / TP row */}
+      {(isBuy || isSell) && (
+        <div className="grid grid-cols-3 gap-1 mb-2 text-[10px]">
+          <div>
+            <div className="text-[var(--text-mute)]">Entry</div>
+            <div className="mono font-semibold text-[var(--text)]">{fmt(s.entry)}</div>
+          </div>
+          <div>
+            <div className="text-[var(--text-mute)]">SL</div>
+            <div className="mono font-semibold num-neg">{fmt(s.sl)}</div>
+          </div>
+          <div>
+            <div className="text-[var(--text-mute)]">TP</div>
+            <div className="mono font-semibold num-pos">{fmt(s.tp)}</div>
+          </div>
+        </div>
+      )}
+
+      <div className="flex items-center justify-between mb-1">
         <span className="text-xs text-[var(--text-mute)]">Confidence</span>
         <span className="mono text-xs font-semibold">{s.confidence}%</span>
       </div>
-      <div className="meter mb-3"><span style={{ width: `${s.confidence}%` }} /></div>
-      <div className="flex items-center justify-between text-xs text-[var(--text-dim)]">
+      <div className="meter mb-2"><span style={{ width: `${s.confidence}%` }} /></div>
+
+      <div className="flex items-center justify-between text-[10px] text-[var(--text-dim)]">
         <span>SMC <span className="mono font-bold text-[var(--text)]">{s.smc_score}/11</span></span>
+        {s.risk_reward_ratio != null && (isBuy || isSell) && (
+          <span className={`mono font-semibold ${s.rr_valid ? "num-pos" : "num-neg"}`}>
+            {s.risk_reward_ratio}R
+          </span>
+        )}
         <span>{s.regime}</span>
       </div>
+
+      {/* Rejection reason */}
+      {s.rejection_reason && (
+        <div className="mt-2 text-[10px] text-[var(--sell)] leading-tight">
+          ⚠ {s.rejection_reason}
+        </div>
+      )}
     </button>
   );
 }
@@ -78,12 +124,13 @@ const MARKET_GROUPS = [
 ];
 
 export default function Dashboard() {
-  const [signals,    setSignals]    = useState([]);
-  const [active,     setActive]     = useState("BTCUSDT");
-  const [interval,   setInterval_]  = useState("5m");
-  const [loading,    setLoading]    = useState(true);
-  const [openTrades, setOpenTrades] = useState([]);
-  const [stats,      setStats]      = useState(null);
+  const [signals,     setSignals]     = useState([]);
+  const [active,      setActive]      = useState("BTCUSDT");
+  const [interval,    setInterval_]   = useState("5m");
+  const [loading,     setLoading]     = useState(true);
+  const [openTrades,  setOpenTrades]  = useState([]);
+  const [stats,       setStats]       = useState(null);
+  const [weeklyStats, setWeeklyStats] = useState(null);
 
   const chartRef     = useRef(null);
   const containerRef = useRef(null);
@@ -93,6 +140,7 @@ export default function Dashboard() {
     try {
       const data = await apiFetch(`/api/signals?interval=${interval}`);
       setSignals(data.signals || []);
+      if (data.weekly) setWeeklyStats(data.weekly);
     } catch (e) {
       console.error("loadSignals failed:", e);
     } finally {
@@ -102,9 +150,14 @@ export default function Dashboard() {
 
   const loadTrades = useCallback(async () => {
     try {
-      const [t, s] = await Promise.all([apiFetch("/api/trades"), apiFetch("/api/stats")]);
+      const [t, s, w] = await Promise.all([
+        apiFetch("/api/trades"),
+        apiFetch("/api/stats"),
+        apiFetch("/api/weekly-stats").catch(() => null),
+      ]);
       setOpenTrades((Array.isArray(t) ? t : []).filter((x) => x.status === "OPEN"));
       setStats(s);
+      if (w) setWeeklyStats(w);
     } catch (e) {
       console.error("loadTrades failed:", e);
     }
@@ -210,7 +263,7 @@ export default function Dashboard() {
             { l: "Balance",       v: `$${stats.balance.toLocaleString()}`,      sub: `Start $${stats.starting_balance.toLocaleString()}` },
             { l: "Net PnL",       v: `${stats.net_pnl >= 0 ? "+" : ""}$${stats.net_pnl.toFixed(2)}`, klass: stats.net_pnl >= 0 ? "num-pos" : "num-neg" },
             { l: "Win rate",      v: `${stats.win_rate}%`,                       sub: `${stats.wins}W · ${stats.losses}L` },
-            { l: "Closed trades", v: stats.total_trades,                         sub: "Paper" },
+            { l: "Kelly sizing",  v: stats.kelly_fraction != null ? `${stats.kelly_fraction}%` : "—", sub: stats.kelly_note || "Suggested risk per trade" },
           ].map((k, i) => (
             <div key={i} className="panel p-5">
               <div className="text-xs text-[var(--text-mute)]">{k.l}</div>
@@ -218,6 +271,84 @@ export default function Dashboard() {
               {k.sub && <div className="text-xs text-[var(--text-dim)] mt-1">{k.sub}</div>}
             </div>
           ))}
+        </div>
+      )}
+
+      {/* Weekly performance card */}
+      {weeklyStats && (
+        <div
+          className={`panel p-5 border ${
+            weeklyStats.weekly_trading_paused
+              ? "border-[var(--sell)]"
+              : weeklyStats.win_goal_hit || weeklyStats.profit_target_hit
+              ? "border-[var(--buy)]"
+              : "border-[var(--line)]"
+          }`}
+          data-testid="weekly-stats-card"
+        >
+          <div className="flex items-center gap-2 mb-4">
+            {weeklyStats.weekly_trading_paused ? (
+              <ShieldAlert size={15} className="text-[var(--sell)]" />
+            ) : (
+              <Trophy size={15} className="text-[var(--accent)]" />
+            )}
+            <div className="section-title">Weekly performance</div>
+            {weeklyStats.weekly_trading_paused && (
+              <span className="ml-auto pill pill-sell text-[10px]">PAUSED</span>
+            )}
+          </div>
+
+          {weeklyStats.weekly_trading_paused && weeklyStats.pause_reason && (
+            <div className="mb-4 p-3 rounded-lg bg-[var(--bg-3)] text-xs text-[var(--sell)] flex items-start gap-2">
+              <ShieldAlert size={12} className="shrink-0 mt-0.5" />
+              {weeklyStats.pause_reason}
+            </div>
+          )}
+
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+            <div>
+              <div className="text-xs text-[var(--text-mute)] flex items-center gap-1">
+                <Trophy size={10} /> Wins this week
+              </div>
+              <div className="mono text-xl font-bold mt-1 num-pos">
+                {weeklyStats.weekly_wins}
+                <span className="text-xs text-[var(--text-mute)] ml-1">/ {weeklyStats.weekly_win_goal}</span>
+              </div>
+            </div>
+            <div>
+              <div className="text-xs text-[var(--text-mute)]">Losses this week</div>
+              <div className={`mono text-xl font-bold mt-1 ${weeklyStats.weekly_losses > 0 ? "num-neg" : ""}`}>
+                {weeklyStats.weekly_losses}
+              </div>
+            </div>
+            <div>
+              <div className="text-xs text-[var(--text-mute)] flex items-center gap-1">
+                <TrendingUp size={10} /> Weekly PnL
+              </div>
+              <div className={`mono text-xl font-bold mt-1 ${weeklyStats.weekly_pnl >= 0 ? "num-pos" : "num-neg"}`}>
+                {weeklyStats.weekly_pnl >= 0 ? "+" : ""}${weeklyStats.weekly_pnl?.toFixed(2)}
+              </div>
+            </div>
+            <div>
+              <div className="text-xs text-[var(--text-mute)] flex items-center gap-1">
+                <Target size={10} /> Profit vs target
+              </div>
+              <div className="mt-1">
+                <div className="flex justify-between text-xs mb-1">
+                  <span className={`mono font-bold ${weeklyStats.weekly_profit_pct >= 0 ? "num-pos" : "num-neg"}`}>
+                    {weeklyStats.weekly_profit_pct >= 0 ? "+" : ""}{weeklyStats.weekly_profit_pct}%
+                  </span>
+                  <span className="text-[var(--text-mute)]">goal {weeklyStats.weekly_profit_target}%</span>
+                </div>
+                <div className="meter">
+                  <span style={{
+                    width: `${Math.min(100, Math.max(0, weeklyStats.weekly_profit_pct / weeklyStats.weekly_profit_target * 100))}%`,
+                    background: weeklyStats.profit_target_hit ? "var(--buy)" : weeklyStats.max_loss_hit ? "var(--sell)" : "var(--accent)",
+                  }} />
+                </div>
+              </div>
+            </div>
+          </div>
         </div>
       )}
 
@@ -245,6 +376,7 @@ export default function Dashboard() {
                       s={s}
                       active={active === sym}
                       onClick={() => setActive(sym)}
+                      weeklyPaused={weeklyStats?.weekly_trading_paused}
                     />
                   );
                 })}
@@ -263,12 +395,22 @@ export default function Dashboard() {
             {activeSignal && (
               <div className="flex items-center gap-3">
                 <div className="text-right">
-                  <div className="text-xs text-[var(--text-mute)]">Entry / SL / TP</div>
+                  <div className="text-xs text-[var(--text-mute)]">
+                    Entry · SL · TP
+                    {activeSignal.risk_reward_ratio && (
+                      <span className={`ml-2 mono font-bold ${activeSignal.rr_valid ? "num-pos" : "num-neg"}`}>
+                        {activeSignal.risk_reward_ratio}R
+                      </span>
+                    )}
+                  </div>
                   <div className="mono text-sm">
                     <span className="text-[var(--text)]">{formatPrice(activeSignal.entry)}</span> ·
                     <span className="text-[var(--sell)] ml-1">{formatPrice(activeSignal.sl)}</span> ·
                     <span className="text-[var(--buy)] ml-1">{formatPrice(activeSignal.tp)}</span>
                   </div>
+                  {activeSignal.rejection_reason && (
+                    <div className="text-[10px] text-[var(--sell)] mt-0.5">⚠ {activeSignal.rejection_reason}</div>
+                  )}
                 </div>
                 <div className="flex gap-2">
                   <button className="btn btn-primary" onClick={() => openPaper("BUY")} data-testid="paper-buy-btn">
