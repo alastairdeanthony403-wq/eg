@@ -73,21 +73,24 @@ export default function Backtester() {
   const [chartCandles, setChartCandles] = useState([]);
 
   // Sub-features
-  const [history,     setHistory]   = useState([]);
-  const [compareData, setCompare]   = useState(null);
-  const [comparing,   setComparing] = useState(false);
-  const [learning,    setLearning]  = useState(false);
-  const [learnResult, setLearnResult]= useState(null);
-  const [learnHistory,setLearnHistory]=useState([]);
-  const [sortField,   setSortField] = useState("open_time");
-  const [sortDir,     setSortDir]   = useState("desc");
-  const [page,        setPage]      = useState(0);
+  const [history,       setHistory]      = useState([]);
+  const [compareData,   setCompare]      = useState(null);
+  const [comparing,     setComparing]    = useState(false);
+  const [learning,      setLearning]     = useState(false);
+  const [learnResult,   setLearnResult]  = useState(null);
+  const [learnHistory,  setLearnHistory] = useState([]);
+  const [autoLearnNote, setAutoLearnNote]= useState(null);   // auto-learn after backtest
+  const [optimizing,    setOptimizing]   = useState(false);
+  const [optResult,     setOptResult]    = useState(null);
+  const [sortField,     setSortField]    = useState("open_time");
+  const [sortDir,       setSortDir]      = useState("desc");
+  const [page,          setPage]         = useState(0);
   const PAGE = 20;
 
   // ── Run backtest ────────────────────────────────────────────────────────────
   const run = async () => {
     setRunning(true); setError(null); setResult(null);
-    setCompare(null); setLearnResult(null); setPage(0);
+    setCompare(null); setLearnResult(null); setAutoLearnNote(null); setPage(0);
     try {
       const d = await apiFetch("/api/backtest", {
         method:"POST",
@@ -98,6 +101,7 @@ export default function Backtester() {
       // ← read body ONCE
       setResult(d);
       setChartCandles(d.candles_chart || []);
+      if (d.auto_learn?.applied) setAutoLearnNote(d.auto_learn);
       loadHistory();
     } catch(e){ setError(e.message); }
     finally{ setRunning(false); }
@@ -157,21 +161,41 @@ export default function Backtester() {
 
   // ── Learn from mistakes ─────────────────────────────────────────────────────
   const handleRunLearn = async () => {
-  setLearning(true);
-  try {
-    const d = await apiFetch("/api/learn", {
-      method: "POST",
-      body: JSON.stringify({ auto_apply: true, symbol }),
-    });
+    setLearning(true);
+    try {
+      const d = await apiFetch("/api/learn", {
+        method: "POST",
+        body: JSON.stringify({ auto_apply: true, symbol }),
+      });
+      setLearnResult(d);
+      loadLearnHistory();
+    } catch(e) {
+      setError(e.message);
+    } finally {
+      setLearning(false);
+    }
+  };
 
-    setLearnResult(d);
-    loadLearnHistory();
-  } catch(e) {
-    setError(e.message);
-  } finally {
-    setLearning(false);
-  }
-};
+  // ── Parameter grid search ────────────────────────────────────────────────────
+  const handleOptimize = async () => {
+    setOptimizing(true); setOptResult(null);
+    try {
+      const d = await apiFetch("/api/optimize", {
+        method: "POST",
+        body: JSON.stringify({
+          symbol, period_days: Number(days),
+          starting_balance: Number(balance),
+          fee_percent: Number(fee),
+          slippage_percent: Number(slip),
+        }),
+      });
+      setOptResult(d);
+    } catch(e) {
+      setError(e.message);
+    } finally {
+      setOptimizing(false);
+    }
+  };
 
   useEffect(() => {
     loadHistory();
@@ -272,6 +296,29 @@ export default function Backtester() {
       {/* Error */}
       {error&&<div style={{margin:"0 20px 16px",background:`${T.red}12`,border:`1px solid ${T.red}40`,borderRadius:5,padding:"10px 14px",color:T.red,fontFamily:MONO,fontSize:12}}>⚠ {error}</div>}
 
+      {/* Auto-learn notification */}
+      {autoLearnNote&&(
+        <div style={{margin:"0 20px 12px",background:`${T.purple}12`,border:`1px solid ${T.purple}44`,
+          borderRadius:5,padding:"9px 14px",display:"flex",alignItems:"flex-start",gap:10,animation:"slide .25s ease"}}>
+          <Brain size={14} style={{color:T.purple,flexShrink:0,marginTop:1}}/>
+          <div style={{flex:1}}>
+            <span style={{fontFamily:MONO,fontSize:10,color:T.purple,letterSpacing:2}}>
+              AUTO-LEARN APPLIED · {autoLearnNote.adjustments_applied} param{autoLearnNote.adjustments_applied!==1?"s":""} updated
+            </span>
+            <div style={{marginTop:4,display:"flex",flexWrap:"wrap",gap:6}}>
+              {Object.entries(autoLearnNote.adjustments||{}).map(([k,v])=>(
+                <span key={k} style={{fontFamily:MONO,fontSize:9,background:`${T.purple}18`,
+                  border:`1px solid ${T.purple}33`,borderRadius:3,padding:"2px 7px",color:T.purple}}>
+                  {k.replace(/_/g," ")} → {String(v)}
+                </span>
+              ))}
+            </div>
+          </div>
+          <button onClick={()=>setAutoLearnNote(null)}
+            style={{background:"none",border:"none",color:T.t2,cursor:"pointer",fontSize:14,lineHeight:1,flexShrink:0}}>×</button>
+        </div>
+      )}
+
       {/* Tabs */}
       <div style={{margin:"0 20px",borderBottom:`1px solid ${T.border}`,display:"flex",gap:0}}>
         {["results","chart","trades","compare","learn","history"].map(t=>(
@@ -369,6 +416,8 @@ export default function Backtester() {
         {/* LEARN TAB */}
         {tab==="learn"&&(
           <div style={{animation:"slide .25s ease"}}>
+
+            {/* ── Learn From Mistakes ── */}
             <div style={{background:T.bg3,border:`1px solid ${T.border}`,borderRadius:6,padding:16,marginBottom:16}}>
               <div style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",gap:16}}>
                 <div>
@@ -382,17 +431,53 @@ export default function Backtester() {
                     Analyses your losing trades and automatically adjusts bot config parameters —
                     confidence threshold, ADX minimum, session filters, and more —
                     to reduce future losses.
+                    <br/>
+                    <span style={{fontSize:11,color:T.purple}}>
+                      ✦ Also runs automatically every time you finish a backtest.
+                    </span>
                   </p>
                 </div>
                 <button onClick={handleRunLearn} disabled={learning}
                   style={{background:`${T.purple}18`,border:`1px solid ${T.purple}44`,color:T.purple,
                     borderRadius:4,padding:"9px 20px",cursor:"pointer",fontFamily:MONO,fontSize:11,
                     letterSpacing:1,whiteSpace:"nowrap",flexShrink:0,display:"flex",alignItems:"center",gap:6}}>
-                  {learning?<><div style={{width:11,height:11,border:`2px solid ${T.t2}`,borderTop:`2px solid ${T.purple}`,borderRadius:"50%",animation:"spin 1s linear infinite"}}/>ANALYSING…</>:<><Brain size={12}/>ANALYSE &amp; APPLY</>}
+                  {learning
+                    ?<><div style={{width:11,height:11,border:`2px solid ${T.t2}`,borderTop:`2px solid ${T.purple}`,borderRadius:"50%",animation:"spin 1s linear infinite"}}/>ANALYSING…</>
+                    :<><Brain size={12}/>ANALYSE &amp; APPLY</>}
                 </button>
               </div>
             </div>
             {learnResult&&<LearnResult data={learnResult}/>}
+
+            {/* ── Parameter Grid Search ── */}
+            <div style={{background:T.bg3,border:`1px solid ${T.border}`,borderRadius:6,padding:16,marginTop:20,marginBottom:16}}>
+              <div style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",gap:16}}>
+                <div>
+                  <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}>
+                    <Zap size={16} style={{color:T.cyan}}/>
+                    <span style={{fontFamily:MONO,fontSize:12,color:T.cyan,letterSpacing:2}}>
+                      PARAMETER OPTIMISER
+                    </span>
+                  </div>
+                  <p style={{margin:0,fontSize:13,color:T.t2,lineHeight:1.65,maxWidth:520}}>
+                    Runs a full grid search across <strong style={{color:T.text}}>60 combinations</strong> of
+                    confluence threshold, risk/reward ratio, and displacement body ratio — using
+                    the current symbol &amp; time window. Automatically applies the best-scoring
+                    parameters to your bot config.
+                  </p>
+                </div>
+                <button onClick={handleOptimize} disabled={optimizing}
+                  style={{background:`${T.cyan}12`,border:`1px solid ${T.cyan}44`,color:T.cyan,
+                    borderRadius:4,padding:"9px 20px",cursor:"pointer",fontFamily:MONO,fontSize:11,
+                    letterSpacing:1,whiteSpace:"nowrap",flexShrink:0,display:"flex",alignItems:"center",gap:6}}>
+                  {optimizing
+                    ?<><div style={{width:11,height:11,border:`2px solid ${T.t2}`,borderTop:`2px solid ${T.cyan}`,borderRadius:"50%",animation:"spin 1s linear infinite"}}/>OPTIMISING…</>
+                    :<><Zap size={12}/>RUN OPTIMISER</>}
+                </button>
+              </div>
+            </div>
+            {optResult&&<OptimizeResult data={optResult}/>}
+
           </div>
         )}
 
@@ -812,6 +897,115 @@ function LearnResult({data:d}){
                     <td style={{padding:"6px 10px",color:T.red}}>{String(v.before??v.old??v)}</td>
                     <td style={{padding:"6px 10px",color:T.green}}>{String(v.after??v.new??v)}</td>
                     <td style={{padding:"6px 10px",color:T.t2,fontSize:10}}>{v.reason||"Pattern-based"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── OPTIMIZE RESULT ───────────────────────────────────────────────────────────
+function OptimizeResult({ data: d }) {
+  const paramLabels = {
+    confluence_min:  "Confluence",
+    risk_reward:     "Risk/Reward",
+    disp_body_ratio: "Disp Body",
+    atr_multiplier:  "ATR Mult",
+  };
+  return (
+    <div style={{background:T.bg3,border:`1px solid ${T.cyan}40`,borderRadius:6,padding:16,animation:"slide .25s ease"}}>
+      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12}}>
+        <CheckCircle size={14} style={{color:T.green}}/>
+        <span style={{fontFamily:MONO,fontSize:11,color:T.green,letterSpacing:1}}>
+          OPTIMISATION COMPLETE — {d.combos_tested} COMBINATIONS TESTED
+        </span>
+        {d.applied&&(
+          <span style={{marginLeft:"auto",fontFamily:MONO,fontSize:9,
+            background:`${T.green}18`,border:`1px solid ${T.green}44`,
+            borderRadius:3,padding:"2px 8px",color:T.green}}>
+            BEST PARAMS APPLIED
+          </span>
+        )}
+      </div>
+
+      {/* Best result highlight */}
+      {d.best&&(
+        <div style={{background:`${T.cyan}08`,border:`1px solid ${T.cyan}33`,borderRadius:5,
+          padding:"12px 14px",marginBottom:14}}>
+          <div style={{fontFamily:MONO,fontSize:8,color:T.cyan,letterSpacing:2,marginBottom:10}}>
+            BEST CONFIGURATION — SCORE {d.best.score}
+          </div>
+          <div style={{display:"flex",flexWrap:"wrap",gap:10,marginBottom:10}}>
+            {Object.entries(d.best.params).map(([k,v])=>(
+              <div key={k} style={{background:T.bg2,border:`1px solid ${T.border}`,borderRadius:4,padding:"6px 12px"}}>
+                <div style={{fontFamily:MONO,fontSize:8,color:T.t2,letterSpacing:1,marginBottom:3}}>
+                  {paramLabels[k]||k.replace(/_/g," ").toUpperCase()}
+                </div>
+                <div style={{fontFamily:MONO,fontSize:14,color:T.cyan,fontWeight:600}}>{v}</div>
+              </div>
+            ))}
+          </div>
+          <div style={{display:"flex",gap:20,flexWrap:"wrap"}}>
+            <div>
+              <div style={{fontFamily:MONO,fontSize:8,color:T.t2,letterSpacing:1,marginBottom:2}}>TRADES</div>
+              <div style={{fontFamily:MONO,fontSize:12,color:T.text}}>{d.best.total_trades}</div>
+            </div>
+            <div>
+              <div style={{fontFamily:MONO,fontSize:8,color:T.t2,letterSpacing:1,marginBottom:2}}>WIN RATE</div>
+              <div style={{fontFamily:MONO,fontSize:12,color:T.gold}}>{d.best.win_rate}%</div>
+            </div>
+            <div>
+              <div style={{fontFamily:MONO,fontSize:8,color:T.t2,letterSpacing:1,marginBottom:2}}>PROFIT FACTOR</div>
+              <div style={{fontFamily:MONO,fontSize:12,color:T.blue}}>{d.best.profit_factor}</div>
+            </div>
+            <div>
+              <div style={{fontFamily:MONO,fontSize:8,color:T.t2,letterSpacing:1,marginBottom:2}}>NET P&L</div>
+              <div style={{fontFamily:MONO,fontSize:12,color:d.best.net_pnl>=0?T.green:T.red}}>
+                {d.best.net_pnl>=0?"+":""}{d.best.net_pnl}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Top 5 table */}
+      {d.top5?.length>1&&(
+        <div>
+          <div style={{fontFamily:MONO,fontSize:8,color:T.t2,letterSpacing:2,marginBottom:8}}>TOP 5 COMBINATIONS</div>
+          <div style={{overflowX:"auto"}}>
+            <table style={{width:"100%",borderCollapse:"collapse",fontFamily:MONO,fontSize:10}}>
+              <thead>
+                <tr>
+                  {["#","Confluence","R:R","Disp Body","Trades","Win %","PF","Net P&L","Score"].map(h=>(
+                    <th key={h} style={{padding:"6px 10px",textAlign:h==="#"?"center":"right",
+                      fontFamily:MONO,fontSize:8,color:T.t2,borderBottom:`1px solid ${T.border}`,
+                      background:T.bg2,letterSpacing:1,whiteSpace:"nowrap"}}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {d.top5.map((r,i)=>(
+                  <tr key={i} style={{background:i%2===0?T.bg3:T.bg2,borderBottom:`1px solid ${T.border}`,
+                    opacity:i===0?1:0.75}}>
+                    <td style={{padding:"6px 10px",textAlign:"center",color:i===0?T.cyan:T.t2,fontWeight:i===0?700:400}}>
+                      {i===0?"★":i+1}
+                    </td>
+                    <td style={{padding:"6px 10px",textAlign:"right",color:T.text}}>{r.params.confluence_min??"-"}</td>
+                    <td style={{padding:"6px 10px",textAlign:"right",color:T.text}}>{r.params.risk_reward??"-"}</td>
+                    <td style={{padding:"6px 10px",textAlign:"right",color:T.text}}>{r.params.disp_body_ratio??"-"}</td>
+                    <td style={{padding:"6px 10px",textAlign:"right",color:T.text}}>{r.total_trades}</td>
+                    <td style={{padding:"6px 10px",textAlign:"right",color:T.gold}}>{r.win_rate}%</td>
+                    <td style={{padding:"6px 10px",textAlign:"right",color:T.blue}}>{r.profit_factor}</td>
+                    <td style={{padding:"6px 10px",textAlign:"right",
+                      color:r.net_pnl>=0?T.green:T.red}}>
+                      {r.net_pnl>=0?"+":""}{r.net_pnl}
+                    </td>
+                    <td style={{padding:"6px 10px",textAlign:"right",
+                      color:i===0?T.cyan:T.t2,fontWeight:i===0?700:400}}>{r.score}</td>
                   </tr>
                 ))}
               </tbody>

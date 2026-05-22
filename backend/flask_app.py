@@ -3328,6 +3328,9 @@ def api_backtest():
     except Exception as e:
         print(f"[backtest] DB save failed: {e}")
 
+    # ── Auto-learn: silently analyse recent runs and adjust config ────────────
+    auto_learn = _auto_learn_silent(g.user_id)
+
     summary = {
         "starting_balance": sb,
         "final_balance":    round(ending_balance, 2),
@@ -3377,6 +3380,7 @@ def api_backtest():
         "trades":         trades,
         "summary":        summary,
         "candles_chart":  candles_chart,
+        "auto_learn":     auto_learn,
     })
 
 
@@ -4026,6 +4030,216 @@ def _analyze_losing_trades(losing_trades, backtest_runs, cfg):
         )
 
     return {"patterns": patterns, "adjustments": adjustments}
+
+
+def _auto_learn_silent(user_id):
+    """
+    Called automatically after every backtest completes.
+    Reads the last 5 runs for this user, runs the rule-based analyser,
+    and applies any config adjustments it finds — silently.
+    Returns a small summary dict that goes back in the backtest response.
+    """
+    import math
+    try:
+        conn = get_conn(); cur = conn.cursor()
+        cur.execute("""
+            SELECT win_rate, profit_factor, trades_json, total_trades
+            FROM   backtest_runs
+            WHERE  user_id = %s
+            ORDER  BY created_at DESC LIMIT 5
+        """, (user_id,))
+        rows = cur.fetchall()
+
+        cur.execute("SELECT settings FROM users WHERE id=%s", (user_id,))
+        cfg_row = cur.fetchone()
+        conn.close()
+
+        cfg = dict(DEFAULT_CONFIG)
+        if cfg_row and cfg_row[0]:
+            try: cfg.update(json.loads(cfg_row[0]))
+            except Exception: pass
+
+        if not rows:
+            return {"applied": False, "adjustments": {}, "patterns": []}
+
+        backtest_runs, losing_trades = [], []
+        for r in rows:
+            backtest_runs.append({
+                "win_rate":      r[0],
+                "profit_factor": r[1],
+                "total_trades":  int(r[3] or 0),
+            })
+            try:
+                for t in json.loads(r[2] or "[]"):
+                    if float(t.get("pnl", 0) or 0) < 0:
+                        losing_trades.append(t)
+            except Exception:
+                pass
+
+        analysis = _analyze_losing_trades(losing_trades, backtest_runs, cfg)
+        all_adj  = analysis["adjustments"]
+        real_adj = {k: v for k, v in all_adj.items() if not k.startswith("_r_")}
+
+        if not real_adj:
+            return {"applied": False, "adjustments": {}, "patterns": analysis["patterns"]}
+
+        new_cfg = dict(cfg); new_cfg.update(real_adj)
+        conn = get_conn(); cur = conn.cursor()
+        cur.execute("UPDATE users SET settings=%s WHERE id=%s",
+                    (json.dumps(new_cfg), user_id))
+        conn.commit(); conn.close()
+
+        return {
+            "applied":              True,
+            "adjustments_applied":  len(real_adj),
+            "adjustments":          real_adj,
+            "patterns":             analysis["patterns"],
+        }
+    except Exception as e:
+        print(f"[auto_learn] error: {e}")
+        return {"applied": False, "adjustments": {}, "patterns": []}
+
+
+# ── Grid of params the optimiser will sweep ──────────────────────────────────
+OPTIMIZE_GRID = {
+    "confluence_min":  [3, 4, 5, 6, 7],
+    "risk_reward":     [1.5, 2.0, 2.5, 3.0],
+    "disp_body_ratio": [0.40, 0.52, 0.62],
+}
+
+
+def _grid_score(total_trades, win_rate, profit_factor):
+    """
+    Composite score: rewards high PF × win-rate while penalising zero-trade runs.
+    A run with ≥ 5 trades, 60% WR, and PF 2.0 scores 1.20.
+    """
+    import math
+    if total_trades < 3:
+        return 0.0
+    wr_frac = (win_rate or 0) / 100.0
+    pf      = profit_factor or 0.0
+    trade_w = min(total_trades, 30) / 30.0
+    return round(pf * wr_frac * trade_w, 4)
+
+
+@app.route("/api/optimize", methods=["POST", "OPTIONS"])
+@auth_required
+def optimize_params():
+    """
+    Parameter grid search.
+    Fetches candles once, then runs run_unified_bot_strategy for every
+    combination in OPTIMIZE_GRID, scores each result, and applies the
+    best-found config to the user's settings.
+
+    Body (same fields as /api/backtest):
+      symbol, interval, period_days, starting_balance, fee_percent,
+      slippage_percent  (strategy is always unified_bot for this endpoint)
+    """
+    data       = request.get_json(force=True) or {}
+    symbol     = data.get("symbol", "BTCUSDT").upper()
+    interval   = data.get("interval", "5m")
+    period_days= max(7, min(int(data.get("period_days", 30)), 90))
+    sb         = float(data.get("starting_balance", 10000))
+    fee_pct    = float(data.get("fee_percent",      0.04))
+    slip_pct   = float(data.get("slippage_percent", 0.02))
+
+    # ── Determine market ──────────────────────────────────────────────────────
+    market = next(
+        (m for m, syms in MARKETS.items() if symbol in syms), "crypto"
+    )
+
+    # ── Fetch candles once ────────────────────────────────────────────────────
+    try:
+        if market == "crypto":
+            target_rows = period_days * 288   # 5 m bars per day
+            end_dt   = datetime.now(timezone.utc)
+            start_dt = end_dt - timedelta(days=period_days)
+            start_ms = int(start_dt.timestamp() * 1000)
+            end_ms   = int(end_dt.timestamp()   * 1000)
+            candles  = fetch_binance_range_paginated(
+                symbol, interval, start_ms, end_ms, max_candles=target_rows
+            )
+        else:
+            candles, interval, _, _ = fetch_non_crypto_backtest_candles(
+                symbol, period_days, random_window=False
+            )
+        if not candles or len(candles) < 60:
+            return jsonify({"error": "Not enough candle data for optimisation."}), 400
+    except Exception as e:
+        return jsonify({"error": f"Candle fetch failed: {e}"}), 500
+
+    cfg = get_user_config()
+
+    # ── Build full Cartesian product of the grid ──────────────────────────────
+    import itertools
+    keys   = list(OPTIMIZE_GRID.keys())
+    values = list(OPTIMIZE_GRID.values())
+    combos = list(itertools.product(*values))  # e.g. 5×4×3 = 60
+
+    results = []
+    for combo in combos:
+        trial_cfg = dict(cfg)
+        for k, v in zip(keys, combo):
+            trial_cfg[k] = v
+
+        try:
+            trades, ending_balance = run_unified_bot_strategy(
+                candles, sb, fee_pct, slip_pct,
+                weekly_win_goal=cfg.get("weekly_win_goal", 3),
+                weekly_profit_target_pct=cfg.get("weekly_profit_target_percent", 3.0),
+                weekly_max_loss_pct=cfg.get("weekly_max_loss_percent", 0.8),
+                user_cfg=trial_cfg,
+            )
+        except Exception:
+            continue
+
+        total   = len(trades)
+        wins    = [t for t in trades if float(t.get("pnl", 0) or 0) > 0]
+        losses  = [t for t in trades if float(t.get("pnl", 0) or 0) <= 0]
+        gp      = sum(float(t.get("pnl", 0) or 0) for t in wins)
+        gl      = abs(sum(float(t.get("pnl", 0) or 0) for t in losses))
+        wr      = (len(wins) / total * 100) if total else 0
+        pf      = (gp / gl) if gl else (1.0 if gp > 0 else 0.0)
+        net     = round(ending_balance - sb, 2)
+        score   = _grid_score(total, wr, pf)
+
+        results.append({
+            "params":        {k: v for k, v in zip(keys, combo)},
+            "total_trades":  total,
+            "win_rate":      round(wr, 2),
+            "profit_factor": round(pf, 2),
+            "net_pnl":       net,
+            "score":         score,
+        })
+
+    if not results:
+        return jsonify({"error": "No results generated — all combos produced errors."}), 500
+
+    results.sort(key=lambda r: r["score"], reverse=True)
+    best    = results[0]
+    top5    = results[:5]
+
+    # ── Apply best params to user config ─────────────────────────────────────
+    new_cfg = dict(cfg)
+    new_cfg.update(best["params"])
+    try:
+        conn = get_conn(); cur = conn.cursor()
+        cur.execute("UPDATE users SET settings=%s WHERE id=%s",
+                    (json.dumps(new_cfg), g.user_id))
+        conn.commit(); conn.close()
+        applied = True
+    except Exception as e:
+        print(f"[optimize] DB save error: {e}")
+        applied = False
+
+    return jsonify({
+        "ok":           True,
+        "combos_tested": len(results),
+        "best":         best,
+        "top5":         top5,
+        "applied":      applied,
+        "param_keys":   keys,
+    })
 
 
 @app.route("/api/learn", methods=["POST", "OPTIONS"])
