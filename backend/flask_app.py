@@ -6492,6 +6492,100 @@ def api_walkforward():
 
 
 # ─────────────────────────────────────────────
+# TRADE RECOMMENDATIONS ENDPOINT
+# ─────────────────────────────────────────────
+
+@app.route("/api/paper/recommendations", methods=["GET", "OPTIONS"])
+@auth_required
+def paper_recommendations():
+    """
+    Scan watchlist and return BUY/SELL trade recommendations with entry/SL/TP levels.
+    Does NOT open any trades — purely advisory.
+
+    Query params:
+      symbol=BTCUSDT  (optional) — restrict scan to a single symbol
+    """
+    try:
+        cfg          = get_user_config()
+        bot_interval = cfg.get("bot_interval", "5m")
+        rr           = float(cfg.get("risk_reward",    2.0))
+        atr_mult     = float(cfg.get("atr_multiplier", 1.5))
+        fee_pct      = float(cfg.get("fee_percent",    0.04))
+        slip_pct     = float(cfg.get("slippage_percent", 0.02))
+        cost_mult    = float(cfg.get("cost_viable_mult", 2.0))
+        symbols      = (cfg.get("symbols") or ALL_SYMBOLS)[:12]
+
+        single = request.args.get("symbol", "").upper().strip()
+        if single and single in ALL_SYMBOLS:
+            symbols = [single]
+
+        recs = []
+        for sym in symbols:
+            try:
+                s = get_symbol_summary(sym, "bot", bot_interval, cfg)
+                if not s:
+                    continue
+                signal     = s.get("signal", "HOLD")
+                confidence = float(s.get("confidence") or 0)
+                if signal not in ("BUY", "SELL"):
+                    continue
+
+                df = fetch_df_for_symbol(sym, bot_interval, 200)
+                if df is None:
+                    continue
+
+                levels = calculate_trade_levels(df, signal, rr, atr_mult, cfg)
+                if not levels.get("rr_valid"):
+                    continue
+
+                # ATR, market, spread
+                try:
+                    atr_val = calculate_atr(df)
+                except Exception:
+                    atr_val = None
+                market     = detect_market(sym)
+                spread_pct = MARKET_SPREADS.get(market, 0.0)
+
+                # Cost viability
+                viable, cost_reason = (True, "") if not atr_val else \
+                    _is_cost_viable(atr_val, levels["entry"], rr,
+                                    fee_pct, slip_pct, spread_pct, cost_mult)
+
+                # News sentiment (non-blocking)
+                news_score = 0
+                try:
+                    news_score, _ = _fetch_news_sentiment(sym)
+                except Exception:
+                    pass
+
+                recs.append({
+                    "symbol":       sym,
+                    "signal":       signal,
+                    "confidence":   round(confidence, 1),
+                    "entry":        levels["entry"],
+                    "sl":           levels["sl"],
+                    "tp":           levels["tp"],
+                    "rr":           round(levels.get("rr", rr), 2),
+                    "atr":          round(atr_val, 8) if atr_val else None,
+                    "news_score":   news_score,
+                    "cost_viable":  viable,
+                    "cost_reason":  cost_reason,
+                    "market":       market,
+                    "generated_at": now_str(),
+                })
+            except Exception:
+                pass
+
+        recs.sort(key=lambda r: r["confidence"], reverse=True)
+        return jsonify({"ok": True, "recommendations": recs,
+                        "scanned": len(symbols), "interval": bot_interval})
+
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "detail": traceback.format_exc()[-400:]}), 500
+
+
+# ─────────────────────────────────────────────
 # NEWS SENTIMENT & SCHEDULER STATUS ENDPOINTS
 # ─────────────────────────────────────────────
 

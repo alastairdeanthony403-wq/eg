@@ -1,7 +1,8 @@
 /**
  * PaperTrading.jsx — NexusBot
- * Live paper trading page: bot auto-trader, open positions, signal scanner,
- * equity curve, activity feed, and closed trade history.
+ * Live paper trading page: symbol selector, chart, bot auto-trader,
+ * trade recommendation sidebar, open positions, signal scanner,
+ * equity curve, and activity feed.
  */
 import React, { useState, useEffect, useCallback, useRef } from "react";
 import { apiFetch } from "../lib/api";
@@ -10,13 +11,13 @@ import {
   Tooltip, ResponsiveContainer,
 } from "recharts";
 import {
-  Play, Square, RefreshCw, Zap, TrendingUp, TrendingDown,
+  Play, Square, RefreshCw, Zap, TrendingUp,
   AlertTriangle, CheckCircle, Activity, RotateCcw,
   ArrowUpRight, ArrowDownRight, Clock, Database,
-  ChevronUp, ChevronDown, X,
+  X, Target, DollarSign, ShieldOff, BarChart2,
 } from "lucide-react";
 
-// ── Design tokens (match rest of app) ────────────────────────────────────────
+// ── Design tokens ─────────────────────────────────────────────────────────────
 const T = {
   bg:     "#050914", bg2: "#08111f", bg3: "#0d1a2e", bg4: "#111f38",
   border: "#162036", b2: "#1e3060",
@@ -37,6 +38,7 @@ const GS = `
 @keyframes spin{to{transform:rotate(360deg)}}
 @keyframes slide{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:translateY(0)}}
 @keyframes pulse-green{0%,100%{box-shadow:0 0 0 0 #00ffa340}50%{box-shadow:0 0 0 6px #00ffa300}}
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
 `;
 
 const fmt    = (n, d = 2) => n == null ? "—" : Number(n).toFixed(d);
@@ -57,46 +59,52 @@ const ALL_WATCHLIST = {
   commodities: ["XAUUSD","XAGUSD","USOIL","UKOIL","NATGAS","COPPER"],
 };
 const ALL_WATCHLIST_FLAT = Object.values(ALL_WATCHLIST).flat();
+const INTERVALS = ["1m","5m","15m","30m","1h","4h"];
 
 // ── MAIN COMPONENT ─────────────────────────────────────────────────────────────
 export default function PaperTrading() {
-  // Account state
+  // Account
   const [summary,    setSummary]   = useState(null);
   const [equity,     setEquity]    = useState([]);
   const [positions,  setPositions] = useState([]);
   const [closed,     setClosed]    = useState([]);
   const [alerts,     setAlerts]    = useState([]);
 
-  // Scanner state
+  // Scanner / bot
   const [scanResult, setScanResult] = useState(null);
   const [scanning,   setScanning]   = useState(false);
-
-  // Bot state
   const [botActive,  setBotActive]  = useState(false);
   const [togglingBot,setTogglingBot]= useState(false);
 
-  // Manual trade state
+  // Symbol & interval focus
+  const [focusSym,   setFocusSym]   = useState("BTCUSDT");
+  const [botInterval,setBotInterval]= useState("5m");
+
+  // Recommendations
+  const [recs,       setRecs]       = useState([]);
+  const [recsLoading,setRecsLoading]= useState(false);
+  const [takingTrade,setTakingTrade]= useState(null); // "SYMBOL_SIDE" key
+
+  // Chart
+  const [chartCandles, setChartCandles] = useState([]);
+  const [chartLoading, setChartLoading] = useState(false);
+
+  // Manual trade
   const [manualSym,  setManualSym]  = useState("BTCUSDT");
   const [manualSide, setManualSide] = useState("BUY");
   const [opening,    setOpening]    = useState(false);
 
-  // UI state
+  // UI
   const [closingId,  setClosingId]  = useState(null);
   const [resetting,  setResetting]  = useState(false);
   const [error,      setError]      = useState(null);
   const [notice,     setNotice]     = useState(null);
-  const [activeTab,  setActiveTab]  = useState("positions");
+  const [historyTab, setHistoryTab] = useState("positions");
 
-  // Chart tab
-  const [chartSym,     setChartSym]     = useState("BTCUSDT");
-  const [chartCandles, setChartCandles] = useState([]);
-  const [chartLoading, setChartLoading] = useState(false);
-
-  const pollRef = useRef(null);
-  const botRef  = useRef(botActive);
+  const botRef = useRef(botActive);
   botRef.current = botActive;
 
-  // ── Loaders ───────────────────────────────────────────────────────────────
+  // ── Data loaders ──────────────────────────────────────────────────────────
   const loadSummary = useCallback(async () => {
     try {
       const d = await apiFetch("/api/paper/summary");
@@ -133,10 +141,10 @@ export default function PaperTrading() {
     } catch {}
   }, []);
 
-  const loadChart = useCallback(async (sym) => {
+  const loadChart = useCallback(async (sym, interval = "5m") => {
     setChartLoading(true);
     try {
-      const d = await apiFetch(`/api/candles?symbol=${sym}&interval=5m&limit=400`);
+      const d = await apiFetch(`/api/candles?symbol=${sym}&interval=${interval}&limit=300`);
       setChartCandles(d.candles || []);
     } catch {
       setChartCandles([]);
@@ -145,10 +153,20 @@ export default function PaperTrading() {
     }
   }, []);
 
-  // Load chart when tab opens or symbol changes (MUST be after loadChart useCallback)
-  useEffect(() => {
-    if (activeTab === "chart") loadChart(chartSym);
-  }, [activeTab, chartSym, loadChart]);
+  const loadRecommendations = useCallback(async (sym) => {
+    setRecsLoading(true);
+    try {
+      const url = sym && sym !== "ALL"
+        ? `/api/paper/recommendations?symbol=${sym}`
+        : `/api/paper/recommendations`;
+      const d = await apiFetch(url);
+      setRecs(d.recommendations || []);
+    } catch {
+      setRecs([]);
+    } finally {
+      setRecsLoading(false);
+    }
+  }, []);
 
   const refreshAll = useCallback(async () => {
     await Promise.all([
@@ -157,43 +175,46 @@ export default function PaperTrading() {
     ]);
   }, [loadSummary, loadPositions, loadEquity, loadClosed, loadAlerts]);
 
-  // ── Polling: positions every 30s, bot-scan every 60s when active ──────────
+  // ── Initial load + polling ─────────────────────────────────────────────
   useEffect(() => {
     refreshAll();
+    loadChart(focusSym, botInterval);
+    loadRecommendations(focusSym);
+
     const positionPoll = setInterval(() => {
-      loadPositions();
-      loadSummary();
-      loadAlerts();
+      loadPositions(); loadSummary(); loadAlerts();
     }, 30_000);
 
-    pollRef.current = setInterval(async () => {
-      if (!botRef.current) return;
-      try {
-        const d = await apiFetch("/api/paper/bot-scan", { method: "POST",
-          body: JSON.stringify({}) });
-        if (d.opened?.length) {
-          setNotice(`Bot opened ${d.opened.length} trade(s): ${d.opened.map(o=>o.symbol).join(", ")}`);
-          loadPositions(); loadSummary(); loadAlerts(); loadEquity();
-        }
-      } catch {}
+    const recsPoll = setInterval(() => {
+      loadRecommendations(focusSym);
     }, 60_000);
 
-    return () => { clearInterval(positionPoll); clearInterval(pollRef.current); };
-  }, [refreshAll, loadPositions, loadSummary, loadAlerts, loadEquity]);
+    return () => { clearInterval(positionPoll); clearInterval(recsPoll); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
-  // ── Bot toggle ────────────────────────────────────────────────────────────
+  // ── Reload chart + recs when focus symbol changes ──────────────────────
+  useEffect(() => {
+    loadChart(focusSym, botInterval);
+    loadRecommendations(focusSym);
+  }, [focusSym, botInterval, loadChart, loadRecommendations]);
+
+  // ── Bot toggle ─────────────────────────────────────────────────────────
   const toggleBot = async () => {
     setTogglingBot(true);
     try {
       const path = botActive ? "/api/paper/stop-auto" : "/api/paper/start-auto";
-      const d = await apiFetch(path, { method: "POST", body: "{}" });
+      const body = botActive ? "{}" : JSON.stringify({ interval: botInterval });
+      const d = await apiFetch(path, { method: "POST", body });
       setBotActive(d.enabled);
-      setNotice(d.enabled ? "Bot started — scanning every 60s" : "Bot stopped");
+      setNotice(d.enabled
+        ? `Bot started — scanning every ${botInterval}`
+        : "Bot stopped — background scanner halted");
     } catch(e) { setError(e.message); }
     finally { setTogglingBot(false); }
   };
 
-  // ── Manual scan ───────────────────────────────────────────────────────────
+  // ── Manual scan ────────────────────────────────────────────────────────
   const runScan = async (force = false) => {
     setScanning(true); setScanResult(null);
     try {
@@ -207,11 +228,29 @@ export default function PaperTrading() {
       } else if (force) {
         setNotice("Scan complete — no qualifying signals at this time.");
       }
+      loadRecommendations(focusSym);
     } catch(e) { setError(e.message); }
     finally { setScanning(false); }
   };
 
-  // ── Manual trade ──────────────────────────────────────────────────────────
+  // ── Take a recommendation ──────────────────────────────────────────────
+  const takeRecommendation = async (rec) => {
+    const key = `${rec.symbol}_${rec.signal}`;
+    setTakingTrade(key);
+    try {
+      const d = await apiFetch("/api/trades", {
+        method: "POST",
+        body: JSON.stringify({ symbol: rec.symbol, side: rec.signal }),
+      });
+      if (!d.ok) throw new Error(d.error || "Open failed");
+      setNotice(`Opened ${rec.signal} ${rec.symbol} @ ${fmt(d.entry, 6)}`);
+      setRecs(r => r.filter(x => !(x.symbol === rec.symbol && x.signal === rec.signal)));
+      loadPositions(); loadSummary(); loadAlerts(); loadChart(focusSym, botInterval);
+    } catch(e) { setError(e.message); }
+    finally { setTakingTrade(null); }
+  };
+
+  // ── Manual trade ───────────────────────────────────────────────────────
   const openManualTrade = async () => {
     setOpening(true); setError(null);
     try {
@@ -226,7 +265,7 @@ export default function PaperTrading() {
     finally { setOpening(false); }
   };
 
-  // ── Close trade ───────────────────────────────────────────────────────────
+  // ── Close trade ────────────────────────────────────────────────────────
   const closeTrade = async (tid) => {
     setClosingId(tid);
     try {
@@ -237,13 +276,13 @@ export default function PaperTrading() {
     finally { setClosingId(null); }
   };
 
-  // ── Reset account ─────────────────────────────────────────────────────────
+  // ── Reset ──────────────────────────────────────────────────────────────
   const resetAccount = async () => {
     if (!window.confirm("Reset paper trading account? All trades will be deleted.")) return;
     setResetting(true);
     try {
       await apiFetch("/api/paper/reset", { method: "POST", body: "{}" });
-      setBotActive(false);
+      setBotActive(false); setRecs([]);
       setNotice("Account reset — starting fresh.");
       refreshAll();
     } catch(e) { setError(e.message); }
@@ -252,19 +291,20 @@ export default function PaperTrading() {
 
   const unrealizedPnl = positions.reduce((s, p) => s + (p.pnl || 0), 0);
 
-  // ── Render ────────────────────────────────────────────────────────────────
+  // ── Render ─────────────────────────────────────────────────────────────
   return (
     <div style={{minHeight:"100vh",background:T.bg,fontFamily:UI,color:T.text}}>
       <style>{GS}</style>
 
       {/* Page header */}
       <div style={{padding:"22px 24px 0",borderBottom:`1px solid ${T.border}`,marginBottom:20}}>
-        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:12,marginBottom:18}}>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",
+          flexWrap:"wrap",gap:12,marginBottom:18}}>
           <div>
             <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:4}}>
               <Activity size={20} style={{color:T.green}}/>
               <h1 style={{margin:0,fontSize:22,fontWeight:700,letterSpacing:1}}>PAPER TRADING</h1>
-              {botActive&&(
+              {botActive && (
                 <span style={{fontFamily:MONO,fontSize:9,background:`${T.green}18`,
                   border:`1px solid ${T.green}44`,borderRadius:3,padding:"2px 8px",
                   color:T.green,letterSpacing:2,animation:"pulse-green 2s infinite"}}>
@@ -287,7 +327,7 @@ export default function PaperTrading() {
               style={{background:`${T.red}10`,border:`1px solid ${T.red}33`,color:T.red,
                 borderRadius:4,padding:"7px 14px",cursor:"pointer",fontFamily:MONO,
                 fontSize:10,display:"flex",alignItems:"center",gap:5}}>
-              <RotateCcw size={11}/>{resetting?"RESETTING…":"RESET"}
+              <RotateCcw size={11}/>{resetting ? "RESETTING…" : "RESET"}
             </button>
           </div>
         </div>
@@ -295,215 +335,166 @@ export default function PaperTrading() {
 
       <div style={{padding:"0 24px 40px"}}>
 
-        {/* Error / Notice banners */}
-        {error&&(
+        {/* Banners */}
+        {error && (
           <div style={{background:`${T.red}12`,border:`1px solid ${T.red}40`,borderRadius:5,
             padding:"9px 14px",marginBottom:14,color:T.red,fontFamily:MONO,fontSize:12,
             display:"flex",alignItems:"center",gap:10}}>
             <AlertTriangle size={13}/>
             <span style={{flex:1}}>{error}</span>
-            <button onClick={()=>setError(null)} style={{background:"none",border:"none",color:T.t2,cursor:"pointer"}}>×</button>
+            <button onClick={()=>setError(null)}
+              style={{background:"none",border:"none",color:T.t2,cursor:"pointer"}}>×</button>
           </div>
         )}
-        {notice&&(
+        {notice && (
           <div style={{background:`${T.green}10`,border:`1px solid ${T.green}33`,borderRadius:5,
             padding:"9px 14px",marginBottom:14,color:T.green,fontFamily:MONO,fontSize:12,
             display:"flex",alignItems:"center",gap:10,animation:"slide .2s ease"}}>
             <CheckCircle size={13}/>
             <span style={{flex:1}}>{notice}</span>
-            <button onClick={()=>setNotice(null)} style={{background:"none",border:"none",color:T.t2,cursor:"pointer"}}>×</button>
+            <button onClick={()=>setNotice(null)}
+              style={{background:"none",border:"none",color:T.t2,cursor:"pointer"}}>×</button>
           </div>
         )}
 
-        {/* ── Account stats strip ── */}
+        {/* Account stats */}
         <AccountStrip summary={summary} unrealizedPnl={unrealizedPnl}/>
 
-        {/* ── Bot controls + Manual trade ── */}
-        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14,marginBottom:20}}>
+        {/* ── Bot controls + symbol/interval selector ── */}
+        <BotPanel
+          botActive={botActive}
+          togglingBot={togglingBot}
+          scanning={scanning}
+          focusSym={focusSym}
+          setFocusSym={setFocusSym}
+          botInterval={botInterval}
+          setBotInterval={setBotInterval}
+          manualSym={manualSym}
+          setManualSym={setManualSym}
+          manualSide={manualSide}
+          setManualSide={setManualSide}
+          opening={opening}
+          onToggleBot={toggleBot}
+          onScan={() => runScan(true)}
+          onManualTrade={openManualTrade}
+        />
 
-          {/* Bot control */}
-          <div style={{background:T.bg3,border:`1px solid ${T.border}`,borderRadius:6,padding:16}}>
-            <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12}}>
-              <Zap size={14} style={{color:botActive?T.green:T.t2}}/>
-              <span style={{fontFamily:MONO,fontSize:11,color:botActive?T.green:T.t2,letterSpacing:2}}>
-                BOT AUTO-TRADER
-              </span>
-            </div>
-            <p style={{margin:"0 0 14px",fontSize:12,color:T.t2,lineHeight:1.6}}>
-              When active, the bot scans your watchlist every 60 seconds and automatically
-              opens trades when signals pass confidence + R:R gates.
-            </p>
-            <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
-              <button onClick={toggleBot} disabled={togglingBot}
-                style={{flex:1,background:botActive?`${T.red}14`:`${T.green}14`,
-                  border:`1px solid ${botActive?T.red:T.green}44`,
-                  color:botActive?T.red:T.green,borderRadius:4,padding:"9px 0",
-                  cursor:"pointer",fontFamily:MONO,fontSize:11,letterSpacing:1,
-                  display:"flex",alignItems:"center",justifyContent:"center",gap:6}}>
-                {togglingBot
-                  ? <><Spinner c={botActive?T.red:T.green}/>TOGGLING…</>
-                  : botActive
-                    ? <><Square size={11}/>STOP BOT</>
-                    : <><Play  size={11}/>START BOT</>
-                }
-              </button>
-              <button onClick={()=>runScan(true)} disabled={scanning}
-                style={{flex:1,background:`${T.blue}12`,border:`1px solid ${T.blue}44`,
-                  color:T.blue,borderRadius:4,padding:"9px 0",cursor:"pointer",
-                  fontFamily:MONO,fontSize:11,letterSpacing:1,
-                  display:"flex",alignItems:"center",justifyContent:"center",gap:6}}>
-                {scanning
-                  ? <><Spinner c={T.blue}/>SCANNING…</>
-                  : <><RefreshCw size={11}/>SCAN NOW</>
-                }
-              </button>
-            </div>
-          </div>
+        {/* Scan results */}
+        {scanResult && <ScanResults data={scanResult} onDismiss={()=>setScanResult(null)}/>}
 
-          {/* Manual trade */}
-          <div style={{background:T.bg3,border:`1px solid ${T.border}`,borderRadius:6,padding:16}}>
-            <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12}}>
-              <TrendingUp size={14} style={{color:T.blue}}/>
-              <span style={{fontFamily:MONO,fontSize:11,color:T.blue,letterSpacing:2}}>
-                MANUAL TRADE
-              </span>
-            </div>
-            <p style={{margin:"0 0 14px",fontSize:12,color:T.t2,lineHeight:1.6}}>
-              Open a paper trade using the bot's live signal levels (entry, SL, TP)
-              for any supported symbol.
-            </p>
-            <div style={{display:"flex",gap:8}}>
-              <select value={manualSym} onChange={e=>setManualSym(e.target.value)}
-                style={{flex:2,background:T.bg2,border:`1px solid ${T.border}`,color:T.text,
-                  borderRadius:4,padding:"8px 10px",fontFamily:MONO,fontSize:11,outline:"none"}}>
-                {Object.entries(ALL_WATCHLIST).map(([grp, syms]) => (
-                  <optgroup key={grp} label={grp.charAt(0).toUpperCase()+grp.slice(1)}>
-                    {syms.map(s=><option key={s} value={s}>{s}</option>)}
-                  </optgroup>
-                ))}
-              </select>
-              <button onClick={()=>setManualSide("BUY")}
-                style={{flex:1,background:manualSide==="BUY"?`${T.green}22`:"transparent",
-                  border:`1px solid ${manualSide==="BUY"?T.green:T.border}`,
-                  color:manualSide==="BUY"?T.green:T.t2,borderRadius:4,cursor:"pointer",
-                  fontFamily:MONO,fontSize:11,padding:"8px 0"}}>
-                BUY
-              </button>
-              <button onClick={()=>setManualSide("SELL")}
-                style={{flex:1,background:manualSide==="SELL"?`${T.red}22`:"transparent",
-                  border:`1px solid ${manualSide==="SELL"?T.red:T.border}`,
-                  color:manualSide==="SELL"?T.red:T.t2,borderRadius:4,cursor:"pointer",
-                  fontFamily:MONO,fontSize:11,padding:"8px 0"}}>
-                SELL
-              </button>
-              <button onClick={openManualTrade} disabled={opening}
-                style={{flex:1,background:`${T.blue}18`,border:`1px solid ${T.blue}44`,
-                  color:T.blue,borderRadius:4,cursor:"pointer",fontFamily:MONO,fontSize:11,padding:"8px 0"}}>
-                {opening?<Spinner c={T.blue}/>:"OPEN"}
-              </button>
-            </div>
-          </div>
-        </div>
+        {/* ── Main grid: left + right sidebar ── */}
+        <div style={{display:"grid",gridTemplateColumns:"1fr 360px",gap:14}}>
 
-        {/* ── Scan results (if ran) ── */}
-        {scanResult&&<ScanResults data={scanResult} onDismiss={()=>setScanResult(null)}/>}
-
-        {/* ── Main grid: positions + equity + signals ── */}
-        <div style={{display:"grid",gridTemplateColumns:"1fr 340px",gap:14,marginBottom:20}}>
-
-          {/* Left — positions / history */}
-          <div>
-            {/* Tab bar */}
-            <div style={{display:"flex",gap:0,borderBottom:`1px solid ${T.border}`,marginBottom:0}}>
-              {["positions","history","chart"].map(t=>(
-                <button key={t} onClick={()=>setActiveTab(t)}
-                  style={{padding:"9px 18px",background:"none",border:"none",
-                    borderBottom:`2px solid ${activeTab===t?T.blue:"transparent"}`,
-                    color:activeTab===t?T.blue:T.t2,cursor:"pointer",fontFamily:MONO,
-                    fontSize:10,letterSpacing:2,textTransform:"uppercase"}}>
-                  {t}{t==="positions"&&positions.length>0&&(
-                    <span style={{marginLeft:6,background:T.blue,color:"#000",
-                      borderRadius:10,padding:"1px 6px",fontSize:9}}>
-                      {positions.length}
-                    </span>
-                  )}
-                </button>
-              ))}
-            </div>
-
-            {activeTab==="positions"&&(
-              positions.length===0
-                ? <EmptyPanel text="No open positions. Start the bot or open a manual trade." icon={<Activity size={28} style={{color:T.t3}}/>}/>
-                : <div>
-                    {positions.map(p=>(
-                      <PositionRow key={p.id} pos={p}
-                        closing={closingId===p.id}
-                        onClose={()=>closeTrade(p.id)}/>
-                    ))}
-                  </div>
-            )}
-
-            {activeTab==="history"&&(
-              closed.length===0
-                ? <EmptyPanel text="No closed trades yet." icon={<Clock size={28} style={{color:T.t3}}/>}/>
-                : <div style={{overflowX:"auto"}}>
-                    <table style={{width:"100%",borderCollapse:"collapse",fontFamily:MONO,fontSize:10}}>
-                      <thead>
-                        <tr>
-                          {["SYMBOL","SIDE","ENTRY","EXIT","P&L","SL","TP","TIME"].map(h=>(
-                            <th key={h} style={{padding:"9px 12px",textAlign:"left",fontFamily:MONO,
-                              fontSize:8,color:T.t2,borderBottom:`1px solid ${T.border}`,
-                              background:T.bg2,letterSpacing:1}}>{h}</th>
-                          ))}
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {closed.map((t,i)=>(
-                          <tr key={t.id} style={{background:i%2===0?T.bg3:T.bg2,
-                            borderBottom:`1px solid ${T.border}`}}>
-                            <td style={{padding:"8px 12px",color:T.text,fontWeight:600}}>{t.symbol}</td>
-                            <td style={{padding:"8px 12px",color:t.side==="BUY"?T.green:T.red}}>
-                              {t.side}
-                            </td>
-                            <td style={{padding:"8px 12px",color:T.text}}>{fmt(t.entry,6)}</td>
-                            <td style={{padding:"8px 12px",color:T.text}}>{fmt(t.exit,6)}</td>
-                            <td style={{padding:"8px 12px",fontWeight:600,
-                              color:(t.pnl||0)>=0?T.green:T.red}}>
-                              {fmtPnl(t.pnl)}
-                            </td>
-                            <td style={{padding:"8px 12px",color:T.red,fontSize:10}}>{fmt(t.sl,6)}</td>
-                            <td style={{padding:"8px 12px",color:T.green,fontSize:10}}>{fmt(t.tp,6)}</td>
-                            <td style={{padding:"8px 12px",color:T.t2,fontSize:9}}>
-                              {String(t.time||"").slice(0,16)}
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-            )}
-
-            {activeTab==="chart"&&(
-              <PaperChart
-                candles={chartCandles}
-                trades={[
-                  ...closed.filter(t=>t.symbol===chartSym),
-                  ...positions.filter(p=>p.symbol===chartSym).map(p=>({
-                    ...p, exit: p.current_price, pnl: p.pnl,
-                    close_time: null, open_time: p.time,
-                    status: "OPEN",
-                  })),
-                ]}
-                symbol={chartSym}
-                loading={chartLoading}
-                allSymbols={ALL_WATCHLIST}
-                onSymbolChange={sym => setChartSym(sym)}
-              />
-            )}
-          </div>
-
-          {/* Right — equity curve + activity */}
+          {/* Left column */}
           <div style={{display:"flex",flexDirection:"column",gap:14}}>
+
+            {/* Chart — always visible */}
+            <PaperChart
+              candles={chartCandles}
+              trades={[
+                ...closed.filter(t=>t.symbol===focusSym),
+                ...positions.filter(p=>p.symbol===focusSym).map(p=>({
+                  ...p, exit: p.current_price, pnl: p.pnl,
+                  close_time: null, open_time: p.time, status: "OPEN",
+                })),
+              ]}
+              symbol={focusSym}
+              interval={botInterval}
+              loading={chartLoading}
+              allSymbols={ALL_WATCHLIST}
+              onSymbolChange={sym => setFocusSym(sym)}
+            />
+
+            {/* Positions / History tabs */}
+            <div style={{background:T.bg3,border:`1px solid ${T.border}`,borderRadius:6}}>
+              <div style={{display:"flex",gap:0,borderBottom:`1px solid ${T.border}`}}>
+                {["positions","history"].map(t=>(
+                  <button key={t} onClick={()=>setHistoryTab(t)}
+                    style={{padding:"9px 20px",background:"none",border:"none",
+                      borderBottom:`2px solid ${historyTab===t?T.blue:"transparent"}`,
+                      color:historyTab===t?T.blue:T.t2,cursor:"pointer",fontFamily:MONO,
+                      fontSize:10,letterSpacing:2,textTransform:"uppercase"}}>
+                    {t}
+                    {t==="positions" && positions.length>0 && (
+                      <span style={{marginLeft:6,background:T.blue,color:"#000",
+                        borderRadius:10,padding:"1px 6px",fontSize:9}}>
+                        {positions.length}
+                      </span>
+                    )}
+                  </button>
+                ))}
+              </div>
+
+              {historyTab==="positions" && (
+                positions.length===0
+                  ? <EmptyPanel text="No open positions. Start the bot or open a manual trade."
+                      icon={<Activity size={28} style={{color:T.t3}}/>}/>
+                  : <div style={{padding:"8px 0"}}>
+                      {positions.map(p=>(
+                        <PositionRow key={p.id} pos={p}
+                          closing={closingId===p.id}
+                          onClose={()=>closeTrade(p.id)}/>
+                      ))}
+                    </div>
+              )}
+
+              {historyTab==="history" && (
+                closed.length===0
+                  ? <EmptyPanel text="No closed trades yet."
+                      icon={<Clock size={28} style={{color:T.t3}}/>}/>
+                  : <div style={{overflowX:"auto"}}>
+                      <table style={{width:"100%",borderCollapse:"collapse",
+                        fontFamily:MONO,fontSize:10}}>
+                        <thead>
+                          <tr>
+                            {["SYMBOL","SIDE","ENTRY","EXIT","P&L","SL","TP","TIME"].map(h=>(
+                              <th key={h} style={{padding:"9px 12px",textAlign:"left",
+                                fontFamily:MONO,fontSize:8,color:T.t2,
+                                borderBottom:`1px solid ${T.border}`,background:T.bg2,
+                                letterSpacing:1}}>{h}</th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {closed.map((t,i)=>(
+                            <tr key={t.id}
+                              style={{background:i%2===0?T.bg3:T.bg2,
+                                borderBottom:`1px solid ${T.border}`}}>
+                              <td style={{padding:"8px 12px",color:T.text,fontWeight:600}}>
+                                {t.symbol}
+                              </td>
+                              <td style={{padding:"8px 12px",
+                                color:t.side==="BUY"?T.green:T.red}}>{t.side}</td>
+                              <td style={{padding:"8px 12px"}}>{fmt(t.entry,6)}</td>
+                              <td style={{padding:"8px 12px"}}>{fmt(t.exit,6)}</td>
+                              <td style={{padding:"8px 12px",fontWeight:600,
+                                color:(t.pnl||0)>=0?T.green:T.red}}>
+                                {fmtPnl(t.pnl)}
+                              </td>
+                              <td style={{padding:"8px 12px",color:T.red}}>{fmt(t.sl,6)}</td>
+                              <td style={{padding:"8px 12px",color:T.green}}>{fmt(t.tp,6)}</td>
+                              <td style={{padding:"8px 12px",color:T.t2,fontSize:9}}>
+                                {String(t.time||"").slice(0,16)}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+              )}
+            </div>
+          </div>
+
+          {/* Right sidebar */}
+          <div style={{display:"flex",flexDirection:"column",gap:14}}>
+            <RecommendationSidebar
+              recs={recs}
+              loading={recsLoading}
+              takingTrade={takingTrade}
+              focusSym={focusSym}
+              onTake={takeRecommendation}
+              onRefresh={() => loadRecommendations(focusSym)}
+            />
             <EquityPanel equity={equity} summary={summary}/>
             <ActivityFeed alerts={alerts}/>
           </div>
@@ -514,7 +505,308 @@ export default function PaperTrading() {
   );
 }
 
-// ── ACCOUNT STATS STRIP ────────────────────────────────────────────────────────
+// ── BOT PANEL ─────────────────────────────────────────────────────────────────
+function BotPanel({
+  botActive, togglingBot, scanning,
+  focusSym, setFocusSym, botInterval, setBotInterval,
+  manualSym, setManualSym, manualSide, setManualSide,
+  opening, onToggleBot, onScan, onManualTrade,
+}) {
+  return (
+    <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14,marginBottom:20}}>
+
+      {/* Bot auto-trader */}
+      <div style={{background:T.bg3,border:`1px solid ${T.border}`,borderRadius:6,padding:16}}>
+        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12}}>
+          <Zap size={14} style={{color:botActive?T.green:T.t2}}/>
+          <span style={{fontFamily:MONO,fontSize:11,
+            color:botActive?T.green:T.t2,letterSpacing:2}}>
+            BOT AUTO-TRADER
+          </span>
+          {botActive && (
+            <span style={{marginLeft:"auto",fontFamily:MONO,fontSize:9,
+              color:T.green,animation:"pulse-green 2s infinite"}}>● LIVE</span>
+          )}
+        </div>
+
+        {/* Symbol + Interval selectors */}
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:12}}>
+          <div>
+            <div style={{fontFamily:MONO,fontSize:9,color:T.t2,
+              letterSpacing:1,marginBottom:4}}>FOCUS SYMBOL</div>
+            <select value={focusSym}
+              onChange={e=>setFocusSym(e.target.value)}
+              style={{width:"100%",background:T.bg2,border:`1px solid ${T.b2}`,
+                color:T.text,borderRadius:4,padding:"7px 10px",
+                fontFamily:MONO,fontSize:11,outline:"none"}}>
+              {Object.entries(ALL_WATCHLIST).map(([grp,syms])=>(
+                <optgroup key={grp} label={grp.charAt(0).toUpperCase()+grp.slice(1)}>
+                  {syms.map(s=><option key={s} value={s}>{s}</option>)}
+                </optgroup>
+              ))}
+            </select>
+          </div>
+          <div>
+            <div style={{fontFamily:MONO,fontSize:9,color:T.t2,
+              letterSpacing:1,marginBottom:4}}>SCAN INTERVAL</div>
+            <select value={botInterval}
+              onChange={e=>setBotInterval(e.target.value)}
+              style={{width:"100%",background:T.bg2,border:`1px solid ${T.b2}`,
+                color:T.text,borderRadius:4,padding:"7px 10px",
+                fontFamily:MONO,fontSize:11,outline:"none"}}>
+              {INTERVALS.map(iv=>(
+                <option key={iv} value={iv}>{iv}</option>
+              ))}
+            </select>
+          </div>
+        </div>
+
+        <div style={{display:"flex",gap:8}}>
+          <button onClick={onToggleBot} disabled={togglingBot}
+            style={{flex:1,background:botActive?`${T.red}14`:`${T.green}14`,
+              border:`1px solid ${botActive?T.red:T.green}44`,
+              color:botActive?T.red:T.green,borderRadius:4,padding:"9px 0",
+              cursor:"pointer",fontFamily:MONO,fontSize:11,letterSpacing:1,
+              display:"flex",alignItems:"center",justifyContent:"center",gap:6}}>
+            {togglingBot
+              ? <><Spinner c={botActive?T.red:T.green}/>TOGGLING…</>
+              : botActive
+                ? <><Square size={11}/>STOP BOT</>
+                : <><Play  size={11}/>START BOT</>
+            }
+          </button>
+          <button onClick={onScan} disabled={scanning}
+            style={{flex:1,background:`${T.blue}12`,border:`1px solid ${T.blue}44`,
+              color:T.blue,borderRadius:4,padding:"9px 0",cursor:"pointer",
+              fontFamily:MONO,fontSize:11,letterSpacing:1,
+              display:"flex",alignItems:"center",justifyContent:"center",gap:6}}>
+            {scanning
+              ? <><Spinner c={T.blue}/>SCANNING…</>
+              : <><RefreshCw size={11}/>SCAN NOW</>
+            }
+          </button>
+        </div>
+      </div>
+
+      {/* Manual trade */}
+      <div style={{background:T.bg3,border:`1px solid ${T.border}`,borderRadius:6,padding:16}}>
+        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12}}>
+          <TrendingUp size={14} style={{color:T.blue}}/>
+          <span style={{fontFamily:MONO,fontSize:11,color:T.blue,letterSpacing:2}}>
+            MANUAL TRADE
+          </span>
+        </div>
+        <p style={{margin:"0 0 14px",fontSize:12,color:T.t2,lineHeight:1.6}}>
+          Open a paper trade using the bot's live signal levels for any symbol.
+        </p>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:8}}>
+          <div>
+            <div style={{fontFamily:MONO,fontSize:9,color:T.t2,
+              letterSpacing:1,marginBottom:4}}>SYMBOL</div>
+            <select value={manualSym} onChange={e=>setManualSym(e.target.value)}
+              style={{width:"100%",background:T.bg2,border:`1px solid ${T.border}`,
+                color:T.text,borderRadius:4,padding:"7px 10px",
+                fontFamily:MONO,fontSize:11,outline:"none"}}>
+              {Object.entries(ALL_WATCHLIST).map(([grp,syms])=>(
+                <optgroup key={grp} label={grp.charAt(0).toUpperCase()+grp.slice(1)}>
+                  {syms.map(s=><option key={s} value={s}>{s}</option>)}
+                </optgroup>
+              ))}
+            </select>
+          </div>
+          <div>
+            <div style={{fontFamily:MONO,fontSize:9,color:T.t2,
+              letterSpacing:1,marginBottom:4}}>DIRECTION</div>
+            <div style={{display:"flex",gap:6,height:34}}>
+              <button onClick={()=>setManualSide("BUY")}
+                style={{flex:1,background:manualSide==="BUY"?`${T.green}22`:"transparent",
+                  border:`1px solid ${manualSide==="BUY"?T.green:T.border}`,
+                  color:manualSide==="BUY"?T.green:T.t2,borderRadius:4,cursor:"pointer",
+                  fontFamily:MONO,fontSize:11}}>BUY</button>
+              <button onClick={()=>setManualSide("SELL")}
+                style={{flex:1,background:manualSide==="SELL"?`${T.red}22`:"transparent",
+                  border:`1px solid ${manualSide==="SELL"?T.red:T.border}`,
+                  color:manualSide==="SELL"?T.red:T.t2,borderRadius:4,cursor:"pointer",
+                  fontFamily:MONO,fontSize:11}}>SELL</button>
+            </div>
+          </div>
+        </div>
+        <button onClick={onManualTrade} disabled={opening}
+          style={{width:"100%",background:`${T.blue}18`,border:`1px solid ${T.blue}44`,
+            color:T.blue,borderRadius:4,cursor:"pointer",fontFamily:MONO,fontSize:11,
+            padding:"9px 0",display:"flex",alignItems:"center",justifyContent:"center",gap:6}}>
+          {opening ? <><Spinner c={T.blue}/>OPENING…</> : <><DollarSign size={11}/>OPEN TRADE</>}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── RECOMMENDATION SIDEBAR ────────────────────────────────────────────────────
+function RecommendationSidebar({ recs, loading, takingTrade, focusSym, onTake, onRefresh }) {
+  return (
+    <div style={{background:T.bg3,border:`1px solid ${T.border}`,borderRadius:6,padding:14}}>
+      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12}}>
+        <Target size={13} style={{color:T.gold}}/>
+        <span style={{fontFamily:MONO,fontSize:9,color:T.gold,letterSpacing:2,flex:1}}>
+          TRADE RECOMMENDATIONS
+        </span>
+        <button onClick={onRefresh} disabled={loading}
+          style={{background:"none",border:"none",color:loading?T.t3:T.t2,
+            cursor:"pointer",padding:"2px 4px",display:"flex",alignItems:"center"}}>
+          {loading
+            ? <Spinner c={T.gold}/>
+            : <RefreshCw size={11}/>
+          }
+        </button>
+      </div>
+
+      {loading && recs.length === 0 ? (
+        <div style={{padding:"24px 0",textAlign:"center",color:T.t2,
+          fontFamily:MONO,fontSize:11,display:"flex",
+          alignItems:"center",justifyContent:"center",gap:8}}>
+          <Spinner c={T.gold}/> Scanning signals…
+        </div>
+      ) : recs.length === 0 ? (
+        <div style={{padding:"20px 0",textAlign:"center"}}>
+          <Target size={24} style={{color:T.t3,marginBottom:8}}/>
+          <div style={{fontFamily:MONO,fontSize:11,color:T.t2}}>
+            No qualifying signals right now
+          </div>
+          <div style={{fontFamily:MONO,fontSize:10,color:T.t3,marginTop:4}}>
+            Showing signals for {focusSym}
+          </div>
+        </div>
+      ) : (
+        <div style={{display:"flex",flexDirection:"column",gap:8}}>
+          {recs.map((rec, i) => (
+            <RecommendationCard
+              key={`${rec.symbol}_${rec.signal}_${i}`}
+              rec={rec}
+              taking={takingTrade === `${rec.symbol}_${rec.signal}`}
+              onTake={() => onTake(rec)}
+            />
+          ))}
+        </div>
+      )}
+
+      <div style={{marginTop:10,paddingTop:8,borderTop:`1px solid ${T.border}`,
+        fontFamily:MONO,fontSize:9,color:T.t3,textAlign:"center"}}>
+        Auto-refreshes every 60s · filtered to {focusSym}
+      </div>
+    </div>
+  );
+}
+
+// ── RECOMMENDATION CARD ───────────────────────────────────────────────────────
+function RecommendationCard({ rec, taking, onTake }) {
+  const isBuy      = rec.signal === "BUY";
+  const sigCol     = isBuy ? T.green : T.red;
+  const newsLabel  = rec.news_score > 2 ? "BULLISH" : rec.news_score < -2 ? "BEARISH" : "NEUTRAL";
+  const newsCol    = rec.news_score > 2 ? T.green : rec.news_score < -2 ? T.red : T.t2;
+
+  const fmtPrice = (v) => {
+    if (v == null) return "—";
+    const n = Number(v);
+    return n >= 100 ? n.toLocaleString("en",{maximumFractionDigits:2})
+         : n >= 1   ? n.toFixed(4)
+         : n.toFixed(6);
+  };
+
+  return (
+    <div style={{background:T.bg2,border:`1px solid ${isBuy?T.green+"33":T.red+"33"}`,
+      borderRadius:5,padding:12,animation:"fadeIn .3s ease",
+      borderLeft:`3px solid ${sigCol}`}}>
+
+      {/* Header row */}
+      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10}}>
+        <div style={{background:isBuy?`${T.green}1a`:`${T.red}1a`,
+          border:`1px solid ${sigCol}44`,borderRadius:3,
+          padding:"2px 8px",fontFamily:MONO,fontSize:10,
+          color:sigCol,fontWeight:700}}>
+          {rec.signal}
+        </div>
+        <span style={{fontFamily:MONO,fontSize:14,fontWeight:700,color:T.text,flex:1}}>
+          {rec.symbol}
+        </span>
+        <div style={{textAlign:"right"}}>
+          <div style={{fontFamily:MONO,fontSize:9,color:T.t2}}>CONF</div>
+          <div style={{fontFamily:MONO,fontSize:12,fontWeight:700,
+            color: rec.confidence >= 80 ? T.green
+                 : rec.confidence >= 60 ? T.gold : T.t2}}>
+            {rec.confidence.toFixed(0)}%
+          </div>
+        </div>
+      </div>
+
+      {/* Trade levels grid */}
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",
+        gap:6,marginBottom:10}}>
+        <LevelCell label="ENTRY" val={fmtPrice(rec.entry)} color={T.text}/>
+        <LevelCell label="STOP LOSS" val={fmtPrice(rec.sl)} color={T.red}/>
+        <LevelCell label="TAKE PROFIT" val={fmtPrice(rec.tp)} color={T.green}/>
+      </div>
+
+      {/* Tags row */}
+      <div style={{display:"flex",gap:5,flexWrap:"wrap",marginBottom:10}}>
+        <Tag label={`R:R ${rec.rr}`} color={T.blue}/>
+        <Tag label={rec.market?.toUpperCase() || "—"} color={T.purple}/>
+        {rec.news_score !== 0 && (
+          <Tag label={`NEWS ${newsLabel}`} color={newsCol}/>
+        )}
+        {!rec.cost_viable && (
+          <Tag label="LOW REWARD" color={T.orange}/>
+        )}
+      </div>
+
+      {/* Take trade button */}
+      <button onClick={onTake} disabled={taking || !rec.cost_viable}
+        style={{width:"100%",
+          background: rec.cost_viable
+            ? (isBuy ? `${T.green}1a` : `${T.red}1a`)
+            : `${T.t2}0a`,
+          border:`1px solid ${rec.cost_viable ? sigCol+"55" : T.border}`,
+          color: rec.cost_viable ? sigCol : T.t3,
+          borderRadius:4,padding:"8px 0",cursor:rec.cost_viable?"pointer":"not-allowed",
+          fontFamily:MONO,fontSize:11,letterSpacing:1,
+          display:"flex",alignItems:"center",justifyContent:"center",gap:6,
+          transition:"all .15s"}}>
+        {taking
+          ? <><Spinner c={sigCol}/>OPENING…</>
+          : rec.cost_viable
+            ? <>{isBuy?<ArrowUpRight size={12}/>:<ArrowDownRight size={12}/>}
+                TAKE {rec.signal} TRADE</>
+            : <><ShieldOff size={11}/>COSTS TOO HIGH</>
+        }
+      </button>
+    </div>
+  );
+}
+
+function LevelCell({ label, val, color }) {
+  return (
+    <div style={{background:T.bg3,borderRadius:3,padding:"5px 7px"}}>
+      <div style={{fontFamily:MONO,fontSize:8,color:T.t2,letterSpacing:1,marginBottom:2}}>
+        {label}
+      </div>
+      <div style={{fontFamily:MONO,fontSize:11,color:color||T.text,fontWeight:600}}>
+        {val}
+      </div>
+    </div>
+  );
+}
+
+function Tag({ label, color }) {
+  return (
+    <span style={{fontFamily:MONO,fontSize:8,letterSpacing:1,
+      background:`${color}14`,border:`1px solid ${color}33`,
+      borderRadius:3,padding:"2px 6px",color}}>
+      {label}
+    </span>
+  );
+}
+
+// ── ACCOUNT STATS STRIP ───────────────────────────────────────────────────────
 function AccountStrip({ summary: s, unrealizedPnl }) {
   if (!s) return (
     <div style={{background:T.bg3,border:`1px solid ${T.border}`,borderRadius:6,
@@ -529,18 +821,18 @@ function AccountStrip({ summary: s, unrealizedPnl }) {
   const balPct    = s.starting_balance ? (balChange / s.starting_balance * 100) : 0;
 
   const stats = [
-    { label:"VIRTUAL BALANCE",  val: `$${s.current_balance?.toLocaleString("en",{minimumFractionDigits:2})}`,
-      color: T.text, big: true },
-    { label:"REALIZED P&L",     val: fmtPnl(s.realized_pnl)+" $",
-      color: (s.realized_pnl||0)>=0?T.green:T.red },
-    { label:"UNREALIZED",       val: fmtPnl(unrealizedPnl)+" $",
-      color: unrealizedPnl>=0?T.green:T.red },
-    { label:"RETURN",           val: (balPct>=0?"+":"")+fmt(balPct,2)+"%",
-      color: balPct>=0?T.green:T.red },
-    { label:"WIN RATE",         val: fmtPct(s.win_rate),        color: T.gold },
-    { label:"PROFIT FACTOR",    val: fmt(s.profit_factor),      color: T.blue },
-    { label:"CLOSED TRADES",    val: s.total_closed||0,         color: T.text },
-    { label:"OPEN POSITIONS",   val: s.open_positions||0,       color: T.cyan },
+    { label:"VIRTUAL BALANCE", val:`$${s.current_balance?.toLocaleString("en",{minimumFractionDigits:2})}`,
+      color:T.text, big:true },
+    { label:"REALIZED P&L",    val:fmtPnl(s.realized_pnl)+" $",
+      color:(s.realized_pnl||0)>=0?T.green:T.red },
+    { label:"UNREALIZED",      val:fmtPnl(unrealizedPnl)+" $",
+      color:unrealizedPnl>=0?T.green:T.red },
+    { label:"RETURN",          val:(balPct>=0?"+":"")+fmt(balPct,2)+"%",
+      color:balPct>=0?T.green:T.red },
+    { label:"WIN RATE",        val:fmtPct(s.win_rate),       color:T.gold },
+    { label:"PROFIT FACTOR",   val:fmt(s.profit_factor),     color:T.blue },
+    { label:"CLOSED TRADES",   val:s.total_closed||0,        color:T.text },
+    { label:"OPEN POSITIONS",  val:s.open_positions||0,      color:T.cyan },
   ];
 
   return (
@@ -561,16 +853,16 @@ function AccountStrip({ summary: s, unrealizedPnl }) {
   );
 }
 
-// ── POSITION ROW ───────────────────────────────────────────────────────────────
+// ── POSITION ROW ──────────────────────────────────────────────────────────────
 function PositionRow({ pos: p, closing, onClose }) {
   const pnlPos = (p.pnl || 0) >= 0;
   return (
     <div style={{background:T.bg3,border:`1px solid ${T.border}`,borderRadius:5,
-      padding:"12px 16px",marginBottom:8,animation:"slide .2s ease",
+      padding:"12px 16px",marginBottom:8,marginLeft:8,marginRight:8,
+      animation:"slide .2s ease",
       borderLeft:`3px solid ${p.side==="BUY"?T.green:T.red}`}}>
-      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:12,flexWrap:"wrap"}}>
-
-        {/* Symbol + side */}
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",
+        gap:12,flexWrap:"wrap"}}>
         <div style={{display:"flex",alignItems:"center",gap:10,minWidth:140}}>
           <div style={{background:p.side==="BUY"?`${T.green}18`:`${T.red}18`,
             border:`1px solid ${p.side==="BUY"?T.green:T.red}44`,
@@ -578,12 +870,8 @@ function PositionRow({ pos: p, closing, onClose }) {
             color:p.side==="BUY"?T.green:T.red,fontWeight:700}}>
             {p.side}
           </div>
-          <span style={{fontFamily:MONO,fontSize:14,fontWeight:700,color:T.text}}>
-            {p.symbol}
-          </span>
+          <span style={{fontFamily:MONO,fontSize:14,fontWeight:700}}>{p.symbol}</span>
         </div>
-
-        {/* Levels */}
         <div style={{display:"flex",gap:18,flexWrap:"wrap"}}>
           <StatCell label="ENTRY"   val={fmt(p.entry,6)}         color={T.text}/>
           <StatCell label="PRICE"   val={fmt(p.current_price,6)} color={T.text}/>
@@ -591,20 +879,17 @@ function PositionRow({ pos: p, closing, onClose }) {
           <StatCell label="TP"      val={fmt(p.tp,6)}            color={T.green}/>
           <StatCell label="SIZE"    val={fmt(p.size,4)}          color={T.t2}/>
           <StatCell label="P&L $"   val={fmtPnl(p.pnl)}         color={pnlPos?T.green:T.red}/>
-          <StatCell label="P&L %"   val={(p.pnl_pct>=0?"+":"")+fmt(p.pnl_pct,2)+"%"}
-                                                                  color={pnlPos?T.green:T.red}/>
+          <StatCell label="P&L %"
+            val={(p.pnl_pct>=0?"+":"")+fmt(p.pnl_pct,2)+"%"}
+            color={pnlPos?T.green:T.red}/>
         </div>
-
-        {/* Close button */}
         <button onClick={onClose} disabled={closing}
           style={{background:`${T.red}14`,border:`1px solid ${T.red}44`,color:T.red,
             borderRadius:4,padding:"7px 14px",cursor:"pointer",fontFamily:MONO,
             fontSize:10,display:"flex",alignItems:"center",gap:5,whiteSpace:"nowrap"}}>
-          {closing?<Spinner c={T.red}/>:<X size={11}/>}
-          CLOSE
+          {closing?<Spinner c={T.red}/>:<X size={11}/>}CLOSE
         </button>
       </div>
-
       <div style={{marginTop:6,fontFamily:MONO,fontSize:9,color:T.t2}}>
         Opened {String(p.time||"").slice(0,16)}
       </div>
@@ -612,7 +897,7 @@ function PositionRow({ pos: p, closing, onClose }) {
   );
 }
 
-// ── EQUITY PANEL ───────────────────────────────────────────────────────────────
+// ── EQUITY PANEL ──────────────────────────────────────────────────────────────
 function EquityPanel({ equity, summary: s }) {
   const last  = equity[equity.length - 1]?.equity ?? s?.current_balance ?? 0;
   const first = equity[0]?.equity ?? s?.starting_balance ?? last;
@@ -622,14 +907,16 @@ function EquityPanel({ equity, summary: s }) {
     <div style={{background:T.bg3,border:`1px solid ${T.border}`,borderRadius:6,padding:14}}>
       <div style={{display:"flex",alignItems:"center",gap:7,marginBottom:10}}>
         <Database size={12} style={{color:T.blue}}/>
-        <span style={{fontFamily:MONO,fontSize:9,color:T.blue,letterSpacing:2}}>EQUITY CURVE</span>
+        <span style={{fontFamily:MONO,fontSize:9,color:T.blue,letterSpacing:2}}>
+          EQUITY CURVE
+        </span>
         <span style={{marginLeft:"auto",fontFamily:MONO,fontSize:11,
           color:up?T.green:T.red,fontWeight:600}}>
           ${last?.toFixed(2)}
         </span>
       </div>
       {equity.length >= 2 ? (
-        <ResponsiveContainer width="100%" height={130}>
+        <ResponsiveContainer width="100%" height={120}>
           <AreaChart data={equity} margin={{top:4,right:4,left:-20,bottom:0}}>
             <defs>
               <linearGradient id="eqGrad" x1="0" y1="0" x2="0" y2="1">
@@ -638,7 +925,7 @@ function EquityPanel({ equity, summary: s }) {
               </linearGradient>
             </defs>
             <CartesianGrid strokeDasharray="3 3" stroke={T.border}/>
-            <XAxis dataKey="time" hide tick={{fill:T.t2,fontSize:8,fontFamily:MONO}}/>
+            <XAxis dataKey="time" hide/>
             <YAxis tick={{fill:T.t2,fontSize:8,fontFamily:MONO}} tickLine={false}/>
             <Tooltip
               contentStyle={{background:T.bg2,border:`1px solid ${T.border}`,
@@ -650,10 +937,8 @@ function EquityPanel({ equity, summary: s }) {
           </AreaChart>
         </ResponsiveContainer>
       ) : (
-        <div style={{height:130,display:"flex",alignItems:"center",justifyContent:"center",
-          color:T.t2,fontFamily:MONO,fontSize:11}}>
-          No trades closed yet
-        </div>
+        <div style={{height:120,display:"flex",alignItems:"center",justifyContent:"center",
+          color:T.t2,fontFamily:MONO,fontSize:11}}>No trades closed yet</div>
       )}
     </div>
   );
@@ -663,25 +948,25 @@ function EquityPanel({ equity, summary: s }) {
 function ActivityFeed({ alerts }) {
   return (
     <div style={{background:T.bg3,border:`1px solid ${T.border}`,borderRadius:6,
-      padding:14,flex:1,maxHeight:280,overflowY:"auto"}}>
+      padding:14,flex:1,maxHeight:260,overflowY:"auto"}}>
       <div style={{display:"flex",alignItems:"center",gap:7,marginBottom:10}}>
         <Activity size={12} style={{color:T.purple}}/>
         <span style={{fontFamily:MONO,fontSize:9,color:T.purple,letterSpacing:2}}>ACTIVITY</span>
       </div>
       {alerts.length === 0
-        ? <div style={{color:T.t2,fontFamily:MONO,fontSize:11,textAlign:"center",paddingTop:20}}>
+        ? <div style={{color:T.t2,fontFamily:MONO,fontSize:11,textAlign:"center",paddingTop:16}}>
             No activity yet
           </div>
         : alerts.map((a,i)=>(
             <div key={i} style={{display:"flex",gap:8,marginBottom:7,
               borderBottom:`1px solid ${T.border}`,paddingBottom:7}}>
-              <span style={{fontFamily:MONO,fontSize:9,color:T.t2,whiteSpace:"nowrap",flexShrink:0}}>
+              <span style={{fontFamily:MONO,fontSize:9,color:T.t2,
+                whiteSpace:"nowrap",flexShrink:0}}>
                 {String(a.time||"").slice(11,16)}
               </span>
-              <span style={{fontFamily:MONO,fontSize:10,color:
-                a.message?.includes("OPEN")?T.green:
-                a.message?.includes("CLOSE")?T.red:T.text,
-                lineHeight:1.5}}>
+              <span style={{fontFamily:MONO,fontSize:10,lineHeight:1.5,
+                color: a.message?.includes("OPEN") ? T.green
+                     : a.message?.includes("CLOSE") ? T.red : T.text}}>
                 {a.message}
               </span>
             </div>
@@ -694,43 +979,54 @@ function ActivityFeed({ alerts }) {
 // ── SCAN RESULTS ──────────────────────────────────────────────────────────────
 function ScanResults({ data: d, onDismiss }) {
   return (
-    <div style={{background:T.bg3,border:`1px solid ${T.cyan}40`,borderRadius:6,padding:16,
-      marginBottom:20,animation:"slide .25s ease"}}>
-      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:12}}>
+    <div style={{background:T.bg3,border:`1px solid ${T.cyan}40`,borderRadius:6,
+      padding:16,marginBottom:20,animation:"slide .25s ease"}}>
+      <div style={{display:"flex",alignItems:"center",
+        justifyContent:"space-between",marginBottom:12}}>
         <div style={{display:"flex",alignItems:"center",gap:8}}>
           <Zap size={14} style={{color:T.cyan}}/>
           <span style={{fontFamily:MONO,fontSize:11,color:T.cyan,letterSpacing:1}}>
             SCAN COMPLETE — {d.scanned} SYMBOLS
           </span>
-          {d.opened?.length>0&&(
+          {d.opened?.length > 0 && (
             <span style={{fontFamily:MONO,fontSize:9,background:`${T.green}18`,
-              border:`1px solid ${T.green}44`,borderRadius:3,padding:"2px 7px",color:T.green}}>
+              border:`1px solid ${T.green}44`,borderRadius:3,padding:"2px 7px",
+              color:T.green}}>
               {d.opened.length} TRADE{d.opened.length!==1?"S":""} OPENED
             </span>
           )}
         </div>
         <button onClick={onDismiss}
-          style={{background:"none",border:"none",color:T.t2,cursor:"pointer",fontSize:16}}>×</button>
+          style={{background:"none",border:"none",color:T.t2,cursor:"pointer",fontSize:16}}>
+          ×
+        </button>
       </div>
       <div style={{display:"flex",flexWrap:"wrap",gap:8}}>
         {d.signals?.map((s,i)=>(
-          <div key={i} style={{background:T.bg2,border:`1px solid ${T.border}`,borderRadius:4,
-            padding:"7px 12px",minWidth:110}}>
-            <div style={{fontFamily:MONO,fontSize:10,color:T.text,marginBottom:3}}>{s.symbol}</div>
+          <div key={i} style={{background:T.bg2,border:`1px solid ${T.border}`,
+            borderRadius:4,padding:"7px 12px",minWidth:110}}>
+            <div style={{fontFamily:MONO,fontSize:10,color:T.text,marginBottom:3}}>
+              {s.symbol}
+            </div>
             <div style={{display:"flex",alignItems:"center",gap:6}}>
-              <span style={{fontFamily:MONO,fontSize:11,fontWeight:700,color:sigColor(s.signal)}}>
+              <span style={{fontFamily:MONO,fontSize:11,fontWeight:700,
+                color:sigColor(s.signal)}}>
                 {s.signal}
               </span>
-              {s.confidence>0&&(
-                <span style={{fontFamily:MONO,fontSize:9,color:T.t2}}>{fmt(s.confidence,0)}%</span>
+              {s.confidence > 0 && (
+                <span style={{fontFamily:MONO,fontSize:9,color:T.t2}}>
+                  {fmt(s.confidence,0)}%
+                </span>
               )}
             </div>
           </div>
         ))}
       </div>
-      {d.opened?.length>0&&(
+      {d.opened?.length > 0 && (
         <div style={{marginTop:10,paddingTop:10,borderTop:`1px solid ${T.border}`}}>
-          <div style={{fontFamily:MONO,fontSize:8,color:T.t2,letterSpacing:2,marginBottom:6}}>OPENED</div>
+          <div style={{fontFamily:MONO,fontSize:8,color:T.t2,letterSpacing:2,marginBottom:6}}>
+            OPENED
+          </div>
           {d.opened.map((o,i)=>(
             <div key={i} style={{fontFamily:MONO,fontSize:11,color:T.green,marginBottom:3}}>
               ✓ {o.side} {o.symbol} @ {fmt(o.entry,6)} — SL {fmt(o.sl,6)} / TP {fmt(o.tp,6)}
@@ -738,11 +1034,12 @@ function ScanResults({ data: d, onDismiss }) {
           ))}
         </div>
       )}
-      {d.skipped?.length>0&&(
+      {d.skipped?.length > 0 && (
         <div style={{marginTop:8,display:"flex",gap:6,flexWrap:"wrap"}}>
           {d.skipped.map((s,i)=>(
             <span key={i} style={{fontFamily:MONO,fontSize:9,color:T.t2,
-              background:T.bg2,border:`1px solid ${T.border}`,borderRadius:3,padding:"2px 7px"}}>
+              background:T.bg2,border:`1px solid ${T.border}`,borderRadius:3,
+              padding:"2px 7px"}}>
               {s.symbol} skipped ({s.reason?.replace(/_/g," ")})
             </span>
           ))}
@@ -756,7 +1053,9 @@ function ScanResults({ data: d, onDismiss }) {
 function StatCell({ label, val, color }) {
   return (
     <div>
-      <div style={{fontFamily:MONO,fontSize:8,color:T.t2,letterSpacing:1,marginBottom:2}}>{label}</div>
+      <div style={{fontFamily:MONO,fontSize:8,color:T.t2,letterSpacing:1,marginBottom:2}}>
+        {label}
+      </div>
       <div style={{fontFamily:MONO,fontSize:11,color:color||T.text}}>{val||"—"}</div>
     </div>
   );
@@ -764,8 +1063,7 @@ function StatCell({ label, val, color }) {
 
 function EmptyPanel({ text, icon }) {
   return (
-    <div style={{background:T.bg3,border:`1px solid ${T.border}`,borderRadius:5,
-      padding:40,textAlign:"center",color:T.t2}}>
+    <div style={{background:"transparent",padding:40,textAlign:"center",color:T.t2}}>
       <div style={{marginBottom:10}}>{icon}</div>
       <div style={{fontFamily:MONO,fontSize:12}}>{text}</div>
     </div>
@@ -783,22 +1081,26 @@ function Spinner({ c }) {
 // ── PAPER TRADING CHART ───────────────────────────────────────────────────────
 function parsePaperTime(str) {
   if (!str) return 0;
-  const d = new Date(str.replace(" ", "T") + (str.length <= 16 ? ":00Z" : "Z"));
+  const d = new Date(str.replace(" ","T") + (str.length<=16?":00Z":"Z"));
   return isNaN(d.getTime()) ? 0 : d.getTime();
 }
 
-function PaperChart({ candles, trades, symbol, loading, allSymbols, onSymbolChange }) {
+function PaperChart({ candles, trades, symbol, interval, loading, allSymbols, onSymbolChange }) {
   const [hovered,       setHovered]       = React.useState(null);
   const [annotationsOn, setAnnotationsOn] = React.useState(true);
 
-  // ── Symbol selector header ──────────────────────────────────────────────
+  const fmtLbl = v => v >= 1000
+    ? v.toLocaleString("en",{maximumFractionDigits:0})
+    : v < 0.01 ? v.toExponential(2)
+    : v.toFixed(v < 1 ? 5 : 2);
+
   const header = (
     <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:12,flexWrap:"wrap"}}>
+      <BarChart2 size={13} style={{color:T.blue}}/>
       <span style={{fontFamily:MONO,fontSize:10,color:T.blue,letterSpacing:2}}>
-        TRADES CHART
+        SYMBOL CHART
       </span>
-      <select value={symbol}
-        onChange={e => onSymbolChange(e.target.value)}
+      <select value={symbol} onChange={e=>onSymbolChange(e.target.value)}
         style={{background:T.bg2,border:`1px solid ${T.border}`,color:T.text,
           borderRadius:3,padding:"4px 8px",fontFamily:MONO,fontSize:10,outline:"none"}}>
         {Object.entries(allSymbols).map(([grp,syms])=>(
@@ -809,7 +1111,7 @@ function PaperChart({ candles, trades, symbol, loading, allSymbols, onSymbolChan
       </select>
       {candles.length > 0 && (
         <span style={{fontFamily:MONO,fontSize:9,color:T.t2}}>
-          {candles.length} candles · 5m
+          {candles.length} candles · {interval}
         </span>
       )}
       <div style={{marginLeft:"auto",display:"flex",gap:10,alignItems:"center",flexWrap:"wrap"}}>
@@ -844,13 +1146,12 @@ function PaperChart({ candles, trades, symbol, loading, allSymbols, onSymbolChan
       {header}
       <div style={{height:260,display:"flex",alignItems:"center",justifyContent:"center",
         color:T.t2,fontFamily:MONO,fontSize:12}}>
-        No chart data available for {symbol}. Select another symbol or try again.
+        No chart data for {symbol}. Select another symbol or try again.
       </div>
     </div>
   );
 
-  // ── Map trades to chart coordinates ────────────────────────────────────
-  const tradeMarkers = trades.map((t, i) => {
+  const tradeMarkers = trades.map((t,i) => {
     const tEntry = parsePaperTime(t.time || t.open_time);
     const tExit  = parsePaperTime(t.close_time || t.time);
     const win    = (t.pnl || 0) > 0;
@@ -865,11 +1166,11 @@ function PaperChart({ candles, trades, symbol, loading, allSymbols, onSymbolChan
   });
 
   const minT  = candles[0]?.t || 0;
-  const maxT  = candles[candles.length - 1]?.t || 1;
+  const maxT  = candles[candles.length-1]?.t || 1;
   const tSpan = maxT - minT || 1;
 
-  const allPrices = candles.flatMap(c => [c.h, c.l]);
-  tradeMarkers.forEach(m => {
+  const allPrices = candles.flatMap(c=>[c.h,c.l]);
+  tradeMarkers.forEach(m=>{
     if (m.sl)    allPrices.push(m.sl);
     if (m.tp)    allPrices.push(m.tp);
     if (m.entry) allPrices.push(m.entry);
@@ -879,30 +1180,23 @@ function PaperChart({ candles, trades, symbol, loading, allSymbols, onSymbolChan
   const maxP  = Math.max(...allPrices) * 1.0006;
   const pSpan = maxP - minP || 1;
 
-  const W = 900; const H = 380;
-  const PAD = { top: 20, right: 24, bottom: 36, left: 76 };
+  const W = 900; const H = 360;
+  const PAD = {top:20,right:24,bottom:36,left:76};
   const cW = W - PAD.left - PAD.right;
   const cH = H - PAD.top  - PAD.bottom;
 
-  const tx = t => PAD.left + ((t - minT) / tSpan) * cW;
-  const ty = p => PAD.top  + cH - ((p - minP) / pSpan) * cH;
+  const tx = t => PAD.left + ((t-minT)/tSpan)*cW;
+  const ty = p => PAD.top  + cH - ((p-minP)/pSpan)*cH;
 
   const spacing  = cW / candles.length;
   const bodyW    = Math.max(1, spacing * 0.7);
   const halfBody = bodyW / 2;
 
-  const yTicks = 6;
-  const yTickVals = Array.from({length: yTicks}, (_, i) => minP + (pSpan * i / (yTicks - 1)));
-
-  const xTickStep = Math.max(1, Math.floor(candles.length / 6));
-  const xTicks    = candles.filter((_, i) => i % xTickStep === 0);
-
-  const fmtLbl = v => v >= 1000
-    ? v.toLocaleString("en", {maximumFractionDigits: 0})
-    : v < 0.01 ? v.toExponential(2)
-    : v.toFixed(v < 1 ? 5 : 2);
-
-  const inBounds = x => x >= PAD.left && x <= PAD.left + cW;
+  const yTicks    = 6;
+  const yTickVals = Array.from({length:yTicks},(_,i)=>minP+(pSpan*i/(yTicks-1)));
+  const xTickStep = Math.max(1,Math.floor(candles.length/6));
+  const xTicks    = candles.filter((_,i)=>i%xTickStep===0);
+  const inBounds  = x => x >= PAD.left && x <= PAD.left+cW;
 
   return (
     <div style={{background:T.bg3,border:`1px solid ${T.border}`,borderRadius:6,
@@ -910,18 +1204,18 @@ function PaperChart({ candles, trades, symbol, loading, allSymbols, onSymbolChan
       {header}
 
       <div style={{width:"100%",overflowX:"auto"}}>
-        <svg width="100%" viewBox={`0 0 ${W} ${H}`} style={{display:"block",minWidth:420}}>
+        <svg width="100%" viewBox={`0 0 ${W} ${H}`}
+          style={{display:"block",minWidth:420}}>
           <defs>
-            <clipPath id="paperClip">
+            <clipPath id="pcClip">
               <rect x={PAD.left} y={PAD.top} width={cW} height={cH}/>
             </clipPath>
           </defs>
 
-          {/* Plot area background */}
           <rect x={PAD.left} y={PAD.top} width={cW} height={cH} fill={T.bg2} rx="3"/>
 
           {/* Y grid + labels */}
-          {yTickVals.map((v, i) => {
+          {yTickVals.map((v,i)=>{
             const yy = ty(v);
             return (
               <g key={i}>
@@ -934,23 +1228,24 @@ function PaperChart({ candles, trades, symbol, loading, allSymbols, onSymbolChan
           })}
 
           {/* X labels */}
-          {xTicks.map((c, i) => (
+          {xTicks.map((c,i)=>(
             <text key={i} x={tx(c.t)} y={H-PAD.bottom+14} textAnchor="middle"
               fill={T.t2} fontSize="9" fontFamily={MONO}>
-              {new Date(c.t).toLocaleString("en-GB",{month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"})}
+              {new Date(c.t).toLocaleString("en-GB",{
+                month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"})}
             </text>
           ))}
 
-          {/* ── OHLC Candlesticks ── */}
-          <g clipPath="url(#paperClip)">
-            {candles.map((c, i) => {
-              const x   = PAD.left + (i / (candles.length - 1 || 1)) * cW;
+          {/* Candles */}
+          <g clipPath="url(#pcClip)">
+            {candles.map((c,i)=>{
+              const x   = PAD.left + (i/(candles.length-1||1))*cW;
               const yo  = ty(c.o); const yc = ty(c.c);
               const yh  = ty(c.h); const yl = ty(c.l);
               const bull = c.c >= c.o;
               const col  = bull ? T.green : T.red;
-              const bTop = Math.min(yo, yc);
-              const bHt  = Math.max(Math.abs(yo - yc), 1);
+              const bTop = Math.min(yo,yc);
+              const bHt  = Math.max(Math.abs(yo-yc),1);
               return (
                 <g key={i}>
                   <line x1={x} y1={yh} x2={x} y2={yl}
@@ -963,45 +1258,41 @@ function PaperChart({ candles, trades, symbol, loading, allSymbols, onSymbolChan
             })}
           </g>
 
-          {/* ── Annotation overlays (SL/TP zone rectangles) ── */}
+          {/* Annotation overlays */}
           {annotationsOn && (
-            <g clipPath="url(#paperClip)">
-              {tradeMarkers.filter(m => m.sl && m.tp && m.tEntry).map(m => {
+            <g clipPath="url(#pcClip)">
+              {tradeMarkers.filter(m=>m.sl&&m.tp&&m.tEntry).map(m=>{
                 const x1 = tx(m.tEntry);
-                const x2 = m.tExit && m.tExit > m.tEntry
-                  ? Math.min(tx(m.tExit), PAD.left + cW)
-                  : PAD.left + cW;
+                const x2 = m.tExit&&m.tExit>m.tEntry
+                  ? Math.min(tx(m.tExit),PAD.left+cW) : PAD.left+cW;
                 const yEntry = ty(m.entry);
                 const ySL    = ty(m.sl);
                 const yTP    = ty(m.tp);
-                const col    = m.status === "OPEN" ? T.blue : (m.win ? T.green : T.red);
-                const rectTop    = Math.min(ySL, yTP);
-                const rectH      = Math.max(Math.abs(ySL - yTP), 2);
+                const col    = m.status==="OPEN"?T.blue:(m.win?T.green:T.red);
+                const rectTop = Math.min(ySL,yTP);
+                const rectH   = Math.max(Math.abs(ySL-yTP),2);
                 return (
                   <g key={m.id}>
-                    {/* SL–TP zone */}
                     <rect x={x1} y={rectTop} width={Math.max(x2-x1,2)} height={rectH}
-                      fill={`${col}0C`} stroke={`${col}28`} strokeWidth="0.5"
-                      strokeDasharray="3 2"/>
-                    {/* Entry line */}
+                      fill={`${col}0C`} stroke={`${col}28`}
+                      strokeWidth="0.5" strokeDasharray="3 2"/>
                     <line x1={x1} y1={yEntry} x2={x2} y2={yEntry}
                       stroke={m.side==="BUY"?T.green:T.red}
                       strokeWidth="1.2" strokeDasharray="5 3"/>
-                    {/* SL line */}
                     <line x1={x1} y1={ySL} x2={x2} y2={ySL}
-                      stroke={T.red} strokeWidth="0.8" strokeDasharray="3 3" strokeOpacity="0.7"/>
-                    {/* TP line */}
+                      stroke={T.red} strokeWidth="0.8"
+                      strokeDasharray="3 3" strokeOpacity="0.7"/>
                     <line x1={x1} y1={yTP} x2={x2} y2={yTP}
-                      stroke={T.green} strokeWidth="0.8" strokeDasharray="3 3" strokeOpacity="0.7"/>
-                    {/* SL/TP labels */}
-                    <text x={Math.min(x2+2, PAD.left+cW-14)} y={ySL+3}
+                      stroke={T.green} strokeWidth="0.8"
+                      strokeDasharray="3 3" strokeOpacity="0.7"/>
+                    <text x={Math.min(x2+2,PAD.left+cW-14)} y={ySL+3}
                       fill={T.red} fontSize="7" fontFamily={MONO}>SL</text>
-                    <text x={Math.min(x2+2, PAD.left+cW-14)} y={yTP+3}
+                    <text x={Math.min(x2+2,PAD.left+cW-14)} y={yTP+3}
                       fill={T.green} fontSize="7" fontFamily={MONO}>TP</text>
-                    {/* Status badge */}
                     {m.status==="OPEN" && (
                       <text x={x1+3} y={PAD.top+10}
-                        fill={T.blue} fontSize="7" fontFamily={MONO} fontWeight="bold">OPEN</text>
+                        fill={T.blue} fontSize="7" fontFamily={MONO}
+                        fontWeight="bold">OPEN</text>
                     )}
                   </g>
                 );
@@ -1009,47 +1300,42 @@ function PaperChart({ candles, trades, symbol, loading, allSymbols, onSymbolChan
             </g>
           )}
 
-          {/* ── Entry/exit markers ── */}
-          <g clipPath="url(#paperClip)">
-            {tradeMarkers.map(m => {
-              const xe  = tx(m.tEntry);
-              const xx  = m.tExit && m.tExit > m.tEntry ? tx(m.tExit) : null;
-              const ye  = ty(m.entry);
-              const yx  = xx ? ty(m.exit || m.entry) : null;
-              const isBuy  = m.side === "BUY";
-              const eColor = isBuy ? T.green : T.red;
-              const xColor = m.win  ? T.green : T.red;
+          {/* Entry/exit markers */}
+          <g clipPath="url(#pcClip)">
+            {tradeMarkers.map(m=>{
+              const xe = tx(m.tEntry);
+              const xx = m.tExit&&m.tExit>m.tEntry?tx(m.tExit):null;
+              const ye = ty(m.entry);
+              const yx = xx?ty(m.exit||m.entry):null;
+              const isBuy  = m.side==="BUY";
+              const eColor = isBuy?T.green:T.red;
+              const xColor = m.win?T.green:T.red;
               return (
                 <g key={m.id}>
-                  {/* Connector line */}
-                  {inBounds(xe) && xx && inBounds(xx) && (
+                  {inBounds(xe)&&xx&&inBounds(xx)&&(
                     <line x1={xe} y1={ye} x2={xx} y2={yx}
-                      stroke={xColor} strokeWidth="0.8" strokeDasharray="4 2" strokeOpacity="0.5"/>
+                      stroke={xColor} strokeWidth="0.8"
+                      strokeDasharray="4 2" strokeOpacity="0.5"/>
                   )}
-                  {/* Entry vertical tick */}
-                  {inBounds(xe) && (
+                  {inBounds(xe)&&(
                     <line x1={xe} y1={PAD.top} x2={xe} y2={PAD.top+cH}
                       stroke={eColor} strokeWidth="0.8" strokeOpacity="0.2"/>
                   )}
-                  {/* Entry triangle */}
-                  {inBounds(xe) && (
+                  {inBounds(xe)&&(
                     <polygon
                       points={isBuy
-                        ? `${xe},${ye-10} ${xe-6},${ye+2} ${xe+6},${ye+2}`
-                        : `${xe},${ye+10} ${xe-6},${ye-2} ${xe+6},${ye-2}`}
+                        ?`${xe},${ye-10} ${xe-6},${ye+2} ${xe+6},${ye+2}`
+                        :`${xe},${ye+10} ${xe-6},${ye-2} ${xe+6},${ye-2}`}
                       fill={eColor} opacity="0.9" style={{cursor:"pointer"}}
-                      onMouseEnter={()=>setHovered({...m, kind:"entry", x:xe, y:ye})}
-                      onMouseLeave={()=>setHovered(null)}
-                    />
+                      onMouseEnter={()=>setHovered({...m,kind:"entry",x:xe,y:ye})}
+                      onMouseLeave={()=>setHovered(null)}/>
                   )}
-                  {/* Exit diamond */}
-                  {xx && inBounds(xx) && (
+                  {xx&&inBounds(xx)&&(
                     <polygon
                       points={`${xx},${yx-7} ${xx+7},${yx} ${xx},${yx+7} ${xx-7},${yx}`}
                       fill={xColor} opacity="0.85" style={{cursor:"pointer"}}
-                      onMouseEnter={()=>setHovered({...m, kind:"exit", x:xx, y:yx})}
-                      onMouseLeave={()=>setHovered(null)}
-                    />
+                      onMouseEnter={()=>setHovered({...m,kind:"exit",x:xx,y:yx})}
+                      onMouseLeave={()=>setHovered(null)}/>
                   )}
                 </g>
               );
@@ -1057,17 +1343,17 @@ function PaperChart({ candles, trades, symbol, loading, allSymbols, onSymbolChan
           </g>
 
           {/* Hover tooltip */}
-          {hovered && (() => {
-            const bx = Math.min(hovered.x + 12, W - 170);
-            const by = Math.max(hovered.y - 64, PAD.top + 4);
-            const isEntry = hovered.kind === "entry";
+          {hovered&&(()=>{
+            const bx = Math.min(hovered.x+12, W-170);
+            const by = Math.max(hovered.y-64, PAD.top+4);
+            const isEntry = hovered.kind==="entry";
             const lines = isEntry
               ? [`${hovered.side} ENTRY @ ${fmtLbl(hovered.entry)}`,
-                 `SL: ${hovered.sl ? fmtLbl(hovered.sl) : "—"}`,
-                 `TP: ${hovered.tp ? fmtLbl(hovered.tp) : "—"}`,
-                 `P&L: ${hovered.pnl != null ? fmtPnl(hovered.pnl) : "open"}`,
+                 `SL: ${hovered.sl?fmtLbl(hovered.sl):"—"}`,
+                 `TP: ${hovered.tp?fmtLbl(hovered.tp):"—"}`,
+                 `P&L: ${hovered.pnl!=null?fmtPnl(hovered.pnl):"open"}`,
                  `Status: ${hovered.status}`]
-              : [`EXIT @ ${fmtLbl(hovered.exit || hovered.entry)}`,
+              : [`EXIT @ ${fmtLbl(hovered.exit||hovered.entry)}`,
                  `Reason: ${hovered.reason}`,
                  `P&L: ${fmtPnl(hovered.pnl)}`];
             return (
@@ -1100,8 +1386,7 @@ function PaperChart({ candles, trades, symbol, loading, allSymbols, onSymbolChan
               title={`${t.side} ${t.symbol} @ ${fmtLbl(t.entry)} → ${fmtPnl(t.pnl)}`}
               style={{background:(t.pnl||0)>0?`${T.green}18`:`${T.red}18`,
                 border:`1px solid ${(t.pnl||0)>0?T.green:T.red}44`,
-                borderRadius:3,padding:"3px 8px",
-                fontFamily:MONO,fontSize:9,
+                borderRadius:3,padding:"3px 8px",fontFamily:MONO,fontSize:9,
                 color:(t.pnl||0)>0?T.green:T.red,cursor:"default",whiteSpace:"nowrap"}}>
               {t.side==="BUY"?"▲":"▼"} {fmtPnl(t.pnl)}
               {t.status==="OPEN"&&<span style={{color:T.blue,marginLeft:4}}>●</span>}
@@ -1109,9 +1394,9 @@ function PaperChart({ candles, trades, symbol, loading, allSymbols, onSymbolChan
           ))}
         </div>
       ) : (
-        <div style={{textAlign:"center",padding:"14px 0 4px",color:T.t2,
-          fontFamily:MONO,fontSize:11}}>
-          No trades for {symbol} yet. Open a trade to see markers here.
+        <div style={{textAlign:"center",padding:"10px 0 4px",
+          color:T.t2,fontFamily:MONO,fontSize:11}}>
+          No trades for {symbol} yet — open one to see markers here.
         </div>
       )}
     </div>
