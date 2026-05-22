@@ -9,3 +9,4 @@ uvicorn
 a2wsgi
 python-dotenv
 psycopg2-binary
+APScheduler==3.10.4

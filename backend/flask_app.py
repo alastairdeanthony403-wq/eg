@@ -42,6 +42,7 @@ import bcrypt
 import json
 from datetime import datetime, timedelta, timezone
 from functools import wraps
+from apscheduler.schedulers.background import BackgroundScheduler
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 app = Flask(__name__)
@@ -186,6 +187,16 @@ DEFAULT_CONFIG = {
     # ALL new trade openings are blocked until the halt is manually cleared.
     # 5% is the standard prop-firm trailing drawdown rule.
     "max_account_drawdown_pct":      5.0,
+    # ── Paper bot scan settings ────────────────────────────────────────────
+    # Timeframe used for signal detection and background scanning.
+    # Valid values: "1m", "5m", "15m", "30m"
+    "bot_interval":                  "5m",
+    # News sentiment filter: block entries that trade against strong news.
+    # BUY blocked when headline score ≤ -3; SELL blocked when score ≥ +3.
+    "news_filter_enabled":           True,
+    # Cost-viability multiplier: reward must exceed round-trip costs × this factor.
+    # 2.0 means the trade's expected reward must cover fees+spread twice over.
+    "cost_viable_mult":              2.0,
 }
 
 JWT_SECRET      = os.environ.get("JWT_SECRET", "ai-trading-engine-secret-change-me")
@@ -211,6 +222,8 @@ NON_CRYPTO_CANDLE_TTL    = 600
 _raw_candle_cache    = {}
 _non_crypto_cache    = {}
 _summary_cache       = {}
+_news_cache          = {}   # {symbol: (fetched_at_ts, score, headlines)}
+NEWS_CACHE_TTL       = 900  # 15 minutes — Polygon free tier has rate limits
 
 _polygon_lock         = __import__("threading").Lock()
 _polygon_last_call_ts = 0.0
@@ -305,6 +318,19 @@ def init_db():
         last_updated     TIMESTAMPTZ DEFAULT NOW()
     )""")
 
+    # ── Background bot state ──────────────────────────────────────────────
+    # Persists which users have the auto-bot enabled so the APScheduler
+    # background thread can continue scanning after the browser tab closes.
+    c.execute("""CREATE TABLE IF NOT EXISTS bot_state (
+        user_id          TEXT PRIMARY KEY,
+        enabled          BOOLEAN NOT NULL DEFAULT FALSE,
+        interval_minutes INTEGER NOT NULL DEFAULT 5,
+        last_scan_at     TIMESTAMPTZ,
+        scan_count       INTEGER NOT NULL DEFAULT 0,
+        news_filter      BOOLEAN NOT NULL DEFAULT TRUE,
+        updated_at       TIMESTAMPTZ DEFAULT NOW()
+    )""")
+
     # ── Fill reconciliation log ────────────────────────────────────────
     # Records expected entry/exit (from signal levels) vs. the price that
     # was actually used for the paper fill. Exposes divergence between
@@ -332,6 +358,45 @@ def init_db():
 
 
 init_db()
+
+
+# ─────────────────────────────────────────────
+# BACKGROUND SCHEDULER
+# ─────────────────────────────────────────────
+_scheduler = BackgroundScheduler(daemon=True)
+
+
+def _scheduler_tick():
+    """Called every 60 s by APScheduler. Scans all users with bot enabled."""
+    try:
+        conn = get_conn(); c = conn.cursor()
+        c.execute("SELECT user_id FROM bot_state WHERE enabled=TRUE")
+        user_ids = [row[0] for row in c.fetchall()]
+        conn.close()
+    except Exception:
+        return
+    for uid in user_ids:
+        try:
+            _run_bot_scan_for_user(uid)
+        except Exception:
+            pass  # never let one user's error stop other users' scans
+
+
+def _self_ping():
+    """Keeps Render free-tier dyno alive by pinging /api/health."""
+    try:
+        render_url = os.environ.get("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
+        if render_url:
+            requests.get(f"{render_url}/api/health", timeout=10)
+    except Exception:
+        pass
+
+
+_scheduler.add_job(_scheduler_tick, "interval", seconds=60,
+                   id="bot_scan_tick", max_instances=1, coalesce=True)
+_scheduler.add_job(_self_ping, "interval", seconds=600,
+                   id="self_ping", max_instances=1, coalesce=True)
+_scheduler.start()
 
 
 def now_str():
@@ -3292,6 +3357,520 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
 
 
 # ─────────────────────────────────────────────
+# BACKGROUND-SAFE CONFIG HELPER
+# ─────────────────────────────────────────────
+
+def _get_user_config_for_id(user_id):
+    """
+    Equivalent to get_user_config() but takes an explicit user_id
+    so it can be called from background threads without Flask's g context.
+    """
+    conn = get_conn(); c = conn.cursor()
+    c.execute("SELECT settings FROM users WHERE id=%s", (user_id,))
+    row = c.fetchone(); conn.close()
+    cfg = dict(DEFAULT_CONFIG)
+    if row and row[0]:
+        try:
+            cfg.update(json.loads(row[0]))
+        except Exception:
+            pass
+    return cfg
+
+
+# ─────────────────────────────────────────────
+# BOT STATE  (DB-persisted, survives tab close)
+# ─────────────────────────────────────────────
+
+def _get_bot_db_state(user_id):
+    """Returns True if background bot is enabled for this user."""
+    try:
+        conn = get_conn(); c = conn.cursor()
+        c.execute("SELECT enabled FROM bot_state WHERE user_id=%s", (user_id,))
+        row = c.fetchone(); conn.close()
+        return bool(row[0]) if row else False
+    except Exception:
+        return False
+
+
+def _set_bot_db_state(user_id, enabled, interval_minutes=5):
+    """Upsert bot_state row — called when user starts/stops the auto-bot."""
+    try:
+        conn = get_conn(); c = conn.cursor()
+        c.execute("""INSERT INTO bot_state (user_id, enabled, interval_minutes, updated_at)
+                     VALUES (%s, %s, %s, NOW())
+                     ON CONFLICT (user_id) DO UPDATE
+                       SET enabled=%s, interval_minutes=%s, updated_at=NOW()""",
+                  (user_id, enabled, interval_minutes, enabled, interval_minutes))
+        conn.commit(); conn.close()
+    except Exception as e:
+        print(f"[bot_state] write error: {e}")
+
+
+# Interval → minutes mapping for scheduler timing
+_INTERVAL_MINUTES = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240}
+
+
+# ─────────────────────────────────────────────
+# NEWS SENTIMENT  (Polygon.io)
+# ─────────────────────────────────────────────
+
+# Keyword sets for bullish/bearish sentiment scoring
+_BULLISH_WORDS = {
+    "rally", "surge", "breakout", "bullish", "upgrade", "beat", "beats",
+    "profit", "growth", "buy", "gains", "gain", "record", "high", "strong",
+    "positive", "rise", "rises", "rising", "boost", "recovery", "recover",
+    "outperform", "upside", "momentum", "expand", "expansion", "approved",
+}
+_BEARISH_WORDS = {
+    "crash", "drop", "drops", "lawsuit", "bearish", "downgrade", "miss",
+    "misses", "loss", "losses", "bankruptcy", "ban", "sell", "falls", "falling",
+    "fall", "decline", "declines", "weak", "warning", "concern", "risk",
+    "threat", "negative", "slump", "recession", "fraud", "probe", "fine",
+    "default", "cut", "cuts", "fear", "fears", "halt", "halted",
+}
+
+# Map our internal crypto symbols to Polygon ticker format
+_CRYPTO_POLYGON_TICKER = {
+    "BTCUSDT": "X:BTCUSD", "ETHUSDT": "X:ETHUSD", "SOLUSDT": "X:SOLUSD",
+    "BNBUSDT": "X:BNBUSD", "XRPUSDT": "X:XRPUSD", "ADAUSDT": "X:ADAUSD",
+    "AVAXUSDT": "X:AVAXUSD", "DOGEUSDT": "X:DOGEUSD", "DOTUSDT": "X:DOTUSD",
+    "LINKUSDT": "X:LINKUSD", "LTCUSDT": "X:LTCUSD", "UNIUSDT": "X:UNIUSD",
+    "ATOMUSDT": "X:ATOMUSD", "NEARUSDT": "X:NEARUSD",
+}
+
+
+def _fetch_news_sentiment(symbol):
+    """
+    Fetch the last 10 Polygon.io headlines for symbol and return:
+        (score: int, headlines: list[dict])
+
+    Score is in range -10 to +10:
+      +1 per bullish headline, -1 per bearish headline.
+    Returns (0, []) if no API key, rate-limited, or fetch fails — graceful degradation.
+    Cached for NEWS_CACHE_TTL seconds.
+    """
+    now_ts = time.time()
+    cached = _news_cache.get(symbol)
+    if cached and (now_ts - cached[0]) < NEWS_CACHE_TTL:
+        return cached[1], cached[2]
+
+    api_key = os.environ.get("POLYGON_API_KEY", "")
+    if not api_key:
+        return 0, []
+
+    # Resolve ticker format
+    ticker = _CRYPTO_POLYGON_TICKER.get(symbol, symbol)
+    # Remove USDT suffix for crypto if not in map
+    if ticker == symbol and symbol.endswith("USDT"):
+        ticker = symbol[:-4]   # BTCUSDT → BTC
+
+    try:
+        resp = requests.get(
+            "https://api.polygon.io/v2/reference/news",
+            params={"ticker": ticker, "limit": 10, "apiKey": api_key},
+            timeout=8,
+        )
+        if resp.status_code != 200:
+            _news_cache[symbol] = (now_ts, 0, [])
+            return 0, []
+
+        articles = resp.json().get("results", [])
+        headlines = []
+        score = 0
+
+        for art in articles:
+            text = ((art.get("title") or "") + " " + (art.get("description") or "")).lower()
+            words = set(text.split())
+            bull_hits = len(words & _BULLISH_WORDS)
+            bear_hits = len(words & _BEARISH_WORDS)
+            net = bull_hits - bear_hits
+            score += max(-1, min(1, net))   # clamp each article to ±1
+            headlines.append({
+                "title":     art.get("title", ""),
+                "published": art.get("published_utc", ""),
+                "score":     net,
+            })
+
+        score = max(-10, min(10, score))
+        _news_cache[symbol] = (now_ts, score, headlines)
+        return score, headlines
+
+    except Exception as e:
+        print(f"[news] fetch error for {symbol}: {e}")
+        _news_cache[symbol] = (now_ts, 0, [])
+        return 0, []
+
+
+# ─────────────────────────────────────────────
+# COST-VIABILITY GATE
+# ─────────────────────────────────────────────
+
+def _is_cost_viable(atr, price, rr, fee_pct, slip_pct, spread_pct=0.0, mult=2.0):
+    """
+    Returns (viable: bool, reason: str | None).
+
+    A trade is cost-viable when the ATR-based expected reward exceeds
+    the round-trip cost by at least `mult` times.
+
+    Rationale: on short timeframes, round-trip costs (fee + slip + spread)
+    can consume most of the expected profit. On a 1m bar where ATR ≈ 0.05%
+    and round-trip ≈ 0.12%, there is no mathematical edge even with a 2:1 R:R.
+
+    SL distance proxy = ATR × 1.5 (consistent with atr_multiplier default)
+    Expected reward   = SL_dist × rr
+    Round-trip cost   = (fee + slip + spread) × 2   (entry + exit)
+    Viability: expected_reward_pct > round_trip_cost_pct × mult
+    """
+    if price <= 0 or atr <= 0:
+        return True, None   # can't compute, allow through
+
+    rt_cost_pct = ((fee_pct + slip_pct + spread_pct) / 100) * 2 * 100
+    sl_dist_pct = (atr * 1.5 / price) * 100
+    reward_pct  = sl_dist_pct * rr
+
+    if reward_pct < rt_cost_pct * mult:
+        return False, (
+            f"Expected reward {reward_pct:.3f}% < "
+            f"round-trip cost {rt_cost_pct:.3f}% × {mult} = {rt_cost_pct * mult:.3f}%. "
+            f"ATR too small relative to fees at this timeframe."
+        )
+    return True, None
+
+
+# ─────────────────────────────────────────────
+# LEAN QUALITY GATE
+# ─────────────────────────────────────────────
+
+def _lean_quality_ok(df, signal):
+    """
+    Three-condition quality check applied before every live paper trade:
+      1. EMA stack aligned with signal direction (e9 > e21 > e50 for BUY)
+      2. ADX ≥ 18 (trend is present, not ranging)
+      3. ATR ≥ 105% of its own 14-bar average (market is active, not drifting)
+
+    Returns (ok: bool, reasons: list[str])
+    If there is not enough data to judge, passes through (True, []).
+    """
+    if df is None or len(df) < 60:
+        return True, []
+
+    closes = df["close"].tolist()
+    highs  = df["high"].tolist()
+    lows   = df["low"].tolist()
+
+    try:
+        e9  = float(df["close"].ewm(span=9,  adjust=False).mean().iloc[-1])
+        e21 = float(df["close"].ewm(span=21, adjust=False).mean().iloc[-1])
+        e50 = float(df["close"].ewm(span=50, adjust=False).mean().iloc[-1])
+        ema_ok = (e9 > e21 > e50) if signal == "BUY" else (e9 < e21 < e50)
+    except Exception:
+        ema_ok = True   # can't compute, don't block
+
+    try:
+        adx_s = _adx_series(highs, lows, closes, 14)
+        adx_v = adx_s[-1] if adx_s and adx_s[-1] is not None else 0
+        adx_ok = adx_v >= 18
+    except Exception:
+        adx_ok = True
+
+    try:
+        atr_s   = _atr_series(highs, lows, closes, 14)
+        atr_v   = atr_s[-1] if atr_s and atr_s[-1] is not None else 0
+        atr_lb  = [x for x in atr_s[-20:] if x is not None]
+        avg_atr = sum(atr_lb) / len(atr_lb) if atr_lb else atr_v
+        atr_ok  = atr_v >= avg_atr * 1.05
+    except Exception:
+        atr_ok = True
+
+    reasons = []
+    if not ema_ok:
+        reasons.append(f"EMA stack not aligned for {signal}")
+    if not adx_ok:
+        reasons.append(f"ADX {adx_v:.1f} < 18")
+    if not atr_ok:
+        reasons.append("ATR not expanding")
+
+    return (ema_ok and adx_ok and atr_ok), reasons
+
+
+# ─────────────────────────────────────────────
+# OPEN-POSITION AUTO-MANAGEMENT
+# ─────────────────────────────────────────────
+
+def _manage_open_positions(user_id, cfg):
+    """
+    Check every open paper position against the current market price.
+    Auto-close any position that has hit its SL or TP.
+    Called by the background scheduler on every tick.
+    """
+    try:
+        conn = get_conn(); c = conn.cursor()
+        c.execute(
+            "SELECT id, symbol, type, entry, sl, tp, size "
+            "FROM trades WHERE user_id=%s AND status='OPEN'",
+            (user_id,))
+        rows = c.fetchall(); conn.close()
+    except Exception as e:
+        print(f"[pos_mgmt] DB read error: {e}")
+        return
+
+    for trade_id, sym, side, entry, sl, tp, size in rows:
+        try:
+            price = get_latest_price(sym)
+            exit_price = exit_reason = None
+
+            if side == "BUY":
+                if price <= sl:
+                    exit_price, exit_reason = sl, "Stop loss"
+                elif price >= tp:
+                    exit_price, exit_reason = tp, "Take profit"
+            else:  # SELL
+                if price >= sl:
+                    exit_price, exit_reason = sl, "Stop loss"
+                elif price <= tp:
+                    exit_price, exit_reason = tp, "Take profit"
+
+            if exit_price is None:
+                # Update unrealised PnL in-place
+                pnl = (price - entry) * size if side == "BUY" else (entry - price) * size
+                conn = get_conn(); c = conn.cursor()
+                c.execute("UPDATE trades SET pnl=%s WHERE id=%s", (round(pnl, 4), trade_id))
+                conn.commit(); conn.close()
+                continue
+
+            # Close the trade
+            pnl = (exit_price - entry) * size if side == "BUY" else (entry - exit_price) * size
+            conn = get_conn(); c = conn.cursor()
+            c.execute(
+                "UPDATE trades SET exit=%s, pnl=%s, status='CLOSED', time=%s WHERE id=%s",
+                (exit_price, round(pnl, 4), now_str(), trade_id))
+            conn.commit(); conn.close()
+            add_alert(user_id,
+                      f"BOT {exit_reason.upper()} {sym} {side} @ "
+                      f"{format_price(exit_price, sym)}  PnL {round(pnl, 4)}")
+
+            # Update risk backstop after every close
+            try:
+                starting_b  = float(cfg.get("starting_balance", 10000))
+                current_bal = _compute_account_balance(user_id, starting_b)
+                update_risk_backstop(user_id, current_bal, cfg)
+            except Exception as rb_err:
+                print(f"[pos_mgmt] backstop update error: {rb_err}")
+
+        except Exception as e:
+            print(f"[pos_mgmt] {sym} {trade_id}: {e}")
+
+
+# ─────────────────────────────────────────────
+# CORE BOT SCAN  (background-safe)
+# ─────────────────────────────────────────────
+
+def _run_bot_scan_for_user(user_id, force=False):
+    """
+    Background-safe bot scan used by both the APScheduler thread and the
+    HTTP /api/paper/bot-scan route.
+
+    Key improvements over the original HTTP-only version:
+      1. No Flask request/g context — all data via explicit user_id.
+      2. Next-bar entry: actual fill = get_latest_price() fetched fresh at
+         execution time, not the cached signal-bar close. This eliminates
+         the look-ahead entry bias that inflated backtest win rates.
+      3. Cost-viability gate: skips trades where the ATR-based expected
+         reward does not exceed round-trip costs by the configured multiplier.
+      4. Lean quality gate: EMA stack + ADX ≥ 18 + ATR expansion required.
+      5. News sentiment filter: blocks entries trading against strong news.
+      6. Auto-manages open positions (SL/TP checks) on every scan tick.
+    """
+    try:
+        cfg = _get_user_config_for_id(user_id)
+    except Exception:
+        cfg = dict(DEFAULT_CONFIG)
+
+    bot_interval   = cfg.get("bot_interval", "5m")
+    fee_pct        = float(cfg.get("fee_percent",         0.04))
+    slip_pct       = float(cfg.get("slippage_percent",    0.02))
+    rr             = float(cfg.get("risk_reward",         2.0))
+    atr_mult       = float(cfg.get("atr_multiplier",      1.5))
+    min_conf       = int  (cfg.get("min_confidence",      70))
+    news_filter_on = bool (cfg.get("news_filter_enabled", True))
+    cost_mult      = float(cfg.get("cost_viable_mult",    2.0))
+    symbols        = (cfg.get("symbols") or ALL_SYMBOLS)[:12]
+
+    # ── Always manage open positions first ─────────────────────────────
+    _manage_open_positions(user_id, cfg)
+
+    # ── Kill-switch ────────────────────────────────────────────────────
+    _halted, _halt_reason = is_risk_halted(user_id)
+    if _halted:
+        return {"ok": False, "halted": True, "halt_reason": _halt_reason,
+                "opened": [], "skipped": []}
+
+    # ── Weekly limit ───────────────────────────────────────────────────
+    try:
+        weekly = is_weekly_paused(user_id, cfg)
+    except Exception:
+        weekly = {}
+
+    # ── Open position set (no pyramiding) ─────────────────────────────
+    open_symbols = set()
+    try:
+        conn = get_conn(); c = conn.cursor()
+        c.execute("SELECT symbol FROM trades WHERE user_id=%s AND status='OPEN'",
+                  (user_id,))
+        open_symbols = {row[0] for row in c.fetchall()}
+        conn.close()
+    except Exception:
+        pass
+
+    opened, skipped = [], []
+
+    for sym in symbols:
+        try:
+            # ── Signal detection ──────────────────────────────────────
+            s = get_symbol_summary(sym, "bot", bot_interval, cfg)
+            if not s:
+                continue
+            signal     = s.get("signal", "HOLD")
+            confidence = float(s.get("confidence") or 0)
+
+            if signal not in ("BUY", "SELL"):
+                continue
+            if confidence < min_conf:
+                skipped.append({"symbol": sym, "reason": "low_confidence",
+                                 "confidence": confidence})
+                continue
+            if sym in open_symbols:
+                skipped.append({"symbol": sym, "reason": "already_open"})
+                continue
+            if weekly.get("weekly_trading_paused"):
+                skipped.append({"symbol": sym, "reason": "weekly_pause"})
+                continue
+
+            # ── Fetch candles for quality / cost checks ──────────────
+            df = fetch_df_for_symbol(sym, bot_interval, 200)
+            if df is None:
+                skipped.append({"symbol": sym, "reason": "no_data"})
+                continue
+
+            # ── Lean quality gate ─────────────────────────────────────
+            lean_ok, lean_reasons = _lean_quality_ok(df, signal)
+            if not lean_ok:
+                skipped.append({"symbol": sym, "reason": "lean_quality",
+                                 "details": lean_reasons})
+                continue
+
+            # ── Trade levels from signal-bar close ────────────────────
+            levels = calculate_trade_levels(df, signal, rr, atr_mult, cfg)
+            if not levels.get("rr_valid"):
+                skipped.append({"symbol": sym, "reason": "rr_invalid",
+                                 "rr": levels.get("rr")})
+                continue
+
+            signal_price = levels["entry"]   # signal-bar close — expected price
+            market       = detect_market(sym)
+            spread_pct   = MARKET_SPREADS.get(market, 0.0)
+
+            try:
+                atr_val = calculate_atr(df)
+            except Exception:
+                atr_val = signal_price * 0.005
+
+            # ── Cost-viability gate ───────────────────────────────────
+            viable, cost_reason = _is_cost_viable(
+                atr_val, signal_price, rr, fee_pct, slip_pct, spread_pct, cost_mult)
+            if not viable:
+                skipped.append({"symbol": sym, "reason": "cost_not_viable",
+                                 "details": cost_reason})
+                continue
+
+            # ── News sentiment filter ─────────────────────────────────
+            if news_filter_on:
+                news_score, _ = _fetch_news_sentiment(sym)
+                if signal == "BUY"  and news_score <= -3:
+                    skipped.append({"symbol": sym, "reason": "news_bearish",
+                                     "score": news_score})
+                    continue
+                if signal == "SELL" and news_score >= 3:
+                    skipped.append({"symbol": sym, "reason": "news_bullish",
+                                     "score": news_score})
+                    continue
+
+            # ── NEXT-BAR ENTRY: fetch fresh market price ──────────────
+            # This eliminates the look-ahead entry bias. The signal fired on
+            # the last closed bar's price; we fill at the current market price.
+            try:
+                fresh_price = get_latest_price(sym)
+            except Exception:
+                fresh_price = signal_price   # graceful fallback
+
+            slip_rate = slip_pct / 100
+            ep = (fresh_price * (1 + slip_rate) if signal == "BUY"
+                  else fresh_price * (1 - slip_rate))
+
+            # Shift SL/TP to be relative to the fresh entry price,
+            # keeping the same ATR-based SL distance.
+            sl_dist = levels["sl_distance"]
+            sl_p    = ep - sl_dist if signal == "BUY" else ep + sl_dist
+            tp_p    = ep + sl_dist * rr if signal == "BUY" else ep - sl_dist * rr
+
+            # ── Position sizing ───────────────────────────────────────
+            starting_b = float(cfg.get("starting_balance", 10000))
+            risk_pct   = float(cfg.get("risk_percent", 1))
+            risk_amt   = starting_b * (risk_pct / 100)
+            size       = risk_amt / sl_dist if sl_dist > 0 else 0
+            if size <= 0:
+                continue
+
+            # ── Insert trade ──────────────────────────────────────────
+            tid = str(uuid.uuid4())
+            conn = get_conn(); c = conn.cursor()
+            c.execute(
+                "INSERT INTO trades VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NULL,NULL,'OPEN',%s)",
+                (tid, user_id, sym, signal, ep, sl_p, tp_p, size, now_str()))
+            conn.commit(); conn.close()
+
+            # ── Fill reconciliation log ───────────────────────────────
+            log_fill(
+                user_id        = user_id,
+                trade_id       = tid,
+                symbol         = sym,
+                side           = signal,
+                mode           = cfg.get("trading_mode", "local_paper"),
+                expected_entry = signal_price,
+                actual_fill    = ep,
+                expected_sl    = sl_p,
+                expected_tp    = tp_p,
+                expected_rr    = rr,
+                notes          = f"conf={confidence:.1f}% fresh_px={fresh_price:.6g}",
+            )
+
+            add_alert(user_id,
+                      f"BOT OPEN {sym} {signal} @ {format_price(ep, sym)} "
+                      f"(conf {confidence:.0f}%)")
+            open_symbols.add(sym)
+            opened.append({
+                "id": tid, "symbol": sym, "side": signal,
+                "entry": ep, "sl": sl_p, "tp": tp_p, "confidence": confidence,
+            })
+
+        except Exception as e:
+            skipped.append({"symbol": sym, "reason": "error", "error": str(e)})
+
+    # ── Update scan timestamp ──────────────────────────────────────────
+    try:
+        conn = get_conn(); c = conn.cursor()
+        c.execute("""UPDATE bot_state
+                     SET last_scan_at=NOW(), scan_count=scan_count+1
+                     WHERE user_id=%s""", (user_id,))
+        conn.commit(); conn.close()
+    except Exception:
+        pass
+
+    return {"ok": True, "opened": opened, "skipped": skipped,
+            "scanned": len(symbols)}
+
+
+# ─────────────────────────────────────────────
 # LEAN CONFLUENCE STRATEGY
 # ─────────────────────────────────────────────
 def run_lean_confluence_strategy(
@@ -4494,20 +5073,31 @@ def paper_update():
 @app.route("/api/paper/status", methods=["GET", "OPTIONS"])
 @auth_required
 def paper_status():
-    return jsonify({"enabled": AUTO_PAPER_TRADING.get(g.user_id, False)})
+    mem_enabled = AUTO_PAPER_TRADING.get(g.user_id, False)
+    db_enabled  = _get_bot_db_state(g.user_id)
+    enabled     = mem_enabled or db_enabled
+    return jsonify({"enabled": enabled})
 
 
 @app.route("/api/paper/start-auto", methods=["POST", "OPTIONS"])
 @auth_required
 def paper_start_auto():
+    data           = request.get_json(force=True) or {}
+    interval_str   = str(data.get("interval", "5m"))
+    interval_mins  = _INTERVAL_MINUTES.get(interval_str, 5)
+
     AUTO_PAPER_TRADING[g.user_id] = True
-    return jsonify({"ok": True, "enabled": True})
+    _set_bot_db_state(g.user_id, enabled=True, interval_minutes=interval_mins)
+    add_alert(g.user_id, f"Background bot started — scanning every {interval_str}")
+    return jsonify({"ok": True, "enabled": True, "interval": interval_str})
 
 
 @app.route("/api/paper/stop-auto", methods=["POST", "OPTIONS"])
 @auth_required
 def paper_stop_auto():
     AUTO_PAPER_TRADING[g.user_id] = False
+    _set_bot_db_state(g.user_id, enabled=False)
+    add_alert(g.user_id, "Background bot stopped")
     return jsonify({"ok": True, "enabled": False})
 
 
@@ -4590,7 +5180,8 @@ def paper_summary():
         "profit_factor":    round(pf, 2),
         "wins":             len(wins),
         "losses":           len(losses),
-        "bot_active":       AUTO_PAPER_TRADING.get(g.user_id, False),
+        "bot_active":       (AUTO_PAPER_TRADING.get(g.user_id, False)
+                             or _get_bot_db_state(g.user_id)),
     })
 
 
@@ -4598,152 +5189,37 @@ def paper_summary():
 @auth_required
 def paper_bot_scan():
     """
-    Scan watched symbols for live signals.
-    When bot is active (or force=true in body), auto-opens trades for
-    BUY/SELL signals that pass confidence + R:R gates and have no open position.
-    Always returns JSON — never raises to Flask's HTML error handler.
+    HTTP trigger for a bot scan.  Delegates to _run_bot_scan_for_user so that
+    the background scheduler and the manual HTTP call share identical logic.
     """
     try:
         data       = request.get_json(force=True) or {}
         force_open = bool(data.get("force", False))
 
-        # ── Load config safely ────────────────────────────────────────────
-        try:
-            cfg = get_user_config()
-        except Exception:
-            cfg = dict(DEFAULT_CONFIG)
+        # Activate the in-memory flag so _run_bot_scan_for_user will open trades
+        # when force=True even if the background bot is not enabled.
+        if force_open:
+            AUTO_PAPER_TRADING[g.user_id] = True
 
-        # ── KILL-SWITCH: hard risk backstop check ─────────────────────────
-        # This is independent of strategy logic and must run before anything
-        # else that could open a trade.
-        _halted, _halt_reason = is_risk_halted(g.user_id)
-        if _halted:
+        result = _run_bot_scan_for_user(g.user_id, force=force_open)
+
+        # If kill-switch fired, return 403
+        if result.get("halted"):
             return jsonify({
                 "ok":         False,
                 "halted":     True,
-                "halt_reason": _halt_reason,
+                "halt_reason": result.get("halt_reason", ""),
                 "message":    "Risk kill-switch is active. No new trades allowed. "
                               "Review drawdown and call POST /api/risk/reset-halt "
                               "to resume after investigation.",
             }), 403
 
-        symbols = (cfg.get("symbols") or ALL_SYMBOLS)[:12]
-
-        min_conf   = int(cfg.get("min_confidence", 70))
-        bot_active = AUTO_PAPER_TRADING.get(g.user_id, False)
-
-        # ── Already-open symbols → skip to prevent pyramiding ─────────────
-        open_symbols = set()
-        try:
-            conn = get_conn(); c = conn.cursor()
-            c.execute("SELECT symbol FROM trades WHERE user_id=%s AND status='OPEN'", (g.user_id,))
-            open_symbols = {row[0] for row in c.fetchall()}
-            conn.close()
-        except Exception:
-            pass  # If DB fails, allow scan but don't gate on open positions
-
-        weekly = {}
-        try:
-            weekly = is_weekly_paused(g.user_id, cfg)
-        except Exception:
-            pass
-
-        scan_results, opened, skipped = [], [], []
-
-        for sym in symbols:
-            try:
-                s = get_symbol_summary(sym, "bot", SIGNALS_INTERVAL, cfg)
-                if not s:
-                    continue
-                signal     = s.get("signal", "HOLD")
-                confidence = float(s.get("confidence") or 0)
-                price_val  = float(s.get("price") or 0)
-
-                scan_results.append({
-                    "symbol":     sym,
-                    "signal":     signal,
-                    "confidence": confidence,
-                    "price":      price_val,
-                })
-
-                should_trade = (bot_active or force_open) and signal in ("BUY", "SELL")
-                if not should_trade:
-                    continue
-                if confidence < min_conf:
-                    skipped.append({"symbol": sym, "reason": "low_confidence", "confidence": confidence})
-                    continue
-                if sym in open_symbols:
-                    skipped.append({"symbol": sym, "reason": "already_open"})
-                    continue
-                if weekly.get("weekly_trading_paused"):
-                    skipped.append({"symbol": sym, "reason": "weekly_pause"})
-                    continue
-
-                df = fetch_df_for_symbol(sym, SIGNALS_INTERVAL, 200)
-                if df is None:
-                    skipped.append({"symbol": sym, "reason": "no_data"})
-                    continue
-
-                levels = calculate_trade_levels(
-                    df, signal, cfg.get("risk_reward", 2),
-                    cfg.get("atr_multiplier", 1.5), cfg
-                )
-                if not levels.get("rr_valid"):
-                    skipped.append({"symbol": sym, "reason": "rr_invalid",
-                                     "rr": levels.get("rr")})
-                    continue
-
-                ep       = levels["entry"]
-                sd       = levels["sl_distance"]
-                risk_amt = starting_balance_for(g.user_id, cfg) * (cfg.get("risk_percent", 1) / 100)
-                size     = risk_amt / sd if sd else 0
-
-                tid = str(uuid.uuid4())
-                conn = get_conn(); cu = conn.cursor()
-                cu.execute(
-                    "INSERT INTO trades VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NULL,NULL,'OPEN',%s)",
-                    (tid, g.user_id, sym, signal, ep, levels["sl"], levels["tp"], size, now_str()))
-                conn.commit(); conn.close()
-
-                # ── Fill reconciliation: log expected vs. actual fill ──────
-                # expected_entry = the signal price (current market close).
-                # actual_fill    = ep (which includes simulated slippage).
-                # This divergence is what /api/fill-reconciliation reports.
-                log_fill(
-                    user_id        = g.user_id,
-                    trade_id       = tid,
-                    symbol         = sym,
-                    side           = signal,
-                    mode           = cfg.get("trading_mode", "local_paper"),
-                    expected_entry = levels.get("signal_price") or ep,
-                    actual_fill    = ep,
-                    expected_sl    = levels["sl"],
-                    expected_tp    = levels["tp"],
-                    expected_rr    = levels.get("rr"),
-                    notes          = f"bot_scan conf={confidence:.1f}%",
-                )
-
-                add_alert(g.user_id,
-                          f"BOT OPEN {sym} {signal} @ {format_price(ep, sym)} "
-                          f"(conf {confidence:.0f}%)")
-                open_symbols.add(sym)
-                opened.append({
-                    "id": tid, "symbol": sym, "side": signal,
-                    "entry": ep, "sl": levels["sl"], "tp": levels["tp"],
-                    "confidence": confidence,
-                })
-            except Exception as e:
-                scan_results.append({"symbol": sym, "signal": "ERROR", "error": str(e)})
-
-        return jsonify({
-            "ok":         True,
-            "scanned":    len(scan_results),
-            "signals":    scan_results,
-            "opened":     opened,
-            "skipped":    skipped,
-            "bot_active": bot_active,
+        result.update({
+            "bot_active": (AUTO_PAPER_TRADING.get(g.user_id, False)
+                           or _get_bot_db_state(g.user_id)),
             "scanned_at": now_str(),
         })
+        return jsonify(result)
 
     except Exception as e:
         import traceback
@@ -4767,6 +5243,7 @@ def paper_reset():
     c.execute("DELETE FROM trades WHERE user_id=%s", (g.user_id,))
     conn.commit(); conn.close()
     AUTO_PAPER_TRADING[g.user_id] = False
+    _set_bot_db_state(g.user_id, enabled=False)
     add_alert(g.user_id, "Paper account reset — all trades cleared")
     return jsonify({"ok": True})
 
@@ -6012,6 +6489,80 @@ def api_walkforward():
     except Exception as e:
         import traceback
         return jsonify({"error": str(e), "detail": traceback.format_exc()[-400:]}), 500
+
+
+# ─────────────────────────────────────────────
+# NEWS SENTIMENT & SCHEDULER STATUS ENDPOINTS
+# ─────────────────────────────────────────────
+
+@app.route("/api/news-sentiment/<symbol>", methods=["GET", "OPTIONS"])
+@auth_required
+def news_sentiment(symbol):
+    """
+    Return cached news sentiment score and recent headlines for a symbol.
+    Score > 0 = net bullish; < 0 = net bearish; 0 = neutral / no data.
+    """
+    try:
+        score, headlines = _fetch_news_sentiment(symbol.upper())
+        cached_at = None
+        entry = _news_cache.get(symbol.upper())
+        if entry:
+            cached_at = datetime.fromtimestamp(entry[0], tz=timezone.utc).isoformat()
+        return jsonify({
+            "symbol":     symbol.upper(),
+            "score":      score,
+            "headlines":  headlines[:10],
+            "cached_at":  cached_at,
+            "sentiment":  ("bullish" if score >= 3 else
+                           "bearish" if score <= -3 else "neutral"),
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/bot/scheduler-status", methods=["GET", "OPTIONS"])
+@auth_required
+def scheduler_status():
+    """
+    Returns the APScheduler state plus per-user bot state from the DB.
+    Useful for debugging whether the background scanner is running.
+    """
+    try:
+        jobs = []
+        for job in _scheduler.get_jobs():
+            next_run = job.next_run_time
+            jobs.append({
+                "id":       job.id,
+                "next_run": next_run.isoformat() if next_run else None,
+            })
+
+        # Per-user DB state
+        conn = get_conn(); c = conn.cursor()
+        c.execute("""SELECT enabled, interval_minutes, last_scan_at, scan_count
+                     FROM bot_state WHERE user_id=%s""", (g.user_id,))
+        row = c.fetchone(); conn.close()
+
+        if row:
+            db_enabled, interval_mins, last_scan, scan_count = row
+        else:
+            db_enabled, interval_mins, last_scan, scan_count = False, 5, None, 0
+
+        mem_enabled = AUTO_PAPER_TRADING.get(g.user_id, False)
+
+        return jsonify({
+            "scheduler_running": _scheduler.running,
+            "jobs":              jobs,
+            "user": {
+                "bot_enabled_db":     db_enabled,
+                "bot_enabled_memory": mem_enabled,
+                "bot_enabled":        bool(db_enabled or mem_enabled),
+                "interval_minutes":   interval_mins,
+                "last_scan_at":       str(last_scan) if last_scan else None,
+                "scan_count":         scan_count,
+            },
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 # ── Global error handlers — always return JSON, never HTML ───────────────────
