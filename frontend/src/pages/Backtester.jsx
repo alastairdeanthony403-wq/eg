@@ -64,6 +64,7 @@ export default function Backtester() {
   const [fee,       setFee]      = useState(0.04);
   const [slip,      setSlip]     = useState(0.02);
   const [rndWindow, setRndWindow]= useState(false);
+  const [trainPct,  setTrainPct] = useState(70);  // % of candles used for training
 
   // Results
   const [result,    setResult]   = useState(null);
@@ -79,13 +80,22 @@ export default function Backtester() {
   const [learning,      setLearning]     = useState(false);
   const [learnResult,   setLearnResult]  = useState(null);
   const [learnHistory,  setLearnHistory] = useState([]);
-  const [autoLearnNote, setAutoLearnNote]= useState(null);   // auto-learn after backtest
+  const [autoLearnNote, setAutoLearnNote]= useState(null);
   const [optimizing,    setOptimizing]   = useState(false);
   const [optResult,     setOptResult]    = useState(null);
   const [sortField,     setSortField]    = useState("open_time");
   const [sortDir,       setSortDir]      = useState("desc");
   const [page,          setPage]         = useState(0);
   const PAGE = 20;
+
+  // Walk-forward
+  const [wfDays,    setWfDays]    = useState(120);
+  const [wfWindows, setWfWindows] = useState(4);
+  const [wfRunning, setWfRunning] = useState(false);
+  const [wfResult,  setWfResult]  = useState(null);
+
+  // Apply-config (for suggestions from learn/optimise)
+  const [applyingCfg, setApplyingCfg] = useState(false);
 
   // ── Run backtest ────────────────────────────────────────────────────────────
   const run = async () => {
@@ -94,17 +104,54 @@ export default function Backtester() {
     try {
       const d = await apiFetch("/api/backtest", {
         method:"POST",
-        body:JSON.stringify({ symbol, strategy, period_days:Number(days),
+        body:JSON.stringify({
+          symbol, strategy, period_days:Number(days),
           starting_balance:Number(balance), fee_percent:Number(fee),
-          slippage_percent:Number(slip), random_window:rndWindow }),
+          slippage_percent:Number(slip), random_window:rndWindow,
+          train_pct: Number(trainPct) / 100,
+        }),
       });
-      // ← read body ONCE
       setResult(d);
       setChartCandles(d.candles_chart || []);
-      if (d.auto_learn?.applied) setAutoLearnNote(d.auto_learn);
+      // Show suggestion banner when auto-learn found something (never auto-applied)
+      const al = d.auto_learn;
+      if (al && al.suggested && Object.keys(al.suggested).length > 0) {
+        setAutoLearnNote(al);
+      }
       loadHistory();
     } catch(e){ setError(e.message); }
     finally{ setRunning(false); }
+  };
+
+  // ── Apply suggested config changes ──────────────────────────────────────────
+  const handleApplyConfig = async (changes) => {
+    setApplyingCfg(true);
+    try {
+      await apiFetch("/api/apply-config", {
+        method:"POST",
+        body:JSON.stringify({ changes }),
+      });
+      setAutoLearnNote(null);
+    } catch(e){ setError(e.message); }
+    finally { setApplyingCfg(false); }
+  };
+
+  // ── Walk-forward analysis ────────────────────────────────────────────────────
+  const handleWalkForward = async () => {
+    setWfRunning(true); setWfResult(null); setError(null);
+    try {
+      const d = await apiFetch("/api/walkforward", {
+        method:"POST",
+        body:JSON.stringify({
+          symbol, period_days:Number(wfDays), n_windows:Number(wfWindows),
+          train_pct:Number(trainPct)/100,
+          starting_balance:Number(balance),
+          fee_percent:Number(fee), slippage_percent:Number(slip),
+        }),
+      });
+      setWfResult(d);
+    } catch(e){ setError(e.message); }
+    finally { setWfRunning(false); }
   };
 
   // ── Load run history ────────────────────────────────────────────────────────
@@ -284,6 +331,11 @@ export default function Backtester() {
           <Field label="SLIPPAGE (%)">
             <input type="number" value={slip} step="0.01" onChange={e=>setSlip(e.target.value)} style={inpStyle}/>
           </Field>
+          <Field label="TRAIN SPLIT (%)">
+            <select value={trainPct} onChange={e=>setTrainPct(Number(e.target.value))} style={selStyle}>
+              {[50,60,70,80].map(v=><option key={v} value={v}>{v}% train / {100-v}% test</option>)}
+            </select>
+          </Field>
         </div>
         <div style={{display:"flex",alignItems:"center",gap:18,marginTop:14}}>
           <label style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer",fontSize:12,color:T.t2,fontFamily:MONO}}>
@@ -313,15 +365,22 @@ export default function Backtester() {
           <Brain size={14} style={{color:T.purple,flexShrink:0,marginTop:1}}/>
           <div style={{flex:1}}>
             <span style={{fontFamily:MONO,fontSize:10,color:T.purple,letterSpacing:2}}>
-              AUTO-LEARN APPLIED · {autoLearnNote.adjustments_applied} param{autoLearnNote.adjustments_applied!==1?"s":""} updated
+              AUTO-LEARN SUGGESTION · {Object.keys(autoLearnNote.suggested||{}).length} param change{Object.keys(autoLearnNote.suggested||{}).length!==1?"s":""} recommended
             </span>
-            <div style={{marginTop:4,display:"flex",flexWrap:"wrap",gap:6}}>
-              {Object.entries(autoLearnNote.adjustments||{}).map(([k,v])=>(
+            <div style={{marginTop:4,display:"flex",flexWrap:"wrap",gap:6,alignItems:"center"}}>
+              {Object.entries(autoLearnNote.suggested||{}).map(([k,v])=>(
                 <span key={k} style={{fontFamily:MONO,fontSize:9,background:`${T.purple}18`,
                   border:`1px solid ${T.purple}33`,borderRadius:3,padding:"2px 7px",color:T.purple}}>
                   {k.replace(/_/g," ")} → {String(v)}
                 </span>
               ))}
+              <button onClick={()=>handleApplyConfig(autoLearnNote.suggested||{})}
+                disabled={applyingCfg}
+                style={{marginLeft:6,background:`${T.purple}28`,border:`1px solid ${T.purple}66`,
+                  color:T.purple,borderRadius:3,padding:"3px 12px",cursor:"pointer",
+                  fontFamily:MONO,fontSize:9,letterSpacing:1}}>
+                {applyingCfg?"APPLYING…":"✓ APPLY"}
+              </button>
             </div>
           </div>
           <button onClick={()=>setAutoLearnNote(null)}
@@ -331,7 +390,7 @@ export default function Backtester() {
 
       {/* Tabs */}
       <div style={{margin:"0 20px",borderBottom:`1px solid ${T.border}`,display:"flex",gap:0}}>
-        {["results","chart","trades","compare","learn","history"].map(t=>(
+        {["results","chart","trades","compare","learn","walkforward","history"].map(t=>(
           <button key={t} onClick={()=>setTab(t)}
             style={{padding:"9px 18px",background:"none",border:"none",borderBottom:`2px solid ${tab===t?T.blue:"transparent"}`,
               color:tab===t?T.blue:T.t2,cursor:"pointer",fontFamily:MONO,fontSize:10,
@@ -349,6 +408,8 @@ export default function Backtester() {
             : <div style={{animation:"slide .25s ease"}}>
                 {/* Test metadata banner */}
                 <TestMeta result={result}/>
+                {/* Out-of-sample validation panel */}
+                <OOSPanel summary={summary}/>
                 {/* Summary cards */}
                 <SummaryCards summary={summary}/>
                 {/* Equity curve */}
@@ -457,7 +518,7 @@ export default function Backtester() {
                 </button>
               </div>
             </div>
-            {learnResult&&<LearnResult data={learnResult}/>}
+            {learnResult&&<LearnResult data={learnResult} onApply={handleApplyConfig} applying={applyingCfg}/>}
 
             {/* ── Parameter Grid Search ── */}
             <div style={{background:T.bg3,border:`1px solid ${T.border}`,borderRadius:6,padding:16,marginTop:20,marginBottom:16}}>
@@ -486,8 +547,51 @@ export default function Backtester() {
                 </button>
               </div>
             </div>
-            {optResult&&<OptimizeResult data={optResult}/>}
+            {optResult&&<OptimizeResult data={optResult} onApply={handleApplyConfig} applying={applyingCfg}/>}
 
+          </div>
+        )}
+
+        {/* WALK-FORWARD TAB */}
+        {tab==="walkforward"&&(
+          <div style={{animation:"slide .25s ease"}}>
+            <div style={{background:T.bg3,border:`1px solid ${T.border}`,borderRadius:6,padding:16,marginBottom:16}}>
+              <div style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",gap:16,flexWrap:"wrap"}}>
+                <div>
+                  <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}>
+                    <TrendingUp size={16} style={{color:T.cyan}}/>
+                    <span style={{fontFamily:MONO,fontSize:12,color:T.cyan,letterSpacing:2}}>WALK-FORWARD ANALYSIS</span>
+                  </div>
+                  <p style={{margin:0,fontSize:13,color:T.t2,lineHeight:1.65,maxWidth:540}}>
+                    Splits history into <strong style={{color:T.text}}>N rolling windows</strong>.
+                    Each window: grid-search best params on the <em>in-sample</em> portion,
+                    then apply them to the <em>out-of-sample</em> portion and record honest metrics.
+                    Tells you whether your edge is stable or curve-fitted.
+                  </p>
+                </div>
+                <div style={{display:"flex",flexDirection:"column",gap:8,minWidth:200}}>
+                  <Field label="TOTAL PERIOD (DAYS)">
+                    <select value={wfDays} onChange={e=>setWfDays(Number(e.target.value))} style={selStyle}>
+                      {[60,90,120,180,240,365].map(d=><option key={d} value={d}>{d} days</option>)}
+                    </select>
+                  </Field>
+                  <Field label="NUMBER OF WINDOWS">
+                    <select value={wfWindows} onChange={e=>setWfWindows(Number(e.target.value))} style={selStyle}>
+                      {[2,3,4,5,6].map(n=><option key={n} value={n}>{n} windows</option>)}
+                    </select>
+                  </Field>
+                  <button onClick={handleWalkForward} disabled={wfRunning}
+                    style={{background:`${T.cyan}12`,border:`1px solid ${T.cyan}44`,color:T.cyan,
+                      borderRadius:4,padding:"9px 20px",cursor:"pointer",fontFamily:MONO,
+                      fontSize:11,letterSpacing:1,display:"flex",alignItems:"center",gap:6,marginTop:4}}>
+                    {wfRunning
+                      ?<><div style={{width:11,height:11,border:`2px solid ${T.t2}`,borderTop:`2px solid ${T.cyan}`,borderRadius:"50%",animation:"spin 1s linear infinite"}}/>RUNNING…</>
+                      :<><TrendingUp size={12}/>RUN WALK-FORWARD</>}
+                  </button>
+                </div>
+              </div>
+            </div>
+            {wfResult&&<WalkForwardResult data={wfResult} onApply={handleApplyConfig} applying={applyingCfg}/>}
           </div>
         )}
 
@@ -859,7 +963,12 @@ function ComparePanel({data}){
 }
 
 // ── LEARN RESULT ──────────────────────────────────────────────────────────────
-function LearnResult({data:d}){
+function LearnResult({data:d, onApply, applying}){
+  // config_changes may be "suggested" (not applied) when auto_apply=false
+  const changes  = d.config_changes || d.suggested || {};
+  const isApplied = d.applied === true;
+  const hasSuggestions = !isApplied && Object.keys(changes).length > 0;
+
   return(
     <div style={{background:T.bg3,border:`1px solid ${T.purple}40`,borderRadius:6,padding:16,animation:"slide .25s ease"}}>
       <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12}}>
@@ -867,6 +976,11 @@ function LearnResult({data:d}){
         <span style={{fontFamily:MONO,fontSize:11,color:T.green,letterSpacing:1}}>
           ANALYSIS COMPLETE — {d.patterns_found||0} PATTERNS FOUND
         </span>
+        {isApplied&&(
+          <span style={{marginLeft:"auto",fontFamily:MONO,fontSize:9,
+            background:`${T.green}18`,border:`1px solid ${T.green}44`,
+            borderRadius:3,padding:"2px 8px",color:T.green}}>APPLIED</span>
+        )}
       </div>
 
       {/* Patterns */}
@@ -883,11 +997,27 @@ function LearnResult({data:d}){
         </div>
       )}
 
-      {/* Config diff */}
-      {d.config_changes&&Object.keys(d.config_changes).length>0&&(
+      {/* Config changes / suggestions */}
+      {Object.keys(changes).length>0&&(
         <div>
-          <div style={{fontFamily:MONO,fontSize:8,color:T.t2,letterSpacing:2,marginBottom:8}}>
-            CONFIG ADJUSTMENTS APPLIED
+          <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:8}}>
+            <span style={{fontFamily:MONO,fontSize:8,color:T.t2,letterSpacing:2}}>
+              {isApplied?"CONFIG ADJUSTMENTS APPLIED":"SUGGESTED CONFIG CHANGES"}
+            </span>
+            {hasSuggestions&&onApply&&(
+              <button onClick={()=>onApply(
+                  // normalise: extract "after" value if it's an object {before,after}
+                  Object.fromEntries(
+                    Object.entries(changes).map(([k,v])=>[k, typeof v==="object"&&v!==null?(v.after??v.new??v):v])
+                  )
+                )}
+                disabled={applying}
+                style={{marginLeft:"auto",background:`${T.purple}22`,border:`1px solid ${T.purple}66`,
+                  color:T.purple,borderRadius:3,padding:"4px 14px",cursor:"pointer",
+                  fontFamily:MONO,fontSize:9,letterSpacing:1}}>
+                {applying?"APPLYING…":"✓ APPLY SUGGESTION"}
+              </button>
+            )}
           </div>
           <div style={{overflowX:"auto"}}>
             <table style={{width:"100%",borderCollapse:"collapse",fontFamily:MONO,fontSize:11}}>
@@ -901,12 +1031,18 @@ function LearnResult({data:d}){
                 </tr>
               </thead>
               <tbody>
-                {Object.entries(d.config_changes).map(([k,v],i)=>(
+                {Object.entries(changes).map(([k,v],i)=>(
                   <tr key={k} style={{background:i%2===0?T.bg3:T.bg2,borderBottom:`1px solid ${T.border}`}}>
                     <td style={{padding:"6px 10px",color:T.text}}>{k}</td>
-                    <td style={{padding:"6px 10px",color:T.red}}>{String(v.before??v.old??v)}</td>
-                    <td style={{padding:"6px 10px",color:T.green}}>{String(v.after??v.new??v)}</td>
-                    <td style={{padding:"6px 10px",color:T.t2,fontSize:10}}>{v.reason||"Pattern-based"}</td>
+                    <td style={{padding:"6px 10px",color:T.red}}>
+                      {typeof v==="object"&&v!==null?String(v.before??v.old??"—"):"—"}
+                    </td>
+                    <td style={{padding:"6px 10px",color:isApplied?T.green:T.gold}}>
+                      {typeof v==="object"&&v!==null?String(v.after??v.new??v):String(v)}
+                    </td>
+                    <td style={{padding:"6px 10px",color:T.t2,fontSize:10}}>
+                      {(typeof v==="object"&&v!==null&&v.reason)||"Pattern-based"}
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -919,7 +1055,7 @@ function LearnResult({data:d}){
 }
 
 // ── OPTIMIZE RESULT ───────────────────────────────────────────────────────────
-function OptimizeResult({ data: d }) {
+function OptimizeResult({ data: d, onApply, applying }) {
   const paramLabels = {
     confluence_min:  "Confluence",
     risk_reward:     "Risk/Reward",
@@ -928,17 +1064,25 @@ function OptimizeResult({ data: d }) {
   };
   return (
     <div style={{background:T.bg3,border:`1px solid ${T.cyan}40`,borderRadius:6,padding:16,animation:"slide .25s ease"}}>
-      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12}}>
+      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12,flexWrap:"wrap"}}>
         <CheckCircle size={14} style={{color:T.green}}/>
         <span style={{fontFamily:MONO,fontSize:11,color:T.green,letterSpacing:1}}>
           OPTIMISATION COMPLETE — {d.combos_tested} COMBINATIONS TESTED
         </span>
         {d.applied&&(
-          <span style={{marginLeft:"auto",fontFamily:MONO,fontSize:9,
+          <span style={{fontFamily:MONO,fontSize:9,
             background:`${T.green}18`,border:`1px solid ${T.green}44`,
             borderRadius:3,padding:"2px 8px",color:T.green}}>
-            BEST PARAMS APPLIED
+            PARAMS APPLIED
           </span>
+        )}
+        {!d.applied&&d.suggested_params&&onApply&&(
+          <button onClick={()=>onApply(d.suggested_params)} disabled={applying}
+            style={{marginLeft:"auto",background:`${T.cyan}20`,border:`1px solid ${T.cyan}66`,
+              color:T.cyan,borderRadius:3,padding:"4px 14px",cursor:"pointer",
+              fontFamily:MONO,fontSize:9,letterSpacing:1}}>
+            {applying?"APPLYING…":"✓ APPLY SUGGESTION"}
+          </button>
         )}
       </div>
 
@@ -1021,6 +1165,194 @@ function OptimizeResult({ data: d }) {
               </tbody>
             </table>
           </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── OUT-OF-SAMPLE PANEL ───────────────────────────────────────────────────────
+function OOSPanel({summary:s}){
+  if(!s||!s.test_summary) return null;
+  const tr   = s.train_summary || {};
+  const te   = s.test_summary  || {};
+  const warn = s.low_sample_warning;
+  const msg  = s.low_sample_msg;
+  const split = s.split_date || "—";
+  const tp    = s.train_pct != null ? Math.round(s.train_pct * 100) : 70;
+
+  const MetaBox = ({label, m, accent}) => (
+    <div style={{flex:1,minWidth:200,background:T.bg2,border:`1px solid ${accent}44`,
+      borderRadius:5,padding:"12px 14px"}}>
+      <div style={{fontFamily:MONO,fontSize:8,color:accent,letterSpacing:2,marginBottom:10}}>{label}</div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+        {[
+          ["TRADES",        m.total_trades ?? "—",                                                T.text],
+          ["WIN RATE",      (m.total_trades||0)>=1 ? fmtPct(m.win_rate)    : "—",                T.gold],
+          ["PROFIT FACTOR", (m.total_trades||0)>=1 ? fmt(m.profit_factor)  : "—",                T.blue],
+          ["NET P&L",       (m.total_trades||0)>=1 ? fmtPnl(m.net_pnl)+"$": "—", (m.net_pnl||0)>=0?T.green:T.red],
+        ].map(([lbl,val,col])=>(
+          <div key={lbl}>
+            <div style={{fontFamily:MONO,fontSize:8,color:T.t2,letterSpacing:1,marginBottom:2}}>{lbl}</div>
+            <div style={{fontFamily:MONO,fontSize:14,color:col,fontWeight:500}}>{val}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+
+  return(
+    <div style={{marginBottom:14,background:T.bg3,border:`1px solid ${T.border}`,
+      borderRadius:6,padding:"12px 14px"}}>
+      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10}}>
+        <Calendar size={12} style={{color:T.cyan}}/>
+        <span style={{fontFamily:MONO,fontSize:9,color:T.cyan,letterSpacing:2}}>
+          OUT-OF-SAMPLE VALIDATION
+        </span>
+        <span style={{fontFamily:MONO,fontSize:9,color:T.t2,marginLeft:8}}>
+          Split: {tp}% train / {100-tp}% test · Split date: {split}
+        </span>
+      </div>
+      <div style={{display:"flex",gap:10,flexWrap:"wrap"}}>
+        <MetaBox label="TRAINING (IN-SAMPLE)"  m={tr} accent={T.blue}/>
+        <MetaBox label="TEST (OUT-OF-SAMPLE)"  m={te} accent={warn?T.gold:T.green}/>
+      </div>
+      {warn&&(
+        <div style={{marginTop:10,background:`${T.gold}12`,border:`1px solid ${T.gold}44`,
+          borderRadius:4,padding:"8px 12px",display:"flex",alignItems:"center",gap:8}}>
+          <AlertTriangle size={13} style={{color:T.gold,flexShrink:0}}/>
+          <span style={{fontFamily:MONO,fontSize:10,color:T.gold}}>
+            {msg||"Insufficient test trades — win rate and profit factor may not be statistically meaningful."}
+          </span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── WALK-FORWARD RESULT ───────────────────────────────────────────────────────
+function WalkForwardResult({data:d, onApply, applying}){
+  if(!d) return null;
+  const VERDICT_COLOR = {STABLE:T.green, MIXED:T.gold, UNSTABLE:T.red};
+  const vc = VERDICT_COLOR[d.verdict] || T.t2;
+
+  return(
+    <div style={{background:T.bg3,border:`1px solid ${T.cyan}44`,borderRadius:6,padding:16,
+      animation:"slide .25s ease"}}>
+
+      {/* Header + verdict badge */}
+      <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:16,flexWrap:"wrap"}}>
+        <CheckCircle size={14} style={{color:T.green}}/>
+        <span style={{fontFamily:MONO,fontSize:11,color:T.green,letterSpacing:1}}>
+          WALK-FORWARD COMPLETE — {d.n_windows||0} WINDOWS
+        </span>
+        <span style={{marginLeft:"auto",fontFamily:MONO,fontSize:11,letterSpacing:2,
+          background:`${vc}18`,border:`1px solid ${vc}55`,borderRadius:4,padding:"4px 14px",
+          color:vc,fontWeight:700}}>
+          {d.verdict||"—"}
+        </span>
+      </div>
+
+      {/* Aggregate stats */}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(130px,1fr))",gap:8,marginBottom:16}}>
+        {[
+          ["WINDOWS",      d.n_windows||0,                              T.text],
+          ["PROFITABLE",   `${d.windows_profitable||0}/${d.n_windows||0}`, T.green],
+          ["CONSISTENCY",  fmtPct(d.consistency_pct),                   vc],
+          ["AVG OOS PF",   fmt(d.avg_oos_pf),                           T.blue],
+          ["AVG OOS WIN%", fmtPct(d.avg_oos_wr),                        T.gold],
+          ["OOS TRADES",   d.total_oos_trades||0,                       T.text],
+        ].map(([lbl,val,col])=>(
+          <div key={lbl} style={{background:T.bg2,border:`1px solid ${T.border}`,borderRadius:4,padding:"8px 12px"}}>
+            <div style={{fontFamily:MONO,fontSize:8,color:T.t2,letterSpacing:1,marginBottom:3}}>{lbl}</div>
+            <div style={{fontFamily:MONO,fontSize:14,color:col,fontWeight:500}}>{val}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Per-window table */}
+      {d.windows?.length>0&&(
+        <div style={{overflowX:"auto",marginBottom:16}}>
+          <div style={{fontFamily:MONO,fontSize:8,color:T.t2,letterSpacing:2,marginBottom:8}}>PER-WINDOW RESULTS</div>
+          <table style={{width:"100%",borderCollapse:"collapse",fontFamily:MONO,fontSize:10}}>
+            <thead>
+              <tr>
+                {["WIN #","IS PERIOD","OOS PERIOD","IS PF","OOS PF","OOS WIN%","OOS TRADES","BEST PARAMS","OUTCOME"].map(h=>(
+                  <th key={h} style={{padding:"6px 10px",textAlign:"left",fontFamily:MONO,fontSize:8,
+                    color:T.t2,borderBottom:`1px solid ${T.border}`,background:T.bg2,
+                    letterSpacing:1,whiteSpace:"nowrap"}}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {d.windows.map((w,i)=>{
+                const profitable = (w.oos_pf||0)>1;
+                const oc = profitable?T.green:T.red;
+                return(
+                  <tr key={i} style={{background:i%2===0?T.bg3:T.bg2,borderBottom:`1px solid ${T.border}`}}>
+                    <td style={{padding:"6px 10px",color:T.t2,textAlign:"center"}}>{i+1}</td>
+                    <td style={{padding:"6px 10px",color:T.t2,fontSize:9,whiteSpace:"nowrap"}}>
+                      {(w.is_start||"—").slice(0,10)}→{(w.is_end||"—").slice(0,10)}
+                    </td>
+                    <td style={{padding:"6px 10px",color:T.t2,fontSize:9,whiteSpace:"nowrap"}}>
+                      {(w.oos_start||"—").slice(0,10)}→{(w.oos_end||"—").slice(0,10)}
+                    </td>
+                    <td style={{padding:"6px 10px",color:T.blue}}>{fmt(w.is_pf)}</td>
+                    <td style={{padding:"6px 10px",color:oc,fontWeight:profitable?700:400}}>{fmt(w.oos_pf)}</td>
+                    <td style={{padding:"6px 10px",color:T.gold}}>{fmtPct(w.oos_wr)}</td>
+                    <td style={{padding:"6px 10px",color:T.text}}>{w.oos_trades||0}</td>
+                    <td style={{padding:"6px 10px",color:T.cyan,fontSize:9}}>
+                      {w.best_params?`c=${w.best_params.confluence_min} rr=${w.best_params.risk_reward}`:"—"}
+                    </td>
+                    <td style={{padding:"6px 10px"}}>
+                      <span style={{fontFamily:MONO,fontSize:8,color:oc,
+                        background:`${oc}18`,border:`1px solid ${oc}44`,
+                        borderRadius:3,padding:"2px 7px"}}>
+                        {profitable?"PROFIT":"LOSS"}
+                      </span>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {/* Low sample warning */}
+      {d.low_sample_warning&&(
+        <div style={{background:`${T.gold}12`,border:`1px solid ${T.gold}44`,borderRadius:4,
+          padding:"8px 12px",display:"flex",alignItems:"center",gap:8,marginBottom:12}}>
+          <AlertTriangle size={13} style={{color:T.gold,flexShrink:0}}/>
+          <span style={{fontFamily:MONO,fontSize:10,color:T.gold}}>
+            Low OOS trade count — results may not be statistically meaningful.
+          </span>
+        </div>
+      )}
+
+      {/* Best params overall + Apply button */}
+      {d.best_params_overall&&onApply&&(
+        <div style={{background:`${T.cyan}08`,border:`1px solid ${T.cyan}33`,borderRadius:5,
+          padding:"12px 14px",display:"flex",alignItems:"center",gap:12,flexWrap:"wrap"}}>
+          <div style={{flex:1}}>
+            <div style={{fontFamily:MONO,fontSize:8,color:T.cyan,letterSpacing:2,marginBottom:6}}>
+              MOST CONSISTENT PARAMS ACROSS WINDOWS
+            </div>
+            <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+              {Object.entries(d.best_params_overall).map(([k,v])=>(
+                <span key={k} style={{fontFamily:MONO,fontSize:9,background:`${T.cyan}18`,
+                  border:`1px solid ${T.cyan}33`,borderRadius:3,padding:"2px 8px",color:T.cyan}}>
+                  {k.replace(/_/g," ")} = {v}
+                </span>
+              ))}
+            </div>
+          </div>
+          <button onClick={()=>onApply(d.best_params_overall)} disabled={applying}
+            style={{background:`${T.cyan}20`,border:`1px solid ${T.cyan}66`,color:T.cyan,
+              borderRadius:4,padding:"8px 18px",cursor:"pointer",fontFamily:MONO,
+              fontSize:10,letterSpacing:1,whiteSpace:"nowrap",flexShrink:0}}>
+            {applying?"APPLYING…":"✓ APPLY TO BOT CONFIG"}
+          </button>
         </div>
       )}
     </div>

@@ -3216,6 +3216,8 @@ def api_backtest():
     sb          = float(data.get("starting_balance", 1000))
     fee_pct     = float(data.get("fee_percent",       0.04))
     slip_pct    = float(data.get("slippage_percent",  0.02))
+    # Out-of-sample split: 0 = no split, 0.7 = 70% train / 30% test
+    train_pct   = max(0.0, min(float(data.get("train_pct", 0.70)), 0.95))
 
     market = detect_market(symbol)
 
@@ -3291,6 +3293,14 @@ def api_backtest():
         return jsonify({
             "error": f"Unexpected error fetching candles for {symbol}: {e}"
         }), 500
+
+    # ── Train / test split index ─────────────────────────────────────────────
+    # Parameter tuning (auto-learn/optimise) sees ONLY train candles.
+    # Metrics reported to the user come from the TEST (held-out) portion.
+    _split_idx    = int(len(candles) * train_pct) if train_pct > 0 else len(candles)
+    _split_idx    = max(50, min(_split_idx, len(candles) - 1))
+    _split_ts_ms  = int(candles[_split_idx][0])   # ms timestamp at the boundary
+    _split_ts_sec = _split_ts_ms / 1000.0
 
     cfg = get_user_config()
     _ww_goal = cfg.get("weekly_win_goal",             3)
@@ -3387,6 +3397,7 @@ def api_backtest():
         t.setdefault("session",    "—")
         t.setdefault("confluence", 0)
 
+    # ── Full-run metrics (used for DB storage and chart) ─────────────────────
     total   = len(trades)
     wins    = [t for t in trades if t["pnl"] > 0]
     losses  = [t for t in trades if t["pnl"] <= 0]
@@ -3396,6 +3407,49 @@ def api_backtest():
     gross_profit = sum(t["pnl"] for t in wins)
     gross_loss   = abs(sum(t["pnl"] for t in losses))
     pf           = (gross_profit / gross_loss) if gross_loss else 0
+
+    # ── Train / test split metrics ────────────────────────────────────────────
+    # Trades are split at _split_ts_sec (set earlier from the candle boundary).
+    # All reported win-rate / PF figures come from the TEST portion only.
+    _MIN_MEANINGFUL = 30  # minimum trades for statistics to be meaningful
+
+    def _split_metrics(trade_list):
+        if not trade_list:
+            return {
+                "total_trades": 0, "wins": 0, "losses": 0,
+                "win_rate": 0.0, "profit_factor": 0.0,
+                "net_pnl": 0.0, "gross_profit": 0.0, "gross_loss": 0.0,
+            }
+        _wins   = [t for t in trade_list if t["pnl"] > 0]
+        _losses = [t for t in trade_list if t["pnl"] <= 0]
+        _gp  = sum(t["pnl"] for t in _wins)
+        _gl  = abs(sum(t["pnl"] for t in _losses))
+        _wr  = len(_wins) / len(trade_list) * 100 if trade_list else 0
+        _pf  = (_gp / _gl) if _gl else (1.0 if _gp > 0 else 0.0)
+        return {
+            "total_trades":  len(trade_list),
+            "wins":          len(_wins),
+            "losses":        len(_losses),
+            "win_rate":      round(_wr, 2),
+            "profit_factor": round(_pf, 2),
+            "net_pnl":       round(sum(t["pnl"] for t in trade_list), 2),
+            "gross_profit":  round(_gp, 2),
+            "gross_loss":    round(_gl, 2),
+        }
+
+    train_trades = [t for t in trades if _parse_ts(t.get("open_time") or t.get("entry_time")) < _split_ts_sec]
+    test_trades  = [t for t in trades if _parse_ts(t.get("open_time") or t.get("entry_time")) >= _split_ts_sec]
+
+    train_m = _split_metrics(train_trades)
+    test_m  = _split_metrics(test_trades)
+
+    # Low-sample warning: fewer than 30 test-period trades → stats unreliable
+    low_sample_warning = len(test_trades) < _MIN_MEANINGFUL
+    low_sample_msg = (
+        f"Only {len(test_trades)} trades in the test window "
+        f"(need ≥ {_MIN_MEANINGFUL} for reliable statistics). "
+        "Run a longer period or adjust the train/test split."
+    ) if low_sample_warning else None
 
     start_ts = candles[0][0]
     end_ts   = candles[-1][0]
@@ -3428,7 +3482,10 @@ def api_backtest():
     # ── Auto-learn: silently analyse recent runs and adjust config ────────────
     auto_learn = _auto_learn_silent(g.user_id)
 
+    split_date = _ts_to_str(int(_split_ts_ms))[:10]   # "YYYY-MM-DD"
+
     summary = {
+        # ── Full-run figures (backward-compat) ─────────────────────────
         "starting_balance": sb,
         "final_balance":    round(ending_balance, 2),
         "net_pnl":          round(net_pnl, 2),
@@ -3442,6 +3499,14 @@ def api_backtest():
         "actual_interval":  actual_interval,
         "candles_used":     len(candles),
         "trades_per_day":   round(total / days, 2),
+        # ── Out-of-sample validation ────────────────────────────────────
+        "train_pct":            train_pct,
+        "split_date":           split_date,
+        "train_summary":        train_m,
+        "test_summary":         test_m,
+        "low_sample_warning":   low_sample_warning,
+        "low_sample_msg":       low_sample_msg,
+        "random_window":        rand_window,
     }
 
     # Sample up to 400 candles for the chart (keep response size reasonable)
@@ -4537,18 +4602,15 @@ def _auto_learn_silent(user_id):
         all_patterns = win_analysis["patterns"] + loss_analysis["patterns"]
 
         if not merged_adj:
-            return {"applied": False, "adjustments": {}, "patterns": all_patterns}
+            return {"applied": False, "suggested": {}, "adjustments": {}, "patterns": all_patterns}
 
-        new_cfg = dict(cfg); new_cfg.update(merged_adj)
-        conn = get_conn(); cur = conn.cursor()
-        cur.execute("UPDATE users SET settings=%s WHERE id=%s",
-                    (json.dumps(new_cfg), user_id))
-        conn.commit(); conn.close()
-
+        # ── NEVER auto-apply. Return suggestions only. ─────────────────────────
+        # The user must call /api/apply-config explicitly to commit changes.
         return {
-            "applied":              True,
-            "adjustments_applied":  len(merged_adj),
-            "adjustments":          merged_adj,
+            "applied":              False,
+            "suggested":            merged_adj,   # suggested (not yet applied)
+            "adjustments":          {},            # nothing was applied
+            "adjustments_applied":  0,
             "patterns":             all_patterns,
         }
     except Exception as e:
@@ -4675,26 +4737,16 @@ def optimize_params():
     best    = results[0]
     top5    = results[:5]
 
-    # ── Apply best params to user config ─────────────────────────────────────
-    new_cfg = dict(cfg)
-    new_cfg.update(best["params"])
-    try:
-        conn = get_conn(); cur = conn.cursor()
-        cur.execute("UPDATE users SET settings=%s WHERE id=%s",
-                    (json.dumps(new_cfg), g.user_id))
-        conn.commit(); conn.close()
-        applied = True
-    except Exception as e:
-        print(f"[optimize] DB save error: {e}")
-        applied = False
-
+    # ── NEVER auto-apply. Return suggestion only. ────────────────────────────
+    # The user must call /api/apply-config with the suggested params to commit.
     return jsonify({
-        "ok":           True,
-        "combos_tested": len(results),
-        "best":         best,
-        "top5":         top5,
-        "applied":      applied,
-        "param_keys":   keys,
+        "ok":              True,
+        "combos_tested":   len(results),
+        "best":            best,
+        "top5":            top5,
+        "applied":         False,   # never auto-applied
+        "suggested_params": best["params"],
+        "param_keys":      keys,
     })
 
 
@@ -4710,7 +4762,7 @@ def learn_from_mistakes():
     """
     data       = request.get_json(force=True) or {}
     n_runs     = max(1, min(int(data.get("n_runs", 5)), 20))
-    auto_apply = bool(data.get("auto_apply", True))
+    auto_apply = False   # NEVER auto-apply; user must call /api/apply-config
     symbol     = data.get("symbol")
 
     # ── Pull recent backtest runs ──────────────────────────────────────
@@ -4884,6 +4936,243 @@ def learn_history():
             "win_rate_after":  r[10],
         })
     return jsonify(result)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# APPLY CONFIG  — explicit user action to apply suggested param changes
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.route("/api/apply-config", methods=["POST", "OPTIONS"])
+@auth_required
+def apply_config():
+    """
+    Apply suggested configuration changes to the user's bot settings.
+    This is the ONLY endpoint that writes config changes — auto-learn,
+    optimise, and learn-from-mistakes all return suggestions only and
+    require the user to call this endpoint explicitly.
+
+    Body: { "changes": { "confluence_min": 5, "risk_reward": 2.5, ... } }
+    """
+    try:
+        data    = request.get_json(force=True) or {}
+        changes = data.get("changes") or {}
+        if not isinstance(changes, dict) or not changes:
+            return jsonify({"error": "Provide a non-empty 'changes' dict."}), 400
+
+        cfg = get_user_config()
+        before = {k: cfg.get(k) for k in changes}
+        cfg.update(changes)
+
+        conn = get_conn(); cur = conn.cursor()
+        cur.execute("UPDATE users SET settings=%s WHERE id=%s",
+                    (json.dumps(cfg), g.user_id))
+        conn.commit(); conn.close()
+
+        return jsonify({
+            "ok":      True,
+            "applied": changes,
+            "before":  before,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WALK-FORWARD ANALYSIS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _wf_metrics(trades, sb):
+    """Compute summary metrics for a list of trades."""
+    if not trades:
+        return {"total_trades": 0, "wins": 0, "losses": 0,
+                "win_rate": 0.0, "profit_factor": 0.0, "net_pnl": 0.0}
+    wins   = [t for t in trades if float(t.get("pnl", 0) or 0) > 0]
+    losses = [t for t in trades if float(t.get("pnl", 0) or 0) <= 0]
+    gp = sum(float(t.get("pnl", 0) or 0) for t in wins)
+    gl = abs(sum(float(t.get("pnl", 0) or 0) for t in losses))
+    wr = len(wins) / len(trades) * 100 if trades else 0
+    pf = (gp / gl) if gl else (1.0 if gp > 0 else 0.0)
+    return {
+        "total_trades":  len(trades),
+        "wins":          len(wins),
+        "losses":        len(losses),
+        "win_rate":      round(wr, 2),
+        "profit_factor": round(pf, 2),
+        "net_pnl":       round(sum(float(t.get("pnl", 0) or 0) for t in trades), 2),
+    }
+
+
+@app.route("/api/walkforward", methods=["POST", "OPTIONS"])
+@auth_required
+def api_walkforward():
+    """
+    Walk-forward analysis.
+
+    Splits the full candle history into N equal windows.
+    For each window:
+      - In-sample (first train_pct of the window): grid-search best params.
+      - Out-of-sample (last 1-train_pct of the window): run strategy with
+        those best params and record honest OOS metrics.
+
+    Returns per-window OOS results + an aggregate so the user can assess
+    whether the edge is stable or curve-fitted to one period.
+
+    Body:
+      symbol, period_days (default 120, max 365), n_windows (2-6, default 4),
+      train_pct (default 0.70), starting_balance, fee_percent, slippage_percent
+    """
+    try:
+        data        = request.get_json(force=True) or {}
+        symbol      = (data.get("symbol") or "BTCUSDT").upper()
+        period_days = max(30, min(int(data.get("period_days", 120)), 365))
+        n_windows   = max(2, min(int(data.get("n_windows",   4)),   6))
+        train_pct   = max(0.50, min(float(data.get("train_pct", 0.70)), 0.90))
+        sb          = float(data.get("starting_balance", 10000))
+        fee_pct     = float(data.get("fee_percent",      0.04))
+        slip_pct    = float(data.get("slippage_percent", 0.02))
+
+        if symbol not in ALL_SYMBOLS:
+            return jsonify({"error": f"Symbol '{symbol}' not supported."}), 400
+
+        market = detect_market(symbol)
+
+        # ── Fetch all candles for the full period ─────────────────────────────
+        if market == "crypto":
+            end_dt   = datetime.now(timezone.utc)
+            start_dt = end_dt - timedelta(days=period_days)
+            start_ms = int(start_dt.timestamp() * 1000)
+            end_ms   = int(end_dt.timestamp()   * 1000)
+            all_candles = fetch_binance_range_paginated(
+                symbol, "5m", start_ms, end_ms,
+                max_candles=period_days * 288
+            )
+        else:
+            all_candles, _, _, _ = fetch_non_crypto_backtest_candles(
+                symbol, period_days, random_window=False
+            )
+
+        if not all_candles or len(all_candles) < n_windows * 60:
+            return jsonify({"error": f"Not enough candle data ({len(all_candles or [])} bars). "
+                                     f"Need at least {n_windows * 60}."}), 400
+
+        cfg = get_user_config()
+        _ww  = cfg.get("weekly_win_goal",             3)
+        _wpt = cfg.get("weekly_profit_target_percent", 3.0)
+        _wml = cfg.get("weekly_max_loss_percent",      0.8)
+
+        # ── Simplified grid for walk-forward (16 combos, keeps each window fast)
+        import itertools
+        WF_GRID = {
+            "confluence_min": [4, 5, 6, 7],
+            "risk_reward":    [1.5, 2.0, 2.5, 3.0],
+        }
+        wf_keys   = list(WF_GRID.keys())
+        wf_combos = list(itertools.product(*WF_GRID.values()))
+
+        # ── Split all_candles into n_windows equal chunks ─────────────────────
+        w_size  = len(all_candles) // n_windows
+        windows = [all_candles[i * w_size : (i + 1) * w_size] for i in range(n_windows)]
+
+        window_results = []
+        all_oos_trades = []
+        MIN_MEANINGFUL = 30
+
+        for wi, w_candles in enumerate(windows):
+            sp = int(len(w_candles) * train_pct)
+            sp = max(50, min(sp, len(w_candles) - 20))
+
+            train_c = w_candles[:sp]
+            test_c  = w_candles[sp:]
+
+            # ── Grid search on in-sample candles ──────────────────────────────
+            best_score  = -1
+            best_params = {k: cfg.get(k) for k in wf_keys}  # fallback to current
+
+            for combo in wf_combos:
+                trial = dict(cfg)
+                for k, v in zip(wf_keys, combo):
+                    trial[k] = v
+                try:
+                    tr, _ = run_unified_bot_strategy(
+                        train_c, sb, fee_pct, slip_pct,
+                        weekly_win_goal=_ww,
+                        weekly_profit_target_pct=_wpt,
+                        weekly_max_loss_pct=_wml,
+                        user_cfg=trial,
+                    )
+                    t_cnt = len(tr)
+                    _wins_tr = [t for t in tr if float(t.get("pnl",0)or 0)>0]
+                    _gl_tr   = abs(sum(float(t.get("pnl",0)or 0) for t in tr if float(t.get("pnl",0)or 0)<0))
+                    _gp_tr   = sum(float(t.get("pnl",0)or 0) for t in _wins_tr)
+                    _wr_tr   = len(_wins_tr)/t_cnt*100 if t_cnt else 0
+                    _pf_tr   = (_gp_tr / _gl_tr) if _gl_tr else 0
+                    score    = _grid_score(t_cnt, _wr_tr, _pf_tr)
+                    if score > best_score:
+                        best_score  = score
+                        best_params = {k: v for k, v in zip(wf_keys, combo)}
+                except Exception:
+                    continue
+
+            # ── Apply best params to OOS (test) candles ───────────────────────
+            oos_cfg = dict(cfg); oos_cfg.update(best_params)
+            try:
+                oos_trades, _ = run_unified_bot_strategy(
+                    test_c, sb, fee_pct, slip_pct,
+                    weekly_win_goal=_ww,
+                    weekly_profit_target_pct=_wpt,
+                    weekly_max_loss_pct=_wml,
+                    user_cfg=oos_cfg,
+                )
+            except Exception:
+                oos_trades = []
+
+            oos_m = _wf_metrics(oos_trades, sb)
+            oos_m["low_sample_warning"] = oos_m["total_trades"] < MIN_MEANINGFUL
+
+            # Human-readable window dates
+            try:
+                w_start = _ts_to_str(int(w_candles[0][0]))[:10]
+                w_split = _ts_to_str(int(train_c[-1][0]))[:10]
+                w_end   = _ts_to_str(int(w_candles[-1][0]))[:10]
+            except Exception:
+                w_start = w_split = w_end = "—"
+
+            all_oos_trades.extend(oos_trades)
+            window_results.append({
+                "window":         wi + 1,
+                "train_start":    w_start,
+                "train_end":      w_split,
+                "test_end":       w_end,
+                "best_is_params": best_params,
+                "is_score":       round(best_score, 4),
+                "oos":            oos_m,
+            })
+
+        # ── Aggregate OOS across all windows ──────────────────────────────────
+        agg = _wf_metrics(all_oos_trades, sb)
+        pos_pf_windows = sum(1 for r in window_results if r["oos"]["profit_factor"] > 1.0)
+        agg["windows_profitable"]   = pos_pf_windows
+        agg["windows_total"]        = n_windows
+        agg["consistency_pct"]      = round(pos_pf_windows / n_windows * 100, 1)
+        agg["low_sample_warning"]   = agg["total_trades"] < MIN_MEANINGFUL * n_windows
+
+        verdict = "STABLE" if pos_pf_windows >= n_windows * 0.75 else \
+                  "MIXED"  if pos_pf_windows >= n_windows * 0.50 else "UNSTABLE"
+        agg["verdict"] = verdict
+
+        return jsonify({
+            "ok":           True,
+            "symbol":       symbol,
+            "period_days":  period_days,
+            "n_windows":    n_windows,
+            "train_pct":    train_pct,
+            "windows":      window_results,
+            "aggregate":    agg,
+        })
+
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "detail": traceback.format_exc()[-400:]}), 500
 
 
 # ── Global error handlers — always return JSON, never HTML ───────────────────
