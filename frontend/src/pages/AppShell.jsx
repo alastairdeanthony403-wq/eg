@@ -1,16 +1,17 @@
 // force redeploy
 import { NavLink, Outlet, useNavigate } from "react-router-dom";
 import { useAuth } from "@/lib/auth";
-import { LayoutDashboard, Settings, BookOpen, FlaskConical, LogOut, TrendingUp, Activity } from "lucide-react";
+import { LayoutDashboard, Settings, BookOpen, FlaskConical, LogOut, TrendingUp, Activity, Layers } from "lucide-react";
 
 export default function AppShell() {
   const { user, logout } = useAuth();
   const nav = useNavigate();
   const items = [
-    { to: "/dashboard", label: "Signals", icon: <LayoutDashboard size={17} /> },
-    { to: "/backtester", label: "Backtester", icon: <FlaskConical size={17} /> },
-    { to: "/journal", label: "Journal", icon: <BookOpen size={17} /> },
-    { to: "/settings", label: "Strategy", icon: <Settings size={17} /> },
+    { to: "/dashboard",  label: "Signals",      icon: <LayoutDashboard size={17} /> },
+    { to: "/backtester", label: "Backtester",   icon: <FlaskConical size={17} /> },
+    { to: "/paper",      label: "Paper Trading", icon: <Layers size={17} /> },
+    { to: "/journal",    label: "Journal",       icon: <BookOpen size={17} /> },
+    { to: "/settings",   label: "Strategy",      icon: <Settings size={17} /> },
   ];
 
   return (
