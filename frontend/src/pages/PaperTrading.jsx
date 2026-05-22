@@ -44,12 +44,19 @@ const fmtPnl = (n)       => n == null ? "—" : (n >= 0 ? "+" : "") + fmt(n, 2);
 const fmtPct = (n)       => n == null ? "—" : fmt(n, 1) + "%";
 const sigColor = (s)     => s === "BUY" ? T.green : s === "SELL" ? T.red : T.t2;
 
-const ALL_WATCHLIST = [
-  "BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT",
-  "EURUSD","GBPUSD","USDJPY",
-  "AAPL","TSLA","NVDA","SPY",
-  "XAUUSD",
-];
+const ALL_WATCHLIST = {
+  crypto:      ["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT",
+                "XRPUSDT","ADAUSDT","AVAXUSDT","DOGEUSDT",
+                "DOTUSDT","LINKUSDT","LTCUSDT","UNIUSDT",
+                "ATOMUSDT","NEARUSDT","APTUSDT","ARBUSDT"],
+  forex:       ["EURUSD","GBPUSD","USDJPY","AUDUSD","USDCAD",
+                "NZDUSD","USDCHF","EURGBP","EURJPY","GBPJPY",
+                "AUDCAD","AUDJPY","CADJPY","CHFJPY"],
+  stocks:      ["AAPL","TSLA","NVDA","MSFT","AMZN","SPY",
+                "GOOGL","META","NFLX","AMD","QQQ","JPM","BAC","V","MA"],
+  commodities: ["XAUUSD","XAGUSD","USOIL","UKOIL","NATGAS","COPPER"],
+};
+const ALL_WATCHLIST_FLAT = Object.values(ALL_WATCHLIST).flat();
 
 // ── MAIN COMPONENT ─────────────────────────────────────────────────────────────
 export default function PaperTrading() {
@@ -80,9 +87,19 @@ export default function PaperTrading() {
   const [notice,     setNotice]     = useState(null);
   const [activeTab,  setActiveTab]  = useState("positions");
 
+  // Chart tab
+  const [chartSym,     setChartSym]     = useState("BTCUSDT");
+  const [chartCandles, setChartCandles] = useState([]);
+  const [chartLoading, setChartLoading] = useState(false);
+
   const pollRef = useRef(null);
   const botRef  = useRef(botActive);
   botRef.current = botActive;
+
+  // Load chart when tab opens or symbol changes
+  React.useEffect(() => {
+    if (activeTab === "chart") loadChart(chartSym);
+  }, [activeTab, chartSym, loadChart]);
 
   // ── Loaders ───────────────────────────────────────────────────────────────
   const loadSummary = useCallback(async () => {
@@ -119,6 +136,18 @@ export default function PaperTrading() {
       const d = await apiFetch("/api/alerts");
       setAlerts(Array.isArray(d) ? d.slice(0, 30) : []);
     } catch {}
+  }, []);
+
+  const loadChart = useCallback(async (sym) => {
+    setChartLoading(true);
+    try {
+      const d = await apiFetch(`/api/candles?symbol=${sym}&interval=5m&limit=400`);
+      setChartCandles(d.candles || []);
+    } catch {
+      setChartCandles([]);
+    } finally {
+      setChartLoading(false);
+    }
   }, []);
 
   const refreshAll = useCallback(async () => {
@@ -347,7 +376,11 @@ export default function PaperTrading() {
               <select value={manualSym} onChange={e=>setManualSym(e.target.value)}
                 style={{flex:2,background:T.bg2,border:`1px solid ${T.border}`,color:T.text,
                   borderRadius:4,padding:"8px 10px",fontFamily:MONO,fontSize:11,outline:"none"}}>
-                {ALL_WATCHLIST.map(s=><option key={s} value={s}>{s}</option>)}
+                {Object.entries(ALL_WATCHLIST).map(([grp, syms]) => (
+                  <optgroup key={grp} label={grp.charAt(0).toUpperCase()+grp.slice(1)}>
+                    {syms.map(s=><option key={s} value={s}>{s}</option>)}
+                  </optgroup>
+                ))}
               </select>
               <button onClick={()=>setManualSide("BUY")}
                 style={{flex:1,background:manualSide==="BUY"?`${T.green}22`:"transparent",
@@ -382,7 +415,7 @@ export default function PaperTrading() {
           <div>
             {/* Tab bar */}
             <div style={{display:"flex",gap:0,borderBottom:`1px solid ${T.border}`,marginBottom:0}}>
-              {["positions","history"].map(t=>(
+              {["positions","history","chart"].map(t=>(
                 <button key={t} onClick={()=>setActiveTab(t)}
                   style={{padding:"9px 18px",background:"none",border:"none",
                     borderBottom:`2px solid ${activeTab===t?T.blue:"transparent"}`,
@@ -417,7 +450,7 @@ export default function PaperTrading() {
                     <table style={{width:"100%",borderCollapse:"collapse",fontFamily:MONO,fontSize:10}}>
                       <thead>
                         <tr>
-                          {["SYMBOL","SIDE","ENTRY","EXIT","P&L","TIME"].map(h=>(
+                          {["SYMBOL","SIDE","ENTRY","EXIT","P&L","SL","TP","TIME"].map(h=>(
                             <th key={h} style={{padding:"9px 12px",textAlign:"left",fontFamily:MONO,
                               fontSize:8,color:T.t2,borderBottom:`1px solid ${T.border}`,
                               background:T.bg2,letterSpacing:1}}>{h}</th>
@@ -438,6 +471,8 @@ export default function PaperTrading() {
                               color:(t.pnl||0)>=0?T.green:T.red}}>
                               {fmtPnl(t.pnl)}
                             </td>
+                            <td style={{padding:"8px 12px",color:T.red,fontSize:10}}>{fmt(t.sl,6)}</td>
+                            <td style={{padding:"8px 12px",color:T.green,fontSize:10}}>{fmt(t.tp,6)}</td>
                             <td style={{padding:"8px 12px",color:T.t2,fontSize:9}}>
                               {String(t.time||"").slice(0,16)}
                             </td>
@@ -446,6 +481,24 @@ export default function PaperTrading() {
                       </tbody>
                     </table>
                   </div>
+            )}
+
+            {activeTab==="chart"&&(
+              <PaperChart
+                candles={chartCandles}
+                trades={[
+                  ...closed.filter(t=>t.symbol===chartSym),
+                  ...positions.filter(p=>p.symbol===chartSym).map(p=>({
+                    ...p, exit: p.current_price, pnl: p.pnl,
+                    close_time: null, open_time: p.time,
+                    status: "OPEN",
+                  })),
+                ]}
+                symbol={chartSym}
+                loading={chartLoading}
+                allSymbols={ALL_WATCHLIST}
+                onSymbolChange={sym => setChartSym(sym)}
+              />
             )}
           </div>
 
@@ -724,5 +777,343 @@ function Spinner({ c }) {
     <div style={{width:11,height:11,border:`2px solid ${T.t2}33`,
       borderTop:`2px solid ${c||T.blue}`,borderRadius:"50%",
       animation:"spin 1s linear infinite",display:"inline-block"}}/>
+  );
+}
+
+// ── PAPER TRADING CHART ───────────────────────────────────────────────────────
+function parsePaperTime(str) {
+  if (!str) return 0;
+  const d = new Date(str.replace(" ", "T") + (str.length <= 16 ? ":00Z" : "Z"));
+  return isNaN(d.getTime()) ? 0 : d.getTime();
+}
+
+function PaperChart({ candles, trades, symbol, loading, allSymbols, onSymbolChange }) {
+  const [hovered,       setHovered]       = React.useState(null);
+  const [annotationsOn, setAnnotationsOn] = React.useState(true);
+
+  // ── Symbol selector header ──────────────────────────────────────────────
+  const header = (
+    <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:12,flexWrap:"wrap"}}>
+      <span style={{fontFamily:MONO,fontSize:10,color:T.blue,letterSpacing:2}}>
+        TRADES CHART
+      </span>
+      <select value={symbol}
+        onChange={e => onSymbolChange(e.target.value)}
+        style={{background:T.bg2,border:`1px solid ${T.border}`,color:T.text,
+          borderRadius:3,padding:"4px 8px",fontFamily:MONO,fontSize:10,outline:"none"}}>
+        {Object.entries(allSymbols).map(([grp,syms])=>(
+          <optgroup key={grp} label={grp.charAt(0).toUpperCase()+grp.slice(1)}>
+            {syms.map(s=><option key={s} value={s}>{s}</option>)}
+          </optgroup>
+        ))}
+      </select>
+      {candles.length > 0 && (
+        <span style={{fontFamily:MONO,fontSize:9,color:T.t2}}>
+          {candles.length} candles · 5m
+        </span>
+      )}
+      <div style={{marginLeft:"auto",display:"flex",gap:10,alignItems:"center",flexWrap:"wrap"}}>
+        <span style={{fontFamily:MONO,fontSize:9,color:T.green}}>▲ BUY entry</span>
+        <span style={{fontFamily:MONO,fontSize:9,color:T.red}}>▼ SELL entry</span>
+        <span style={{fontFamily:MONO,fontSize:9,color:T.green}}>◆ win</span>
+        <span style={{fontFamily:MONO,fontSize:9,color:T.red}}>◆ loss</span>
+        <button onClick={()=>setAnnotationsOn(a=>!a)}
+          style={{fontFamily:MONO,fontSize:9,letterSpacing:1,
+            background:annotationsOn?`${T.gold}22`:T.bg2,
+            border:`1px solid ${annotationsOn?T.gold:T.border}`,
+            color:annotationsOn?T.gold:T.t2,
+            borderRadius:3,padding:"3px 10px",cursor:"pointer"}}>
+          {annotationsOn?"HIDE ANNOTATIONS":"SHOW ANNOTATIONS"}
+        </button>
+      </div>
+    </div>
+  );
+
+  if (loading) return (
+    <div style={{background:T.bg3,border:`1px solid ${T.border}`,borderRadius:6,padding:16}}>
+      {header}
+      <div style={{height:300,display:"flex",alignItems:"center",justifyContent:"center",
+        color:T.t2,fontFamily:MONO,fontSize:11,gap:10}}>
+        <Spinner c={T.blue}/> Loading candles…
+      </div>
+    </div>
+  );
+
+  if (!candles?.length) return (
+    <div style={{background:T.bg3,border:`1px solid ${T.border}`,borderRadius:6,padding:16}}>
+      {header}
+      <div style={{height:260,display:"flex",alignItems:"center",justifyContent:"center",
+        color:T.t2,fontFamily:MONO,fontSize:12}}>
+        No chart data available for {symbol}. Select another symbol or try again.
+      </div>
+    </div>
+  );
+
+  // ── Map trades to chart coordinates ────────────────────────────────────
+  const tradeMarkers = trades.map((t, i) => {
+    const tEntry = parsePaperTime(t.time || t.open_time);
+    const tExit  = parsePaperTime(t.close_time || t.time);
+    const win    = (t.pnl || 0) > 0;
+    return {
+      id: i, tEntry, tExit,
+      entry: t.entry, exit: t.exit,
+      sl: t.sl, tp: t.tp,
+      side: t.side, pnl: t.pnl, win,
+      status: t.status || "CLOSED",
+      reason: t.exit_reason || (t.status === "OPEN" ? "OPEN" : "—"),
+    };
+  });
+
+  const minT  = candles[0]?.t || 0;
+  const maxT  = candles[candles.length - 1]?.t || 1;
+  const tSpan = maxT - minT || 1;
+
+  const allPrices = candles.flatMap(c => [c.h, c.l]);
+  tradeMarkers.forEach(m => {
+    if (m.sl)    allPrices.push(m.sl);
+    if (m.tp)    allPrices.push(m.tp);
+    if (m.entry) allPrices.push(m.entry);
+    if (m.exit)  allPrices.push(m.exit);
+  });
+  const minP  = Math.min(...allPrices) * 0.9994;
+  const maxP  = Math.max(...allPrices) * 1.0006;
+  const pSpan = maxP - minP || 1;
+
+  const W = 900; const H = 380;
+  const PAD = { top: 20, right: 24, bottom: 36, left: 76 };
+  const cW = W - PAD.left - PAD.right;
+  const cH = H - PAD.top  - PAD.bottom;
+
+  const tx = t => PAD.left + ((t - minT) / tSpan) * cW;
+  const ty = p => PAD.top  + cH - ((p - minP) / pSpan) * cH;
+
+  const spacing  = cW / candles.length;
+  const bodyW    = Math.max(1, spacing * 0.7);
+  const halfBody = bodyW / 2;
+
+  const yTicks = 6;
+  const yTickVals = Array.from({length: yTicks}, (_, i) => minP + (pSpan * i / (yTicks - 1)));
+
+  const xTickStep = Math.max(1, Math.floor(candles.length / 6));
+  const xTicks    = candles.filter((_, i) => i % xTickStep === 0);
+
+  const fmtLbl = v => v >= 1000
+    ? v.toLocaleString("en", {maximumFractionDigits: 0})
+    : v < 0.01 ? v.toExponential(2)
+    : v.toFixed(v < 1 ? 5 : 2);
+
+  const inBounds = x => x >= PAD.left && x <= PAD.left + cW;
+
+  return (
+    <div style={{background:T.bg3,border:`1px solid ${T.border}`,borderRadius:6,
+      padding:"16px 10px 10px"}}>
+      {header}
+
+      <div style={{width:"100%",overflowX:"auto"}}>
+        <svg width="100%" viewBox={`0 0 ${W} ${H}`} style={{display:"block",minWidth:420}}>
+          <defs>
+            <clipPath id="paperClip">
+              <rect x={PAD.left} y={PAD.top} width={cW} height={cH}/>
+            </clipPath>
+          </defs>
+
+          {/* Plot area background */}
+          <rect x={PAD.left} y={PAD.top} width={cW} height={cH} fill={T.bg2} rx="3"/>
+
+          {/* Y grid + labels */}
+          {yTickVals.map((v, i) => {
+            const yy = ty(v);
+            return (
+              <g key={i}>
+                <line x1={PAD.left} y1={yy} x2={PAD.left+cW} y2={yy}
+                  stroke={T.border} strokeDasharray="3 3" strokeWidth="0.5"/>
+                <text x={PAD.left-5} y={yy+4} textAnchor="end"
+                  fill={T.t2} fontSize="9" fontFamily={MONO}>{fmtLbl(v)}</text>
+              </g>
+            );
+          })}
+
+          {/* X labels */}
+          {xTicks.map((c, i) => (
+            <text key={i} x={tx(c.t)} y={H-PAD.bottom+14} textAnchor="middle"
+              fill={T.t2} fontSize="9" fontFamily={MONO}>
+              {new Date(c.t).toLocaleString("en-GB",{month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"})}
+            </text>
+          ))}
+
+          {/* ── OHLC Candlesticks ── */}
+          <g clipPath="url(#paperClip)">
+            {candles.map((c, i) => {
+              const x   = PAD.left + (i / (candles.length - 1 || 1)) * cW;
+              const yo  = ty(c.o); const yc = ty(c.c);
+              const yh  = ty(c.h); const yl = ty(c.l);
+              const bull = c.c >= c.o;
+              const col  = bull ? T.green : T.red;
+              const bTop = Math.min(yo, yc);
+              const bHt  = Math.max(Math.abs(yo - yc), 1);
+              return (
+                <g key={i}>
+                  <line x1={x} y1={yh} x2={x} y2={yl}
+                    stroke={col} strokeWidth="0.7" strokeOpacity="0.6"/>
+                  <rect x={x-halfBody} y={bTop} width={bodyW} height={bHt}
+                    fill={bull?`${T.green}80`:`${T.red}80`}
+                    stroke={col} strokeWidth="0.4"/>
+                </g>
+              );
+            })}
+          </g>
+
+          {/* ── Annotation overlays (SL/TP zone rectangles) ── */}
+          {annotationsOn && (
+            <g clipPath="url(#paperClip)">
+              {tradeMarkers.filter(m => m.sl && m.tp && m.tEntry).map(m => {
+                const x1 = tx(m.tEntry);
+                const x2 = m.tExit && m.tExit > m.tEntry
+                  ? Math.min(tx(m.tExit), PAD.left + cW)
+                  : PAD.left + cW;
+                const yEntry = ty(m.entry);
+                const ySL    = ty(m.sl);
+                const yTP    = ty(m.tp);
+                const col    = m.status === "OPEN" ? T.blue : (m.win ? T.green : T.red);
+                const rectTop    = Math.min(ySL, yTP);
+                const rectH      = Math.max(Math.abs(ySL - yTP), 2);
+                return (
+                  <g key={m.id}>
+                    {/* SL–TP zone */}
+                    <rect x={x1} y={rectTop} width={Math.max(x2-x1,2)} height={rectH}
+                      fill={`${col}0C`} stroke={`${col}28`} strokeWidth="0.5"
+                      strokeDasharray="3 2"/>
+                    {/* Entry line */}
+                    <line x1={x1} y1={yEntry} x2={x2} y2={yEntry}
+                      stroke={m.side==="BUY"?T.green:T.red}
+                      strokeWidth="1.2" strokeDasharray="5 3"/>
+                    {/* SL line */}
+                    <line x1={x1} y1={ySL} x2={x2} y2={ySL}
+                      stroke={T.red} strokeWidth="0.8" strokeDasharray="3 3" strokeOpacity="0.7"/>
+                    {/* TP line */}
+                    <line x1={x1} y1={yTP} x2={x2} y2={yTP}
+                      stroke={T.green} strokeWidth="0.8" strokeDasharray="3 3" strokeOpacity="0.7"/>
+                    {/* SL/TP labels */}
+                    <text x={Math.min(x2+2, PAD.left+cW-14)} y={ySL+3}
+                      fill={T.red} fontSize="7" fontFamily={MONO}>SL</text>
+                    <text x={Math.min(x2+2, PAD.left+cW-14)} y={yTP+3}
+                      fill={T.green} fontSize="7" fontFamily={MONO}>TP</text>
+                    {/* Status badge */}
+                    {m.status==="OPEN" && (
+                      <text x={x1+3} y={PAD.top+10}
+                        fill={T.blue} fontSize="7" fontFamily={MONO} fontWeight="bold">OPEN</text>
+                    )}
+                  </g>
+                );
+              })}
+            </g>
+          )}
+
+          {/* ── Entry/exit markers ── */}
+          <g clipPath="url(#paperClip)">
+            {tradeMarkers.map(m => {
+              const xe  = tx(m.tEntry);
+              const xx  = m.tExit && m.tExit > m.tEntry ? tx(m.tExit) : null;
+              const ye  = ty(m.entry);
+              const yx  = xx ? ty(m.exit || m.entry) : null;
+              const isBuy  = m.side === "BUY";
+              const eColor = isBuy ? T.green : T.red;
+              const xColor = m.win  ? T.green : T.red;
+              return (
+                <g key={m.id}>
+                  {/* Connector line */}
+                  {inBounds(xe) && xx && inBounds(xx) && (
+                    <line x1={xe} y1={ye} x2={xx} y2={yx}
+                      stroke={xColor} strokeWidth="0.8" strokeDasharray="4 2" strokeOpacity="0.5"/>
+                  )}
+                  {/* Entry vertical tick */}
+                  {inBounds(xe) && (
+                    <line x1={xe} y1={PAD.top} x2={xe} y2={PAD.top+cH}
+                      stroke={eColor} strokeWidth="0.8" strokeOpacity="0.2"/>
+                  )}
+                  {/* Entry triangle */}
+                  {inBounds(xe) && (
+                    <polygon
+                      points={isBuy
+                        ? `${xe},${ye-10} ${xe-6},${ye+2} ${xe+6},${ye+2}`
+                        : `${xe},${ye+10} ${xe-6},${ye-2} ${xe+6},${ye-2}`}
+                      fill={eColor} opacity="0.9" style={{cursor:"pointer"}}
+                      onMouseEnter={()=>setHovered({...m, kind:"entry", x:xe, y:ye})}
+                      onMouseLeave={()=>setHovered(null)}
+                    />
+                  )}
+                  {/* Exit diamond */}
+                  {xx && inBounds(xx) && (
+                    <polygon
+                      points={`${xx},${yx-7} ${xx+7},${yx} ${xx},${yx+7} ${xx-7},${yx}`}
+                      fill={xColor} opacity="0.85" style={{cursor:"pointer"}}
+                      onMouseEnter={()=>setHovered({...m, kind:"exit", x:xx, y:yx})}
+                      onMouseLeave={()=>setHovered(null)}
+                    />
+                  )}
+                </g>
+              );
+            })}
+          </g>
+
+          {/* Hover tooltip */}
+          {hovered && (() => {
+            const bx = Math.min(hovered.x + 12, W - 170);
+            const by = Math.max(hovered.y - 64, PAD.top + 4);
+            const isEntry = hovered.kind === "entry";
+            const lines = isEntry
+              ? [`${hovered.side} ENTRY @ ${fmtLbl(hovered.entry)}`,
+                 `SL: ${hovered.sl ? fmtLbl(hovered.sl) : "—"}`,
+                 `TP: ${hovered.tp ? fmtLbl(hovered.tp) : "—"}`,
+                 `P&L: ${hovered.pnl != null ? fmtPnl(hovered.pnl) : "open"}`,
+                 `Status: ${hovered.status}`]
+              : [`EXIT @ ${fmtLbl(hovered.exit || hovered.entry)}`,
+                 `Reason: ${hovered.reason}`,
+                 `P&L: ${fmtPnl(hovered.pnl)}`];
+            return (
+              <g>
+                <rect x={bx} y={by} width="165" height={lines.length*16+12}
+                  rx="3" fill={T.bg2} stroke={T.border} strokeWidth="1"/>
+                {lines.map((l,i)=>(
+                  <text key={i} x={bx+8} y={by+16+i*16}
+                    fill={i===3?(hovered.pnl>0?T.green:T.red):T.text}
+                    fontSize="10" fontFamily={MONO}>{l}</text>
+                ))}
+              </g>
+            );
+          })()}
+
+          {/* Axes */}
+          <line x1={PAD.left} y1={PAD.top} x2={PAD.left} y2={PAD.top+cH}
+            stroke={T.border} strokeWidth="1"/>
+          <line x1={PAD.left} y1={PAD.top+cH} x2={PAD.left+cW} y2={PAD.top+cH}
+            stroke={T.border} strokeWidth="1"/>
+        </svg>
+      </div>
+
+      {/* Trade P&L strip */}
+      {trades.length > 0 ? (
+        <div style={{display:"flex",gap:6,flexWrap:"wrap",padding:"10px 4px 0",
+          borderTop:`1px solid ${T.border}`,marginTop:8}}>
+          {trades.map((t,i)=>(
+            <div key={i}
+              title={`${t.side} ${t.symbol} @ ${fmtLbl(t.entry)} → ${fmtPnl(t.pnl)}`}
+              style={{background:(t.pnl||0)>0?`${T.green}18`:`${T.red}18`,
+                border:`1px solid ${(t.pnl||0)>0?T.green:T.red}44`,
+                borderRadius:3,padding:"3px 8px",
+                fontFamily:MONO,fontSize:9,
+                color:(t.pnl||0)>0?T.green:T.red,cursor:"default",whiteSpace:"nowrap"}}>
+              {t.side==="BUY"?"▲":"▼"} {fmtPnl(t.pnl)}
+              {t.status==="OPEN"&&<span style={{color:T.blue,marginLeft:4}}>●</span>}
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div style={{textAlign:"center",padding:"14px 0 4px",color:T.t2,
+          fontFamily:MONO,fontSize:11}}>
+          No trades for {symbol} yet. Open a trade to see markers here.
+        </div>
+      )}
+    </div>
   );
 }

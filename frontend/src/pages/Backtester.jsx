@@ -242,16 +242,26 @@ export default function Backtester() {
           <Field label="SYMBOL">
             <select value={symbol} onChange={e=>setSymbol(e.target.value)} style={selStyle}>
               <optgroup label="Crypto">
-                {["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT"].map(s=><option key={s} value={s}>{s}</option>)}
+                {["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT",
+                  "XRPUSDT","ADAUSDT","AVAXUSDT","DOGEUSDT",
+                  "DOTUSDT","LINKUSDT","LTCUSDT","UNIUSDT",
+                  "ATOMUSDT","NEARUSDT","APTUSDT","ARBUSDT",
+                ].map(s=><option key={s} value={s}>{s}</option>)}
               </optgroup>
               <optgroup label="Forex">
-                {["EURUSD","GBPUSD","USDJPY","AUDUSD","USDCAD"].map(s=><option key={s} value={s}>{s}</option>)}
+                {["EURUSD","GBPUSD","USDJPY","AUDUSD","USDCAD",
+                  "NZDUSD","USDCHF","EURGBP","EURJPY","GBPJPY",
+                  "AUDCAD","AUDJPY","CADJPY","CHFJPY",
+                ].map(s=><option key={s} value={s}>{s}</option>)}
               </optgroup>
-              <optgroup label="Stocks">
-                {["AAPL","TSLA","NVDA","MSFT","AMZN","SPY"].map(s=><option key={s} value={s}>{s}</option>)}
+              <optgroup label="Stocks &amp; ETFs">
+                {["AAPL","TSLA","NVDA","MSFT","AMZN","SPY",
+                  "GOOGL","META","NFLX","AMD","QQQ",
+                  "JPM","BAC","V","MA",
+                ].map(s=><option key={s} value={s}>{s}</option>)}
               </optgroup>
               <optgroup label="Commodities">
-                {["XAUUSD","XAGUSD","USOIL","UKOIL"].map(s=><option key={s} value={s}>{s}</option>)}
+                {["XAUUSD","XAGUSD","USOIL","UKOIL","NATGAS","COPPER"].map(s=><option key={s} value={s}>{s}</option>)}
               </optgroup>
             </select>
           </Field>

@@ -73,10 +73,23 @@ CORS(app, resources={r"/api/*": {"origins": "*"}}, supports_credentials=True)
 # SYMBOLS & MARKETS
 # ─────────────────────────────────────────────
 MARKETS = {
-    "crypto":      ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"],
-    "forex":       ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD"],
-    "stocks":      ["AAPL", "TSLA", "NVDA", "MSFT", "AMZN", "SPY"],
-    "commodities": ["XAUUSD", "XAGUSD", "USOIL", "UKOIL"],
+    "crypto": [
+        "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT",
+        "XRPUSDT", "ADAUSDT", "AVAXUSDT", "DOGEUSDT",
+        "DOTUSDT", "LINKUSDT", "LTCUSDT", "UNIUSDT",
+        "ATOMUSDT", "NEARUSDT", "APTUSDT", "ARBUSDT",
+    ],
+    "forex": [
+        "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD",
+        "NZDUSD", "USDCHF", "EURGBP", "EURJPY", "GBPJPY",
+        "AUDCAD", "AUDJPY", "CADJPY", "CHFJPY",
+    ],
+    "stocks": [
+        "AAPL", "TSLA", "NVDA", "MSFT", "AMZN", "SPY",
+        "GOOGL", "META", "NFLX", "AMD", "QQQ",
+        "JPM", "BAC", "V", "MA",
+    ],
+    "commodities": ["XAUUSD", "XAGUSD", "USOIL", "UKOIL", "NATGAS", "COPPER"],
 }
 
 ALL_SYMBOLS = (
@@ -87,14 +100,23 @@ ALL_SYMBOLS = (
 )
 
 POLYGON_SYMBOL_MAP = {
+    # Forex
     "EURUSD": "C:EURUSD", "GBPUSD": "C:GBPUSD", "USDJPY": "C:USDJPY",
-    "AUDUSD": "C:AUDUSD", "USDCAD": "C:USDCAD",
-    "XAUUSD": "C:XAUUSD",
-    "XAGUSD": "C:XAGUSD",
-    "USOIL":  "USO",
-    "UKOIL":  "BNO",
+    "AUDUSD": "C:AUDUSD", "USDCAD": "C:USDCAD", "NZDUSD": "C:NZDUSD",
+    "USDCHF": "C:USDCHF", "EURGBP": "C:EURGBP", "EURJPY": "C:EURJPY",
+    "GBPJPY": "C:GBPJPY", "AUDCAD": "C:AUDCAD", "AUDJPY": "C:AUDJPY",
+    "CADJPY": "C:CADJPY", "CHFJPY": "C:CHFJPY",
+    # Commodities
+    "XAUUSD": "C:XAUUSD", "XAGUSD": "C:XAGUSD",
+    "USOIL":  "USO",      "UKOIL":  "BNO",
+    "NATGAS": "UNG",      "COPPER": "COPX",
+    # Stocks & ETFs
     "AAPL": "AAPL", "TSLA": "TSLA", "NVDA": "NVDA",
     "MSFT": "MSFT", "AMZN": "AMZN", "SPY":  "SPY",
+    "GOOGL": "GOOGL", "META": "META", "NFLX": "NFLX",
+    "AMD":   "AMD",   "QQQ":  "QQQ",
+    "JPM":   "JPM",   "BAC":  "BAC",
+    "V":     "V",     "MA":   "MA",
 }
 
 POLYGON_INTERVAL_MAP = {
@@ -3904,6 +3926,46 @@ def paper_reset():
     AUTO_PAPER_TRADING[g.user_id] = False
     add_alert(g.user_id, "Paper account reset — all trades cleared")
     return jsonify({"ok": True})
+
+
+# ─────────────────────────────────────────────
+# LIVE CANDLE DATA (for frontend charts)
+# ─────────────────────────────────────────────
+
+@app.route("/api/candles", methods=["GET"])
+@auth_required
+def api_candles():
+    """
+    Return recent OHLC candles for a symbol in {t,o,h,l,c} format.
+    Used by the Paper Trading chart and any other live chart widget.
+    Query params: symbol, interval (default 5m), limit (default 300, max 1000)
+    """
+    try:
+        symbol   = (request.args.get("symbol") or "BTCUSDT").upper().strip()
+        interval = request.args.get("interval", "5m")
+        limit    = max(10, min(int(request.args.get("limit", 300)), 1000))
+
+        df = fetch_df_for_symbol(symbol, interval, limit)
+        if df is None:
+            return jsonify({"error": f"No market data available for {symbol}"}), 404
+
+        candles = [
+            {
+                "t": int(row["timestamp"]),
+                "o": float(row["open"]),
+                "h": float(row["high"]),
+                "l": float(row["low"]),
+                "c": float(row["close"]),
+            }
+            for _, row in df.iterrows()
+        ]
+        return jsonify({
+            "symbol":   symbol,
+            "interval": interval,
+            "candles":  candles,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 # ─────────────────────────────────────────────
