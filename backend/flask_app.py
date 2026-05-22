@@ -3236,6 +3236,247 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
 
 
 # ─────────────────────────────────────────────
+# LEAN CONFLUENCE STRATEGY
+# ─────────────────────────────────────────────
+def run_lean_confluence_strategy(
+    candles,
+    starting_balance=1000,
+    fee_pct=0.04,
+    slippage_pct=0.02,
+    weekly_win_goal=3,
+    weekly_profit_target_pct=3.0,
+    weekly_max_loss_pct=0.8,
+    spread_pct=0.0,
+):
+    """
+    Lean 3-Signal Confluence Strategy — defensible, low parameter count.
+
+    All four conditions must be true before entry:
+      A. EMA trend stack : e9 > e21 > e50 (BUY) / e9 < e21 < e50 (SELL)
+      B. ADX >= 20       : confirms trend strength (direction-agnostic)
+      C. ATR >= 105% avg : market is active, not drifting sideways
+      D. RSI < 68 / > 32 : avoids chasing exhausted moves
+
+    Fixed execution parameters (no dynamic scaling):
+      R:R  = 2.0
+      Risk = 1.0% of balance per trade
+      SL   = 1.5 × ATR(14) from entry
+      TP   = entry ± SL_dist × 2.0
+
+    Realism features (same as unified bot):
+      - Volatility-scaled slippage via _vol_slippage()
+      - Per-market spread via spread_pct
+      - Pessimistic intrabar: if SL and TP both touched on the same bar, SL wins
+      - Weekly win / profit / loss limits
+      - No trailing stop (keeps parameter count minimal)
+    """
+    # ── Constants ────────────────────────────────────────────────────────────
+    WARMUP          = 60      # EMA50(50) + ATR(14) + ADX(14) + 20-bar avg → 60 bars
+    RR              = 2.0
+    RISK_PCT        = 0.01    # 1% per trade — fixed, not optimised
+    ATR_MULT        = 1.5     # SL distance = ATR × 1.5
+    ATR_EXP_RATIO   = 1.05    # ATR must be ≥ 105% of its 20-bar rolling average
+    ADX_MIN         = 20
+    RSI_MAX_BUY     = 68      # BUY blocked when RSI ≥ 68 (overbought guard)
+    RSI_MIN_SELL    = 32      # SELL blocked when RSI ≤ 32 (oversold guard)
+    MAX_WINS_DAY    = 2
+    MAX_LOSS_DAY    = 2
+
+    trades      = []
+    balance     = float(starting_balance)
+    fee_rate    = fee_pct      / 100
+    slip_rate   = slippage_pct / 100
+    spread_rate = spread_pct   / 100
+
+    if not candles or len(candles) < WARMUP + 10:
+        return trades, balance
+
+    def _lc_date(ts):
+        return datetime.utcfromtimestamp(int(ts) / 1000).strftime("%Y-%m-%d")
+
+    def _lc_str(ts):
+        return datetime.utcfromtimestamp(int(ts) / 1000).strftime("%Y-%m-%d %H:%M")
+
+    closes  = [float(c[4]) for c in candles]
+    highs   = [float(c[2]) for c in candles]
+    lows    = [float(c[3]) for c in candles]
+
+    # ── Indicators ───────────────────────────────────────────────────────────
+    ema9_s  = _ema_series(closes, 9)
+    ema21_s = _ema_series(closes, 21)
+    ema50_s = _ema_series(closes, 50)
+    atr_s   = _atr_series(highs, lows, closes, 14)
+    rsi_s   = _rsi_series(closes, 14)
+    adx_s   = _adx_series(highs, lows, closes, 14)
+
+    position     = None
+    current_day  = None
+    day_wins     = 0
+    day_losses   = 0
+    current_week = None
+    week_wins    = 0
+    week_losses  = 0
+    week_pnl     = 0.0
+    week_paused  = False
+
+    for i in range(WARMUP, len(candles)):
+        e9  = ema9_s[i];   e21 = ema21_s[i];  e50 = ema50_s[i]
+        atr = atr_s[i];    rsi = rsi_s[i];     adx = adx_s[i]
+
+        if any(v is None for v in [e9, e21, e50, atr, rsi, adx]) or atr <= 0:
+            continue
+
+        close = closes[i]; hi = highs[i]; lo = lows[i]
+        t_str = _lc_str(candles[i][0])
+        today = _lc_date(candles[i][0])
+
+        # ── Daily reset ───────────────────────────────────────────────────────
+        if today != current_day:
+            current_day = today; day_wins = 0; day_losses = 0
+
+        # ── Weekly reset ──────────────────────────────────────────────────────
+        dt_i     = datetime.utcfromtimestamp(int(candles[i][0]) / 1000)
+        iso_week = dt_i.isocalendar()[:2]
+        if iso_week != current_week:
+            current_week = iso_week
+            week_wins = 0; week_losses = 0; week_pnl = 0.0; week_paused = False
+
+        # ── Manage open position ──────────────────────────────────────────────
+        if position is not None:
+            side = position["side"]
+            ep   = position["entry"]
+            sl_p = position["sl"]
+            tp_p = position["tp"]
+            sz   = position["size"]
+
+            # Pessimistic intrabar: if both SL and TP are touched on the same
+            # bar, assume the adverse fill (SL) happened first.
+            if side == "BUY":
+                sl_hit = lo <= sl_p
+                tp_hit = hi >= tp_p
+                if sl_hit and tp_hit:
+                    exit_price, exit_reason = sl_p, "Stop loss (SL/TP same bar)"
+                elif sl_hit:
+                    exit_price, exit_reason = sl_p, "Stop loss"
+                elif tp_hit:
+                    exit_price, exit_reason = tp_p, "Take profit"
+                else:
+                    exit_price = exit_reason = None
+            else:  # SELL
+                sl_hit = hi >= sl_p
+                tp_hit = lo <= tp_p
+                if sl_hit and tp_hit:
+                    exit_price, exit_reason = sl_p, "Stop loss (SL/TP same bar)"
+                elif sl_hit:
+                    exit_price, exit_reason = sl_p, "Stop loss"
+                elif tp_hit:
+                    exit_price, exit_reason = tp_p, "Take profit"
+                else:
+                    exit_price = exit_reason = None
+
+            if exit_price is not None:
+                gp  = ((exit_price - ep) if side == "BUY" else (ep - exit_price)) * sz
+                fee = ep * sz * (fee_rate + spread_rate) * 2
+                net = gp - fee
+                balance += net
+                if net > 0: day_wins   += 1; week_wins   += 1
+                else:       day_losses += 1; week_losses += 1
+                week_pnl += net
+                sl_pct_v = round(abs(ep - sl_p) / ep * 100, 3) if ep > 0 else 0
+                rr_v     = round(abs(tp_p - ep) / abs(ep - sl_p), 2) if abs(ep - sl_p) > 0 else RR
+                trades.append({
+                    "side":             side,
+                    "entry":            round(ep, 6),
+                    "exit":             round(exit_price, 6),
+                    "pnl":              round(net, 4),
+                    "open_time":        position["time"],
+                    "close_time":       t_str,
+                    "exit_reason":      exit_reason,
+                    "sl":               round(sl_p, 6),
+                    "tp":               round(tp_p, 6),
+                    "rr":               rr_v,
+                    "sl_pct":           sl_pct_v,
+                    "session":          "Lean",
+                    "confluence":       position.get("confluence", 4),
+                    "strategy_signals": position.get("strategy_signals", []),
+                })
+                position = None
+                _wpct = week_pnl / float(starting_balance) * 100
+                if (week_wins >= weekly_win_goal or
+                        _wpct >= weekly_profit_target_pct or
+                        _wpct <= -weekly_max_loss_pct):
+                    week_paused = True
+            continue
+
+        # ── Skip if session or weekly limits hit ──────────────────────────────
+        if day_losses >= MAX_LOSS_DAY or day_wins >= MAX_WINS_DAY:
+            continue
+        if week_paused:
+            continue
+
+        # ── ATR expansion: current ATR vs 20-bar rolling average ─────────────
+        atr_lb  = [x for x in atr_s[max(0, i - 20):i] if x is not None]
+        avg_atr = sum(atr_lb) / len(atr_lb) if atr_lb else atr
+        if not (atr >= avg_atr * ATR_EXP_RATIO):
+            continue   # market is too quiet — skip
+
+        # ── ADX gate ─────────────────────────────────────────────────────────
+        if adx < ADX_MIN:
+            continue
+
+        # ── Direction from EMA stack + RSI exhaustion guard ──────────────────
+        trend_up   = (e9 > e21) and (e21 > e50)
+        trend_down = (e9 < e21) and (e21 < e50)
+
+        if trend_up and rsi < RSI_MAX_BUY:
+            direction = "BUY"
+            sig_list  = [
+                "EMA stack bullish",
+                f"ADX {adx:.1f} >= {ADX_MIN}",
+                "ATR expanding",
+                f"RSI {rsi:.1f} < {RSI_MAX_BUY}",
+            ]
+        elif trend_down and rsi > RSI_MIN_SELL:
+            direction = "SELL"
+            sig_list  = [
+                "EMA stack bearish",
+                f"ADX {adx:.1f} >= {ADX_MIN}",
+                "ATR expanding",
+                f"RSI {rsi:.1f} > {RSI_MIN_SELL}",
+            ]
+        else:
+            continue
+
+        # ── Entry price with volatility-scaled slippage ───────────────────────
+        _slip   = _vol_slippage(slip_rate, hi, lo, close, atr)
+        ep      = close * (1 + _slip) if direction == "BUY" else close * (1 - _slip)
+
+        # ── SL / TP with hard minimum (0.3% of price) ────────────────────────
+        sl_dist = max(atr * ATR_MULT, close * 0.003)
+        sl_p    = ep - sl_dist if direction == "BUY" else ep + sl_dist
+        tp_p    = ep + sl_dist * RR if direction == "BUY" else ep - sl_dist * RR
+
+        # ── Position size (fixed 1% risk) ─────────────────────────────────────
+        risk_dlr = balance * RISK_PCT
+        sz       = risk_dlr / sl_dist if sl_dist > 0 else 0
+        if sz <= 0:
+            continue
+
+        position = {
+            "side":             direction,
+            "entry":            ep,
+            "sl":               sl_p,
+            "tp":               tp_p,
+            "size":             sz,
+            "time":             t_str,
+            "confluence":       len(sig_list),
+            "strategy_signals": sig_list,
+        }
+
+    return trades, balance
+
+
+# ─────────────────────────────────────────────
 # API ROUTES
 # ─────────────────────────────────────────────
 
@@ -3476,6 +3717,14 @@ def api_backtest():
         elif strategy == "vwap_ema":
             trades, ending_balance = run_vwap_ema_strategy(candles, sb, fee_pct, slip_pct,
                                                             spread_pct=spread_pct)
+        elif strategy == "lean_confluence":
+            trades, ending_balance = run_lean_confluence_strategy(
+                candles, sb, fee_pct, slip_pct,
+                weekly_win_goal=_ww_goal,
+                weekly_profit_target_pct=_wpt_pct,
+                weekly_max_loss_pct=_wml_pct,
+                spread_pct=spread_pct,
+            )
         else:
             trades, ending_balance = run_simple_ma_strategy(
                 candles, sb, fee_pct, slip_pct,
@@ -5168,6 +5417,7 @@ def api_walkforward():
     try:
         data        = request.get_json(force=True) or {}
         symbol      = (data.get("symbol") or "BTCUSDT").upper()
+        wf_strategy = str(data.get("strategy", "unified_bot")).lower()
         period_days = max(30, min(int(data.get("period_days", 120)), 365))
         n_windows   = max(2, min(int(data.get("n_windows",   4)),   6))
         train_pct   = max(0.50, min(float(data.get("train_pct", 0.70)), 0.90))
@@ -5204,14 +5454,50 @@ def api_walkforward():
         _wpt = cfg.get("weekly_profit_target_percent", 3.0)
         _wml = cfg.get("weekly_max_loss_percent",      0.8)
 
-        # ── Simplified grid for walk-forward (16 combos, keeps each window fast)
+        spread_pct_wf = MARKET_SPREADS.get(market, 0.0)
+
+        # ── Strategy-specific walk-forward runner ─────────────────────────────
+        # lean_confluence has no tunable params (R:R + risk are fixed constants).
+        # unified_bot uses a 16-combo grid on confluence_min × risk_reward.
         import itertools
-        WF_GRID = {
-            "confluence_min": [4, 5, 6, 7],
-            "risk_reward":    [1.5, 2.0, 2.5, 3.0],
-        }
-        wf_keys   = list(WF_GRID.keys())
-        wf_combos = list(itertools.product(*WF_GRID.values()))
+
+        def _wf_run_strategy(candle_slice, extra_cfg=None):
+            """Run the chosen WF strategy; returns list of trades."""
+            if wf_strategy == "lean_confluence":
+                tr, _ = run_lean_confluence_strategy(
+                    candle_slice, sb, fee_pct, slip_pct,
+                    weekly_win_goal=_ww,
+                    weekly_profit_target_pct=_wpt,
+                    weekly_max_loss_pct=_wml,
+                    spread_pct=spread_pct_wf,
+                )
+                return tr
+            else:  # unified_bot / bot (default)
+                _c = dict(cfg)
+                if extra_cfg:
+                    _c.update(extra_cfg)
+                tr, _ = run_unified_bot_strategy(
+                    candle_slice, sb, fee_pct, slip_pct,
+                    weekly_win_goal=_ww,
+                    weekly_profit_target_pct=_wpt,
+                    weekly_max_loss_pct=_wml,
+                    user_cfg=_c,
+                    spread_pct=spread_pct_wf,
+                )
+                return tr
+
+        if wf_strategy == "lean_confluence":
+            # Lean strategy is parameter-free — no grid search needed.
+            WF_GRID   = {}
+            wf_keys   = []
+            wf_combos = [()]   # single empty combo
+        else:
+            WF_GRID = {
+                "confluence_min": [4, 5, 6, 7],
+                "risk_reward":    [1.5, 2.0, 2.5, 3.0],
+            }
+            wf_keys   = list(WF_GRID.keys())
+            wf_combos = list(itertools.product(*WF_GRID.values()))
 
         # ── Split all_candles into n_windows equal chunks ─────────────────────
         w_size  = len(all_candles) // n_windows
@@ -5228,45 +5514,31 @@ def api_walkforward():
             train_c = w_candles[:sp]
             test_c  = w_candles[sp:]
 
-            # ── Grid search on in-sample candles ──────────────────────────────
+            # ── Grid search on in-sample candles (unified_bot only) ───────────
             best_score  = -1
-            best_params = {k: cfg.get(k) for k in wf_keys}  # fallback to current
+            best_params = {k: cfg.get(k) for k in wf_keys}  # fallback / empty for lean
 
             for combo in wf_combos:
-                trial = dict(cfg)
-                for k, v in zip(wf_keys, combo):
-                    trial[k] = v
+                trial_params = dict(zip(wf_keys, combo)) if wf_keys else None
                 try:
-                    tr, _ = run_unified_bot_strategy(
-                        train_c, sb, fee_pct, slip_pct,
-                        weekly_win_goal=_ww,
-                        weekly_profit_target_pct=_wpt,
-                        weekly_max_loss_pct=_wml,
-                        user_cfg=trial,
-                    )
+                    tr    = _wf_run_strategy(train_c, trial_params)
                     t_cnt = len(tr)
-                    _wins_tr = [t for t in tr if float(t.get("pnl",0)or 0)>0]
-                    _gl_tr   = abs(sum(float(t.get("pnl",0)or 0) for t in tr if float(t.get("pnl",0)or 0)<0))
-                    _gp_tr   = sum(float(t.get("pnl",0)or 0) for t in _wins_tr)
-                    _wr_tr   = len(_wins_tr)/t_cnt*100 if t_cnt else 0
+                    _wins_tr = [t for t in tr if float(t.get("pnl", 0) or 0) > 0]
+                    _gl_tr   = abs(sum(float(t.get("pnl", 0) or 0) for t in tr
+                                       if float(t.get("pnl", 0) or 0) < 0))
+                    _gp_tr   = sum(float(t.get("pnl", 0) or 0) for t in _wins_tr)
+                    _wr_tr   = len(_wins_tr) / t_cnt * 100 if t_cnt else 0
                     _pf_tr   = (_gp_tr / _gl_tr) if _gl_tr else 0
                     score    = _grid_score(t_cnt, _wr_tr, _pf_tr)
                     if score > best_score:
                         best_score  = score
-                        best_params = {k: v for k, v in zip(wf_keys, combo)}
+                        best_params = trial_params or {}
                 except Exception:
                     continue
 
             # ── Apply best params to OOS (test) candles ───────────────────────
-            oos_cfg = dict(cfg); oos_cfg.update(best_params)
             try:
-                oos_trades, _ = run_unified_bot_strategy(
-                    test_c, sb, fee_pct, slip_pct,
-                    weekly_win_goal=_ww,
-                    weekly_profit_target_pct=_wpt,
-                    weekly_max_loss_pct=_wml,
-                    user_cfg=oos_cfg,
-                )
+                oos_trades = _wf_run_strategy(test_c, best_params if best_params else None)
             except Exception:
                 oos_trades = []
 
@@ -5307,6 +5579,7 @@ def api_walkforward():
         return jsonify({
             "ok":           True,
             "symbol":       symbol,
+            "strategy":     wf_strategy,
             "period_days":  period_days,
             "n_windows":    n_windows,
             "train_pct":    train_pct,

@@ -48,10 +48,11 @@ const durStr  = (s)   => {
 };
 
 const STRATEGIES = [
-  {value:"unified_bot", label:"SMC Unified Bot"},
-  {value:"basic",       label:"Basic SMC"},
-  {value:"ema_rsi",     label:"EMA + RSI"},
-  {value:"sma_cross",   label:"SMA Crossover"},
+  {value:"unified_bot",     label:"SMC Unified Bot"},
+  {value:"lean_confluence", label:"Lean Confluence (3-Signal)"},
+  {value:"vwap_ema",        label:"VWAP + EMA"},
+  {value:"orb_0dte",        label:"ORB / 0DTE"},
+  {value:"basic",           label:"Simple MA"},
 ];
 
 // ── MAIN COMPONENT ────────────────────────────────────────────────────────────
@@ -143,7 +144,8 @@ export default function Backtester() {
       const d = await apiFetch("/api/walkforward", {
         method:"POST",
         body:JSON.stringify({
-          symbol, period_days:Number(wfDays), n_windows:Number(wfWindows),
+          symbol, strategy,
+          period_days:Number(wfDays), n_windows:Number(wfWindows),
           train_pct:Number(trainPct)/100,
           starting_balance:Number(balance),
           fee_percent:Number(fee), slippage_percent:Number(slip),
@@ -564,10 +566,15 @@ export default function Backtester() {
                   </div>
                   <p style={{margin:0,fontSize:13,color:T.t2,lineHeight:1.65,maxWidth:540}}>
                     Splits history into <strong style={{color:T.text}}>N rolling windows</strong>.
-                    Each window: grid-search best params on the <em>in-sample</em> portion,
-                    then apply them to the <em>out-of-sample</em> portion and record honest metrics.
-                    Tells you whether your edge is stable or curve-fitted.
+                    {strategy==="lean_confluence"
+                      ? <> <strong style={{color:T.green}}>Lean Confluence</strong> has no free parameters — each window runs directly on out-of-sample candles. Tells you whether the fixed signal set is stable across time.</>
+                      : <> Each window: grid-search best params on the <em>in-sample</em> portion, then apply them to the <em>out-of-sample</em> portion. Tells you whether the edge is stable or curve-fitted.</>
+                    }
                   </p>
+                  <div style={{marginTop:8,fontSize:11,color:T.t2,fontFamily:MONO}}>
+                    STRATEGY: <span style={{color:T.cyan}}>{STRATEGIES.find(s=>s.value===strategy)?.label||strategy}</span>
+                    &nbsp;·&nbsp;SYMBOL: <span style={{color:T.cyan}}>{symbol}</span>
+                  </div>
                 </div>
                 <div style={{display:"flex",flexDirection:"column",gap:8,minWidth:200}}>
                   <Field label="TOTAL PERIOD (DAYS)">
@@ -1233,8 +1240,26 @@ function OOSPanel({summary:s}){
 // ── WALK-FORWARD RESULT ───────────────────────────────────────────────────────
 function WalkForwardResult({data:d, onApply, applying}){
   if(!d) return null;
+
+  // Backend returns aggregate metrics under d.aggregate, per-window under d.windows
+  const agg     = d.aggregate || {};
+  const verdict = agg.verdict;
+  const isLean  = d.strategy === "lean_confluence";
   const VERDICT_COLOR = {STABLE:T.green, MIXED:T.gold, UNSTABLE:T.red};
-  const vc = VERDICT_COLOR[d.verdict] || T.t2;
+  const vc = VERDICT_COLOR[verdict] || T.t2;
+
+  // For non-lean strategies: derive "best overall params" from the window
+  // that produced the highest OOS profit factor, then offer Apply.
+  const bestParamsOverall = !isLean && d.windows?.length > 0
+    ? (()=>{
+        const best = d.windows.reduce((a,b)=>
+          ((b.oos?.profit_factor)||0) > ((a.oos?.profit_factor)||0) ? b : a,
+          d.windows[0]
+        );
+        const p = best?.best_is_params;
+        return p && Object.keys(p).length > 0 ? p : null;
+      })()
+    : null;
 
   return(
     <div style={{background:T.bg3,border:`1px solid ${T.cyan}44`,borderRadius:6,padding:16,
@@ -1245,23 +1270,24 @@ function WalkForwardResult({data:d, onApply, applying}){
         <CheckCircle size={14} style={{color:T.green}}/>
         <span style={{fontFamily:MONO,fontSize:11,color:T.green,letterSpacing:1}}>
           WALK-FORWARD COMPLETE — {d.n_windows||0} WINDOWS
+          {d.strategy && <span style={{color:T.t2}}> · {d.strategy.replace(/_/g," ").toUpperCase()}</span>}
         </span>
         <span style={{marginLeft:"auto",fontFamily:MONO,fontSize:11,letterSpacing:2,
           background:`${vc}18`,border:`1px solid ${vc}55`,borderRadius:4,padding:"4px 14px",
           color:vc,fontWeight:700}}>
-          {d.verdict||"—"}
+          {verdict||"—"}
         </span>
       </div>
 
-      {/* Aggregate stats */}
+      {/* Aggregate stats — sourced from d.aggregate */}
       <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(130px,1fr))",gap:8,marginBottom:16}}>
         {[
-          ["WINDOWS",      d.n_windows||0,                              T.text],
-          ["PROFITABLE",   `${d.windows_profitable||0}/${d.n_windows||0}`, T.green],
-          ["CONSISTENCY",  fmtPct(d.consistency_pct),                   vc],
-          ["AVG OOS PF",   fmt(d.avg_oos_pf),                           T.blue],
-          ["AVG OOS WIN%", fmtPct(d.avg_oos_wr),                        T.gold],
-          ["OOS TRADES",   d.total_oos_trades||0,                       T.text],
+          ["WINDOWS",        d.n_windows||0,                                              T.text],
+          ["PROFITABLE",     `${agg.windows_profitable||0}/${agg.windows_total||d.n_windows||0}`, T.green],
+          ["CONSISTENCY",    fmtPct(agg.consistency_pct),                                vc],
+          ["OOS PROF FACTOR",fmt(agg.profit_factor),                                     T.blue],
+          ["OOS WIN RATE",   fmtPct(agg.win_rate),                                       T.gold],
+          ["TOTAL OOS TRADES",agg.total_trades||0,                                       T.text],
         ].map(([lbl,val,col])=>(
           <div key={lbl} style={{background:T.bg2,border:`1px solid ${T.border}`,borderRadius:4,padding:"8px 12px"}}>
             <div style={{fontFamily:MONO,fontSize:8,color:T.t2,letterSpacing:1,marginBottom:3}}>{lbl}</div>
@@ -1277,7 +1303,7 @@ function WalkForwardResult({data:d, onApply, applying}){
           <table style={{width:"100%",borderCollapse:"collapse",fontFamily:MONO,fontSize:10}}>
             <thead>
               <tr>
-                {["WIN #","IS PERIOD","OOS PERIOD","IS PF","OOS PF","OOS WIN%","OOS TRADES","BEST PARAMS","OUTCOME"].map(h=>(
+                {["WIN#","TRAIN PERIOD","TEST PERIOD","IS SCORE","OOS PF","OOS WIN%","OOS TRADES","PARAMS","OUTCOME"].map(h=>(
                   <th key={h} style={{padding:"6px 10px",textAlign:"left",fontFamily:MONO,fontSize:8,
                     color:T.t2,borderBottom:`1px solid ${T.border}`,background:T.bg2,
                     letterSpacing:1,whiteSpace:"nowrap"}}>{h}</th>
@@ -1286,24 +1312,28 @@ function WalkForwardResult({data:d, onApply, applying}){
             </thead>
             <tbody>
               {d.windows.map((w,i)=>{
-                const profitable = (w.oos_pf||0)>1;
-                const oc = profitable?T.green:T.red;
+                // Backend field names: train_start, train_end, test_end, is_score, best_is_params, oos{}
+                const oospf     = w.oos?.profit_factor ?? 0;
+                const profitable = oospf > 1;
+                const oc = profitable ? T.green : T.red;
+                const bp = w.best_is_params || {};
+                const bpStr = Object.keys(bp).length > 0
+                  ? Object.entries(bp).map(([k,v])=>`${k.replace("_"," ")}=${v}`).join(" ")
+                  : isLean ? "fixed" : "—";
                 return(
                   <tr key={i} style={{background:i%2===0?T.bg3:T.bg2,borderBottom:`1px solid ${T.border}`}}>
-                    <td style={{padding:"6px 10px",color:T.t2,textAlign:"center"}}>{i+1}</td>
+                    <td style={{padding:"6px 10px",color:T.t2,textAlign:"center"}}>{w.window||i+1}</td>
                     <td style={{padding:"6px 10px",color:T.t2,fontSize:9,whiteSpace:"nowrap"}}>
-                      {(w.is_start||"—").slice(0,10)}→{(w.is_end||"—").slice(0,10)}
+                      {(w.train_start||"—").slice(0,10)} → {(w.train_end||"—").slice(0,10)}
                     </td>
                     <td style={{padding:"6px 10px",color:T.t2,fontSize:9,whiteSpace:"nowrap"}}>
-                      {(w.oos_start||"—").slice(0,10)}→{(w.oos_end||"—").slice(0,10)}
+                      {(w.train_end||"—").slice(0,10)} → {(w.test_end||"—").slice(0,10)}
                     </td>
-                    <td style={{padding:"6px 10px",color:T.blue}}>{fmt(w.is_pf)}</td>
-                    <td style={{padding:"6px 10px",color:oc,fontWeight:profitable?700:400}}>{fmt(w.oos_pf)}</td>
-                    <td style={{padding:"6px 10px",color:T.gold}}>{fmtPct(w.oos_wr)}</td>
-                    <td style={{padding:"6px 10px",color:T.text}}>{w.oos_trades||0}</td>
-                    <td style={{padding:"6px 10px",color:T.cyan,fontSize:9}}>
-                      {w.best_params?`c=${w.best_params.confluence_min} rr=${w.best_params.risk_reward}`:"—"}
-                    </td>
+                    <td style={{padding:"6px 10px",color:T.blue}}>{fmt(w.is_score,3)}</td>
+                    <td style={{padding:"6px 10px",color:oc,fontWeight:profitable?700:400}}>{fmt(oospf)}</td>
+                    <td style={{padding:"6px 10px",color:T.gold}}>{fmtPct(w.oos?.win_rate)}</td>
+                    <td style={{padding:"6px 10px",color:T.text}}>{w.oos?.total_trades||0}</td>
+                    <td style={{padding:"6px 10px",color:T.cyan,fontSize:9}}>{bpStr}</td>
                     <td style={{padding:"6px 10px"}}>
                       <span style={{fontFamily:MONO,fontSize:8,color:oc,
                         background:`${oc}18`,border:`1px solid ${oc}44`,
@@ -1320,7 +1350,7 @@ function WalkForwardResult({data:d, onApply, applying}){
       )}
 
       {/* Low sample warning */}
-      {d.low_sample_warning&&(
+      {agg.low_sample_warning&&(
         <div style={{background:`${T.gold}12`,border:`1px solid ${T.gold}44`,borderRadius:4,
           padding:"8px 12px",display:"flex",alignItems:"center",gap:8,marginBottom:12}}>
           <AlertTriangle size={13} style={{color:T.gold,flexShrink:0}}/>
@@ -1330,16 +1360,25 @@ function WalkForwardResult({data:d, onApply, applying}){
         </div>
       )}
 
-      {/* Best params overall + Apply button */}
-      {d.best_params_overall&&onApply&&(
+      {/* Lean confluence info note */}
+      {isLean&&(
+        <div style={{background:`${T.green}08`,border:`1px solid ${T.green}33`,borderRadius:4,
+          padding:"8px 12px",fontFamily:MONO,fontSize:10,color:T.green,marginBottom:12}}>
+          ✓ Lean Confluence uses fixed parameters (R:R=2.0, Risk=1%, no grid search).
+          The edge shown is purely from signal quality — not from curve-fitting.
+        </div>
+      )}
+
+      {/* Best params overall + Apply button (unified_bot only) */}
+      {bestParamsOverall&&onApply&&(
         <div style={{background:`${T.cyan}08`,border:`1px solid ${T.cyan}33`,borderRadius:5,
           padding:"12px 14px",display:"flex",alignItems:"center",gap:12,flexWrap:"wrap"}}>
           <div style={{flex:1}}>
             <div style={{fontFamily:MONO,fontSize:8,color:T.cyan,letterSpacing:2,marginBottom:6}}>
-              MOST CONSISTENT PARAMS ACROSS WINDOWS
+              BEST OOS WINDOW PARAMS — APPLY TO BOT CONFIG
             </div>
             <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
-              {Object.entries(d.best_params_overall).map(([k,v])=>(
+              {Object.entries(bestParamsOverall).map(([k,v])=>(
                 <span key={k} style={{fontFamily:MONO,fontSize:9,background:`${T.cyan}18`,
                   border:`1px solid ${T.cyan}33`,borderRadius:3,padding:"2px 8px",color:T.cyan}}>
                   {k.replace(/_/g," ")} = {v}
@@ -1347,7 +1386,7 @@ function WalkForwardResult({data:d, onApply, applying}){
               ))}
             </div>
           </div>
-          <button onClick={()=>onApply(d.best_params_overall)} disabled={applying}
+          <button onClick={()=>onApply(bestParamsOverall)} disabled={applying}
             style={{background:`${T.cyan}20`,border:`1px solid ${T.cyan}66`,color:T.cyan,
               borderRadius:4,padding:"8px 18px",cursor:"pointer",fontFamily:MONO,
               fontSize:10,letterSpacing:1,whiteSpace:"nowrap",flexShrink:0}}>
