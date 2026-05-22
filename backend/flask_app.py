@@ -3256,6 +3256,14 @@ def api_backtest():
             return 0
 
     for t in trades:
+        # ── Convert raw integer timestamps to human-readable strings ─────────
+        # EMA fallback & ICT path store candle[0] (Binance ms timestamp) directly.
+        # JavaScript's String.slice() crashes on numbers → convert here once.
+        for _tk in ("entry_time", "exit_time", "open_time", "close_time", "time"):
+            _v = t.get(_tk)
+            if isinstance(_v, (int, float)) and _v > 1_000_000_000:
+                t[_tk] = _ts_to_str(int(_v))
+
         # Unify open_time / entry_time
         if "open_time" not in t:
             t["open_time"]  = t.get("entry_time", "")
