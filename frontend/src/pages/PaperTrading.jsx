@@ -96,11 +96,6 @@ export default function PaperTrading() {
   const botRef  = useRef(botActive);
   botRef.current = botActive;
 
-  // Load chart when tab opens or symbol changes
-  React.useEffect(() => {
-    if (activeTab === "chart") loadChart(chartSym);
-  }, [activeTab, chartSym, loadChart]);
-
   // ── Loaders ───────────────────────────────────────────────────────────────
   const loadSummary = useCallback(async () => {
     try {
@@ -149,6 +144,11 @@ export default function PaperTrading() {
       setChartLoading(false);
     }
   }, []);
+
+  // Load chart when tab opens or symbol changes (MUST be after loadChart useCallback)
+  useEffect(() => {
+    if (activeTab === "chart") loadChart(chartSym);
+  }, [activeTab, chartSym, loadChart]);
 
   const refreshAll = useCallback(async () => {
     await Promise.all([
