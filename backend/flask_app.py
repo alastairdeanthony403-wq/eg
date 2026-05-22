@@ -99,6 +99,16 @@ ALL_SYMBOLS = (
     + MARKETS["commodities"]
 )
 
+# ── Per-market bid-ask spread (one-way %, applied on entry AND exit) ──────────
+# Crypto: exchange fee already covers spread; set to 0.
+# Forex/stocks/commodities: realistic mid-market spread estimates.
+MARKET_SPREADS = {
+    "crypto":      0.00,   # absorbed in exchange fee
+    "forex":       0.01,   # ~1 pip on major pairs (EURUSD, GBPUSD, etc.)
+    "stocks":      0.02,   # ~$0.02 on a $100 stock (penny spread on mid-caps)
+    "commodities": 0.03,   # gold ~$0.60 on $2000, oil ~$0.05 on $80
+}
+
 POLYGON_SYMBOL_MAP = {
     # Forex
     "EURUSD": "C:EURUSD", "GBPUSD": "C:GBPUSD", "USDJPY": "C:USDJPY",
@@ -1554,7 +1564,7 @@ def _candle_et_hm(ts_ms):
 # ─────────────────────────────────────────────
 
 def run_orb_strategy(candles, starting_balance=1000,
-                     fee_pct=0.04, slippage_pct=0.02):
+                     fee_pct=0.04, slippage_pct=0.02, spread_pct=0.0):
     RISK_PCT        = 0.02
     TP_PCT          = 1.00
     SL_PCT          = 0.50
@@ -1562,8 +1572,9 @@ def run_orb_strategy(candles, starting_balance=1000,
     OPEN_RANGE_MINS = 5
     TRADE_DAYS      = {0, 2, 4}
 
-    trades  = []
-    balance = float(starting_balance)
+    trades      = []
+    balance     = float(starting_balance)
+    spread_rate = spread_pct / 100   # one-way; * 2 for round-trip in fee calc
 
     if len(candles) < 10:
         return trades, balance
@@ -1622,7 +1633,7 @@ def run_orb_strategy(candles, starting_balance=1000,
                 raw_ret = (price - ep) / ep if side == "BUY" else (ep - price) / ep
                 opt_pnl = raw_ret / (or_high - or_low) * prem * size if (or_high - or_low) > 0 else 0
                 opt_pnl = max(opt_pnl, -prem * SL_PCT * size)
-                fee     = risk_dollar * fee_pct / 100 * 2
+                fee     = risk_dollar * (fee_pct / 100 + spread_rate) * 2
                 net_pnl = opt_pnl - fee
                 balance += net_pnl
                 trades.append({
@@ -1636,12 +1647,16 @@ def run_orb_strategy(candles, starting_balance=1000,
 
             if position is None and not day_traded:
                 if price > or_high:
-                    ep = price * (1 + slippage_pct / 100)
+                    _slip = _vol_slippage(slippage_pct / 100,
+                                          float(c[2]), float(c[3]), price)
+                    ep = price * (1 + _slip)
                     position   = {"side": "BUY",  "entry_price": ep,
                                   "premium": option_premium, "time": t_str}
                     day_traded = True
                 elif price < or_low:
-                    ep = price * (1 - slippage_pct / 100)
+                    _slip = _vol_slippage(slippage_pct / 100,
+                                          float(c[2]), float(c[3]), price)
+                    ep = price * (1 - _slip)
                     position   = {"side": "SELL", "entry_price": ep,
                                   "premium": option_premium, "time": t_str}
                     day_traded = True
@@ -1653,7 +1668,7 @@ def run_orb_strategy(candles, starting_balance=1000,
                 underlying_move = (price - ep) if side == "BUY" else (ep - price)
                 opt_pnl_pct = underlying_move / prem
                 if opt_pnl_pct >= TP_PCT:
-                    net_pnl = prem * TP_PCT * size - risk_dollar * fee_pct / 100 * 2
+                    net_pnl = prem * TP_PCT * size - risk_dollar * (fee_pct / 100 + spread_rate) * 2
                     balance += net_pnl
                     trades.append({
                         "side": side, "entry": round(ep, 4), "exit": round(price, 4),
@@ -1663,7 +1678,7 @@ def run_orb_strategy(candles, starting_balance=1000,
                     })
                     position = None
                 elif opt_pnl_pct <= -SL_PCT:
-                    net_pnl = -(prem * SL_PCT * size) - risk_dollar * fee_pct / 100 * 2
+                    net_pnl = -(prem * SL_PCT * size) - risk_dollar * (fee_pct / 100 + spread_rate) * 2
                     balance += net_pnl
                     trades.append({
                         "side": side, "entry": round(ep, 4), "exit": round(price, 4),
@@ -1681,7 +1696,7 @@ def run_orb_strategy(candles, starting_balance=1000,
 # ─────────────────────────────────────────────
 
 def run_vwap_ema_strategy(candles, starting_balance=1000,
-                           fee_pct=0.04, slippage_pct=0.02):
+                           fee_pct=0.04, slippage_pct=0.02, spread_pct=0.0):
     RISK_PCT        = 0.02
     ENTRY_AFTER_ET  = 1030
     CLOSE_ET        = 1600
@@ -1692,8 +1707,9 @@ def run_vwap_ema_strategy(candles, starting_balance=1000,
     ADR_TP1_MULT    = 0.75
     TRAIL_ATR_MULT  = 1.0
 
-    trades  = []
-    balance = float(starting_balance)
+    trades      = []
+    balance     = float(starting_balance)
+    spread_rate = spread_pct / 100
 
     if len(candles) < max(EMA_SLOW, ADR_PERIOD * 2) + 5:
         return trades, balance
@@ -1765,7 +1781,7 @@ def run_vwap_ema_strategy(candles, starting_balance=1000,
         if position is not None and hm >= CLOSE_ET:
             side = position["side"]; ep = position["entry"]
             raw_pnl = ((close - ep) if side == "BUY" else (ep - close)) * position["size"]
-            fee = ep * position["size"] * fee_pct / 100 * 2
+            fee = ep * position["size"] * (fee_pct / 100 + spread_rate) * 2
             net = raw_pnl - fee
             balance += net
             trades.append({
@@ -1803,37 +1819,43 @@ def run_vwap_ema_strategy(candles, starting_balance=1000,
 
             eff_sl = trail_sl if tp1_hit else sl
 
-            if not tp1_hit:
-                if (side == "BUY" and hi >= tp1) or (side == "SELL" and lo <= tp1):
-                    partial_sz = sz_full - sz_rem
-                    raw_pnl_p1 = ((tp1 - ep) if side == "BUY" else (ep - tp1)) * partial_sz
-                    fee_p1     = ep * partial_sz * fee_pct / 100 * 2
-                    net_p1     = raw_pnl_p1 - fee_p1
-                    balance   += net_p1
-                    position["tp1_hit"]  = True
-                    position["trail_sl"] = ep
-                    trail_sl = ep
-                    trades.append({
-                        "side": side, "entry": round(ep, 6), "exit": round(tp1, 6),
-                        "entry_time": position["time"], "exit_time": t_str,
-                        "pnl": round(net_p1, 4), "reason": "Target 1 (75% ADR) — 50% closed",
-                        "setup": position.get("setup", ""),
-                    })
-                    continue
+            # ── Intrabar SL/TP priority — pessimistic fill rule ─────────────
+            # When a single candle's range touches BOTH TP1 and SL, we cannot
+            # know the order of fills. We assume the UNFAVORABLE outcome: SL hit
+            # first. This prevents the optimistic scenario where partial close at
+            # TP1 is credited on the same bar that also stopped out the remainder.
+            _tp1_cond = (not tp1_hit) and (
+                (side == "BUY" and hi >= tp1) or (side == "SELL" and lo <= tp1)
+            )
+            _sl_cond = (side == "BUY" and lo <= eff_sl) or (side == "SELL" and hi >= eff_sl)
+
+            if _tp1_cond and not _sl_cond:
+                # Clean TP1 hit — SL not also reached this bar
+                partial_sz = sz_full - sz_rem
+                raw_pnl_p1 = ((tp1 - ep) if side == "BUY" else (ep - tp1)) * partial_sz
+                fee_p1     = ep * partial_sz * (fee_pct / 100 + spread_rate) * 2
+                net_p1     = raw_pnl_p1 - fee_p1
+                balance   += net_p1
+                position["tp1_hit"]  = True
+                position["trail_sl"] = ep
+                trail_sl = ep
+                trades.append({
+                    "side": side, "entry": round(ep, 6), "exit": round(tp1, 6),
+                    "entry_time": position["time"], "exit_time": t_str,
+                    "pnl": round(net_p1, 4), "reason": "Target 1 (75% ADR) — 50% closed",
+                    "setup": position.get("setup", ""),
+                })
+                continue
+            # If _sl_cond is True (with or without _tp1_cond), fall through to SL block
 
             exit_price = exit_reason = None
-            if side == "BUY":
-                if lo <= eff_sl:
-                    exit_price  = eff_sl
-                    exit_reason = "Trailing stop" if tp1_hit else "Stop loss"
-            else:
-                if hi >= eff_sl:
-                    exit_price  = eff_sl
-                    exit_reason = "Trailing stop" if tp1_hit else "Stop loss"
+            if _sl_cond:
+                exit_price  = eff_sl
+                exit_reason = "Trailing stop" if tp1_hit else "Stop loss"
 
             if exit_price is not None:
                 raw_pnl = ((exit_price - ep) if side == "BUY" else (ep - exit_price)) * sz_rem
-                fee     = ep * sz_rem * fee_pct / 100 * 2
+                fee     = ep * sz_rem * (fee_pct / 100 + spread_rate) * 2
                 net     = raw_pnl - fee
                 balance += net
                 trades.append({
@@ -1868,7 +1890,9 @@ def run_vwap_ema_strategy(candles, starting_balance=1000,
         if size <= 0:
             continue
 
-        ep = close * (1 + slippage_pct/100) if side == "BUY" else close * (1 - slippage_pct/100)
+        _vwap_slip = _vol_slippage(slippage_pct / 100,
+                                    hi, lo, close, atr_v)
+        ep = close * (1 + _vwap_slip) if side == "BUY" else close * (1 - _vwap_slip)
         sl_price  = ep - sl_dist  if side == "BUY" else ep + sl_dist
         tp1_price = ep + tp1_dist if side == "BUY" else ep - tp1_dist
 
@@ -1892,12 +1916,14 @@ def run_simple_ma_strategy(candles, starting_balance=1000,
                             fee_pct=0.04, slippage_pct=0.02,
                             weekly_win_goal=3,
                             weekly_profit_target_pct=3.0,
-                            weekly_max_loss_pct=0.8):
-    trades      = []
-    balance     = float(starting_balance)
-    risk_pct    = 0.01
-    fee_rate    = fee_pct    / 100
-    slip_rate   = slippage_pct / 100
+                            weekly_max_loss_pct=0.8,
+                            spread_pct=0.0):
+    trades       = []
+    balance      = float(starting_balance)
+    risk_pct     = 0.01
+    fee_rate     = fee_pct      / 100
+    slip_rate    = slippage_pct / 100
+    spread_rate  = spread_pct   / 100
 
     if len(candles) < 35:
         return trades, balance
@@ -1946,13 +1972,17 @@ def run_simple_ma_strategy(candles, starting_balance=1000,
             crossed_up   = prev_fast <= prev_slow and fast > slow
             crossed_down = prev_fast >= prev_slow and fast < slow
             if crossed_up:
-                ep      = price * (1 + slip_rate)
+                _ma_hi  = float(candles[i][2]); _ma_lo = float(candles[i][3])
+                _ma_slip = _vol_slippage(slip_rate, _ma_hi, _ma_lo, price, atr)
+                ep      = price * (1 + _ma_slip)
                 sl_dist = atr * 1.5
                 position = {"side": "BUY",  "entry": ep, "time": entry_time,
                             "sl": ep - sl_dist, "tp": ep + sl_dist * 2,
                             "sl_dist": sl_dist}
             elif crossed_down:
-                ep      = price * (1 - slip_rate)
+                _ma_hi  = float(candles[i][2]); _ma_lo = float(candles[i][3])
+                _ma_slip = _vol_slippage(slip_rate, _ma_hi, _ma_lo, price, atr)
+                ep      = price * (1 - _ma_slip)
                 sl_dist = atr * 1.5
                 position = {"side": "SELL", "entry": ep, "time": entry_time,
                             "sl": ep + sl_dist, "tp": ep - sl_dist * 2,
@@ -1985,7 +2015,7 @@ def run_simple_ma_strategy(candles, starting_balance=1000,
                 raw_pnl = (exit_price - ep) * size
             else:
                 raw_pnl = (ep - exit_price) * size
-            fee      = ep * size * fee_rate * 2
+            fee      = ep * size * (fee_rate + spread_rate) * 2
             net_pnl  = raw_pnl - fee
             balance += net_pnl
             if net_pnl > 0: week_wins   += 1
@@ -2284,6 +2314,28 @@ def _dynamic_risk_pct(score, base_risk=0.01):
     return base_risk * scale
 
 
+def _vol_slippage(base_rate, candle_hi, candle_lo, price, atr=None):
+    """
+    Volatility-scaled slippage. Returns actual slippage rate (as a decimal, e.g. 0.002 = 0.2%).
+
+    base_rate  : flat floor from user config (e.g. 0.0002 for 0.02%)
+    candle_hi  : this bar's high
+    candle_lo  : this bar's low
+    price      : reference price (entry price)
+    atr        : 14-bar ATR; if None only bar range is used
+
+    Logic: slippage = max(base_rate, 10% of (range or ATR) as % of price).
+    Rationale: on a $1000 range BTC bar, you realistically slip 0.2-1% not 0.02%.
+    On a 5-pip forex bar, slippage stays near the flat floor.
+    """
+    if price <= 0:
+        return base_rate
+    bar_range = max(candle_hi - candle_lo, 0.0)
+    ref = max(bar_range, atr) if (atr and atr > 0) else bar_range
+    vol_component = (ref / price) * 0.10   # 10% of range/ATR as fraction of price
+    return max(base_rate, vol_component)
+
+
 # ─────────────────────────────────────────────
 # UNIFIED BOT STRATEGY  v3
 # ─────────────────────────────────────────────
@@ -2295,7 +2347,8 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                               weekly_profit_target_pct=3.0,
                               weekly_max_loss_pct=0.8,
                               user_cfg=None,
-                              htf_candles=None):
+                              htf_candles=None,
+                              spread_pct=0.0):
     """
     ICT — Asian Range → London Push → New York Reversal
 
@@ -2330,8 +2383,9 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
     trades      = []
     balance     = float(starting_balance)
     risk_dollar = balance * RISK_PCT
-    fee_rate    = fee_pct    / 100
+    fee_rate    = fee_pct      / 100
     slip_rate   = slippage_pct / 100
+    spread_rate = spread_pct   / 100
 
     if not candles or len(candles) < 10:
         return trades, balance
@@ -2399,7 +2453,7 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                     sz  = position["size_rem"] if position["scaled"] else position["size"]
                     gp  = ((lc - position["entry"]) if position["side"] == "BUY"
                            else (position["entry"] - lc)) * sz
-                    fee = position["entry"] * sz * fee_rate * 2
+                    fee = position["entry"] * sz * (fee_rate + spread_rate) * 2
                     net = gp - fee
                     balance += net
                     trades.append({
@@ -2531,8 +2585,10 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                         continue
                     if _fb_htf == 'BULL' and fb_dir == 'SELL':
                         continue
-                    fb_c   = float(c_fb[4])
-                    fb_ep  = fb_c * (1 + slip_rate) if fb_dir == "BUY" else fb_c * (1 - slip_rate)
+                    fb_c      = float(c_fb[4])
+                    _fb_slip  = _vol_slippage(slip_rate, float(c_fb[2]), float(c_fb[3]),
+                                              fb_c, atr_f)
+                    fb_ep  = fb_c * (1 + _fb_slip) if fb_dir == "BUY" else fb_c * (1 - _fb_slip)
                     # SL: use HTF ATR if available; hard minimum 0.5% (was 0.2% — too tight)
                     _fb_htf_atr = _htf_atr_lu.get(int(c_fb[0])) if _htf_atr_lu else None
                     if _fb_htf_atr and _fb_htf_atr > 0:
@@ -2560,35 +2616,56 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                     except ValueError:
                         k_fb_start = len(ny + after)
                     remaining = (ny + after)[k_fb_start:]
+                    _fb_fr = fee_rate + spread_rate   # combined round-trip cost rate
                     for c_r in remaining:
                         if position is None:
                             break
                         h_r = float(c_r[2]); lo_r = float(c_r[3]); t_r = c_r[0]
                         sd  = position["side"]
                         if sd == "SELL":
-                            if not position["scaled"] and lo_r <= position["tp1"]:
+                            # Pessimistic: SL wins if both SL and TP hit same bar
+                            _fb_sl = h_r  >= position["sl"]
+                            _fb_tp = (not position["scaled"]) and lo_r <= position["tp1"]
+                            if _fb_sl and _fb_tp:
+                                ep_r = position["sl"]; sz_r = position["size_rem"] if position["scaled"] else position["size"]
+                                net_r = (position["entry"] - ep_r) * sz_r - position["entry"] * sz_r * _fb_fr * 2
+                                balance += net_r
+                                if not position["scaled"]: day_losses += 1
+                                trades.append({"side":"SELL","entry":round(position["entry"],6),"exit":round(ep_r,6),"pnl":round(net_r,4),"entry_time":position["time"],"exit_time":t_r,"reason":"Stop loss","rr":position.get("rr",2.5),"sl_pct":position.get("sl_pct",0),"session":position.get("session","NY")})
+                                position = None
+                            elif _fb_tp:
                                 ep_r = position["tp1"]; sz_r = position["size"] * 0.5
-                                net_r = (position["entry"] - ep_r) * sz_r - position["entry"] * sz_r * fee_rate * 2
+                                net_r = (position["entry"] - ep_r) * sz_r - position["entry"] * sz_r * _fb_fr * 2
                                 balance += net_r; day_wins += 1
                                 trades.append({"side":"SELL","entry":round(position["entry"],6),"exit":round(ep_r,6),"pnl":round(net_r,4),"entry_time":position["time"],"exit_time":t_r,"reason":"Take profit","rr":position.get("rr",2.5),"sl_pct":position.get("sl_pct",0),"session":position.get("session","NY")})
                                 position = None
-                            elif h_r >= position["sl"]:
+                            elif _fb_sl:
                                 ep_r = position["sl"]; sz_r = position["size_rem"] if position["scaled"] else position["size"]
-                                net_r = (position["entry"] - ep_r) * sz_r - position["entry"] * sz_r * fee_rate * 2
+                                net_r = (position["entry"] - ep_r) * sz_r - position["entry"] * sz_r * _fb_fr * 2
                                 balance += net_r
                                 if not position["scaled"]: day_losses += 1
                                 trades.append({"side":"SELL","entry":round(position["entry"],6),"exit":round(ep_r,6),"pnl":round(net_r,4),"entry_time":position["time"],"exit_time":t_r,"reason":"Stop loss","rr":position.get("rr",2.5),"sl_pct":position.get("sl_pct",0),"session":position.get("session","NY")})
                                 position = None
                         else:
-                            if not position["scaled"] and h_r >= position["tp1"]:
+                            # Pessimistic: SL wins if both SL and TP hit same bar
+                            _fb_sl = lo_r <= position["sl"]
+                            _fb_tp = (not position["scaled"]) and h_r >= position["tp1"]
+                            if _fb_sl and _fb_tp:
+                                ep_r = position["sl"]; sz_r = position["size_rem"] if position["scaled"] else position["size"]
+                                net_r = (ep_r - position["entry"]) * sz_r - position["entry"] * sz_r * _fb_fr * 2
+                                balance += net_r
+                                if not position["scaled"]: day_losses += 1
+                                trades.append({"side":"BUY","entry":round(position["entry"],6),"exit":round(ep_r,6),"pnl":round(net_r,4),"entry_time":position["time"],"exit_time":t_r,"reason":"Stop loss","rr":position.get("rr",2.5),"sl_pct":position.get("sl_pct",0),"session":position.get("session","NY")})
+                                position = None
+                            elif _fb_tp:
                                 ep_r = position["tp1"]; sz_r = position["size"] * 0.5
-                                net_r = (ep_r - position["entry"]) * sz_r - position["entry"] * sz_r * fee_rate * 2
+                                net_r = (ep_r - position["entry"]) * sz_r - position["entry"] * sz_r * _fb_fr * 2
                                 balance += net_r; day_wins += 1
                                 trades.append({"side":"BUY","entry":round(position["entry"],6),"exit":round(ep_r,6),"pnl":round(net_r,4),"entry_time":position["time"],"exit_time":t_r,"reason":"Take profit","rr":position.get("rr",2.5),"sl_pct":position.get("sl_pct",0),"session":position.get("session","NY")})
                                 position = None
-                            elif lo_r <= position["sl"]:
+                            elif _fb_sl:
                                 ep_r = position["sl"]; sz_r = position["size_rem"] if position["scaled"] else position["size"]
-                                net_r = (ep_r - position["entry"]) * sz_r - position["entry"] * sz_r * fee_rate * 2
+                                net_r = (ep_r - position["entry"]) * sz_r - position["entry"] * sz_r * _fb_fr * 2
                                 balance += net_r
                                 if not position["scaled"]: day_losses += 1
                                 trades.append({"side":"BUY","entry":round(position["entry"],6),"exit":round(ep_r,6),"pnl":round(net_r,4),"entry_time":position["time"],"exit_time":t_r,"reason":"Stop loss","rr":position.get("rr",2.5),"sl_pct":position.get("sl_pct",0),"session":position.get("session","NY")})
@@ -2597,7 +2674,7 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                         last_r = (after or ny)[-1] if (after or ny) else None
                         if last_r:
                             lc_r = float(last_r[4]); sz_r = position["size_rem"] if position["scaled"] else position["size"]
-                            net_r = ((lc_r - position["entry"]) if position["side"] == "BUY" else (position["entry"] - lc_r)) * sz_r - position["entry"] * sz_r * fee_rate * 2
+                            net_r = ((lc_r - position["entry"]) if position["side"] == "BUY" else (position["entry"] - lc_r)) * sz_r - position["entry"] * sz_r * _fb_fr * 2
                             balance += net_r
                             trades.append({"side":position["side"],"entry":round(position["entry"],6),"exit":round(lc_r,6),"pnl":round(net_r,4),"entry_time":position["time"],"exit_time":last_r[0],"reason":"Session-end close","rr":position.get("rr",2.5),"sl_pct":position.get("sl_pct",0),"session":position.get("session","NY")})
                             position = None
@@ -2623,8 +2700,15 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                         break
 
             raw_entry   = fvg_entry_price if fvg_entry_price is not None else ec
-            entry_price = raw_entry * (1 - slip_rate) if reversal == "SELL" \
-                          else raw_entry * (1 + slip_rate)
+            # Volatile slippage: scales with the entry candle's range and ATR
+            _ec_idx    = _pa_cidx.get(int(entry_candle[0]), -1)
+            _ec_range  = float(entry_candle[2]) - float(entry_candle[3])
+            _ec_atr    = (_pa_atr[_ec_idx]
+                          if 0 <= _ec_idx < len(_pa_atr) else None)
+            _act_slip  = _vol_slippage(slip_rate, float(entry_candle[2]),
+                                       float(entry_candle[3]), raw_entry, _ec_atr)
+            entry_price = raw_entry * (1 - _act_slip) if reversal == "SELL" \
+                          else raw_entry * (1 + _act_slip)
 
             risk_dist = abs(entry_price - sl_price)
             if risk_dist <= 0:
@@ -2667,11 +2751,38 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                 h   = float(c[2]); lo_ = float(c[3])
                 t   = c[0]; side = position["side"]
 
+                # ── Pessimistic intrabar fill rule ──────────────────────────
+                # If both SL and TP are touched within the same bar's range,
+                # assume SL was hit first (worst-case fill).
                 if side == "SELL":
-                    if not position["scaled"] and lo_ <= position["tp1"]:
+                    _sl_hit  = h   >= position["sl"]
+                    _tp1_hit = (not position["scaled"]) and lo_ <= position["tp1"]
+                    _tp2_hit = position["scaled"] and lo_ <= position["tp2"]
+
+                    if _sl_hit and (_tp1_hit or _tp2_hit):
+                        # SL and TP both reachable this bar → SL wins
+                        ep  = position["sl"]
+                        sz  = position["size_rem"] if position["scaled"] else position["size"]
+                        gp  = (position["entry"] - ep) * sz
+                        fee = position["entry"] * sz * (fee_rate + spread_rate) * 2
+                        net = gp - fee
+                        balance += net
+                        trades.append({
+                            "side": "SELL", "entry": round(position["entry"], 6),
+                            "exit": round(ep, 6), "pnl": round(net, 4),
+                            "entry_time": position["time"], "exit_time": t,
+                            "reason": ("Stop loss (at breakeven)"
+                                       if position["scaled"] else "Stop loss"),
+                            "rr": position.get("rr", 2.0), "sl_pct": position.get("sl_pct", 0),
+                            "session": position.get("session", "NY"),
+                        })
+                        if not position["scaled"]: day_losses += 1
+                        position = None
+
+                    elif _tp1_hit:
                         ep  = position["tp1"]; sz = position["size"] * 0.5
                         gp  = (position["entry"] - ep) * sz
-                        fee = position["entry"] * sz * fee_rate * 2
+                        fee = position["entry"] * sz * (fee_rate + spread_rate) * 2
                         net = gp - fee
                         balance += net
                         trades.append({
@@ -2685,10 +2796,10 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                         position["scaled"] = True
                         position["sl"]     = position["entry"]
 
-                    elif position["scaled"] and lo_ <= position["tp2"]:
+                    elif _tp2_hit:
                         ep  = position["tp2"]; sz = position["size_rem"]
                         gp  = (position["entry"] - ep) * sz
-                        fee = position["entry"] * sz * fee_rate * 2
+                        fee = position["entry"] * sz * (fee_rate + spread_rate) * 2
                         net = gp - fee
                         balance += net
                         trades.append({
@@ -2701,11 +2812,11 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                         })
                         day_wins += 1; position = None
 
-                    elif h >= position["sl"]:
+                    elif _sl_hit:
                         ep  = position["sl"]
                         sz  = position["size_rem"] if position["scaled"] else position["size"]
                         gp  = (position["entry"] - ep) * sz
-                        fee = position["entry"] * sz * fee_rate * 2
+                        fee = position["entry"] * sz * (fee_rate + spread_rate) * 2
                         net = gp - fee
                         balance += net
                         trades.append({
@@ -2721,10 +2832,34 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                         position = None
 
                 else:  # BUY
-                    if not position["scaled"] and h >= position["tp1"]:
+                    _sl_hit  = lo_ <= position["sl"]
+                    _tp1_hit = (not position["scaled"]) and h >= position["tp1"]
+                    _tp2_hit = position["scaled"] and h >= position["tp2"]
+
+                    if _sl_hit and (_tp1_hit or _tp2_hit):
+                        # SL and TP both reachable this bar → SL wins
+                        ep  = position["sl"]
+                        sz  = position["size_rem"] if position["scaled"] else position["size"]
+                        gp  = (ep - position["entry"]) * sz
+                        fee = position["entry"] * sz * (fee_rate + spread_rate) * 2
+                        net = gp - fee
+                        balance += net
+                        trades.append({
+                            "side": "BUY", "entry": round(position["entry"], 6),
+                            "exit": round(ep, 6), "pnl": round(net, 4),
+                            "entry_time": position["time"], "exit_time": t,
+                            "reason": ("Stop loss (at breakeven)"
+                                       if position["scaled"] else "Stop loss"),
+                            "rr": position.get("rr", 2.0), "sl_pct": position.get("sl_pct", 0),
+                            "session": position.get("session", "NY"),
+                        })
+                        if not position["scaled"]: day_losses += 1
+                        position = None
+
+                    elif _tp1_hit:
                         ep  = position["tp1"]; sz = position["size"] * 0.5
                         gp  = (ep - position["entry"]) * sz
-                        fee = position["entry"] * sz * fee_rate * 2
+                        fee = position["entry"] * sz * (fee_rate + spread_rate) * 2
                         net = gp - fee
                         balance += net
                         trades.append({
@@ -2738,10 +2873,10 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                         position["scaled"] = True
                         position["sl"]     = position["entry"]
 
-                    elif position["scaled"] and h >= position["tp2"]:
+                    elif _tp2_hit:
                         ep  = position["tp2"]; sz = position["size_rem"]
                         gp  = (ep - position["entry"]) * sz
-                        fee = position["entry"] * sz * fee_rate * 2
+                        fee = position["entry"] * sz * (fee_rate + spread_rate) * 2
                         net = gp - fee
                         balance += net
                         trades.append({
@@ -2754,11 +2889,11 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                         })
                         day_wins += 1; position = None
 
-                    elif lo_ <= position["sl"]:
+                    elif _sl_hit:
                         ep  = position["sl"]
                         sz  = position["size_rem"] if position["scaled"] else position["size"]
                         gp  = (ep - position["entry"]) * sz
-                        fee = position["entry"] * sz * fee_rate * 2
+                        fee = position["entry"] * sz * (fee_rate + spread_rate) * 2
                         net = gp - fee
                         balance += net
                         trades.append({
@@ -2780,7 +2915,7 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                     sz  = position["size_rem"] if position["scaled"] else position["size"]
                     gp  = ((lc - position["entry"]) if position["side"] == "BUY"
                            else (position["entry"] - lc)) * sz
-                    fee = position["entry"] * sz * fee_rate * 2
+                    fee = position["entry"] * sz * (fee_rate + spread_rate) * 2
                     net = gp - fee
                     balance += net
                     trades.append({
@@ -2930,7 +3065,7 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
 
             if exit_price:
                 gp  = ((exit_price - ep) if side == "BUY" else (ep - exit_price)) * sz
-                fee = ep * sz * fee_rate * 2
+                fee = ep * sz * (fee_rate + spread_rate) * 2
                 net = gp - fee
                 balance += net          # ← FIX: was missing, caused net PnL = $0
                 if net > 0: day_wins  += 1; week_wins   += 1
@@ -3081,7 +3216,8 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
             # No HTF data: use current-TF ATR but enforce 0.5% minimum
             # (was 0.1% — way too tight, caused constant stop-outs)
             sl_dist = max(atr_v * _atr_mult_b, close * 0.005)
-        ep       = close * (1 + slip_rate) if direction == "BUY" else close * (1 - slip_rate)
+        _b_slip  = _vol_slippage(slip_rate, hi, lo, close, atr_v)
+        ep       = close * (1 + _b_slip) if direction == "BUY" else close * (1 - _b_slip)
         sl_p     = ep - sl_dist if direction == "BUY" else ep + sl_dist
         tp_p     = ep + sl_dist * dyn_rr if direction == "BUY" else ep - sl_dist * dyn_rr
         sz       = risk_dollar_dyn / sl_dist if sl_dist > 0 else 0
@@ -3320,6 +3456,9 @@ def api_backtest():
         except Exception as _htf_err:
             print(f"[backtest] HTF 1h fetch skipped: {_htf_err}")
 
+    # Per-market spread cost (one-way %; 0 for crypto — absorbed in fee)
+    spread_pct = MARKET_SPREADS.get(market, 0.0)
+
     try:
         if strategy in ("unified_bot", "bot"):   # "bot" kept as legacy alias
             trades, ending_balance = run_unified_bot_strategy(
@@ -3329,17 +3468,21 @@ def api_backtest():
                 weekly_max_loss_pct=_wml_pct,
                 user_cfg=cfg,
                 htf_candles=htf_candles,  # 1h candles for MTF SL + bias
+                spread_pct=spread_pct,
             )
         elif strategy == "orb_0dte":
-            trades, ending_balance = run_orb_strategy(candles, sb, fee_pct, slip_pct)
+            trades, ending_balance = run_orb_strategy(candles, sb, fee_pct, slip_pct,
+                                                       spread_pct=spread_pct)
         elif strategy == "vwap_ema":
-            trades, ending_balance = run_vwap_ema_strategy(candles, sb, fee_pct, slip_pct)
+            trades, ending_balance = run_vwap_ema_strategy(candles, sb, fee_pct, slip_pct,
+                                                            spread_pct=spread_pct)
         else:
             trades, ending_balance = run_simple_ma_strategy(
                 candles, sb, fee_pct, slip_pct,
                 weekly_win_goal=_ww_goal,
                 weekly_profit_target_pct=_wpt_pct,
                 weekly_max_loss_pct=_wml_pct,
+                spread_pct=spread_pct,
             )
     except Exception as e:
         return jsonify({
@@ -3507,6 +3650,7 @@ def api_backtest():
         "low_sample_warning":   low_sample_warning,
         "low_sample_msg":       low_sample_msg,
         "random_window":        rand_window,
+        "spread_pct":           spread_pct,
     }
 
     # Sample up to 400 candles for the chart (keep response size reasonable)
