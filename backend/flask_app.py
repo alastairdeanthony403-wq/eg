@@ -180,11 +180,29 @@ DEFAULT_CONFIG = {
     "weekly_win_goal":               3,     # stop new trades after N wins this week
     "weekly_profit_target_percent":  3.0,   # stop new trades after +3% weekly profit
     "weekly_max_loss_percent":       0.8,   # stop new trades after -0.8% weekly loss
+    # ── Hard risk backstop (kill-switch) ──────────────────────────────────
+    # Server-side drawdown limit independent of all strategy logic.
+    # If (peak_balance - current_balance) / peak_balance * 100 exceeds this,
+    # ALL new trade openings are blocked until the halt is manually cleared.
+    # 5% is the standard prop-firm trailing drawdown rule.
+    "max_account_drawdown_pct":      5.0,
 }
 
 JWT_SECRET      = os.environ.get("JWT_SECRET", "ai-trading-engine-secret-change-me")
 JWT_ALGO        = "HS256"
 JWT_EXPIRY_DAYS = 30   # was 7 — tokens were expiring too quickly
+
+# ── Trading mode gate ────────────────────────────────────────────────────────
+# LIVE_MODE_ENABLED must be explicitly set to the string "true" as a server
+# environment variable before live-order execution can ever be attempted.
+# It is FALSE by default and must never be True in this codebase without a
+# completed PRE_LIVE_CHECKLIST.md sign-off.
+#
+# Current state: no broker API is integrated, so even LIVE_MODE_ENABLED=true
+# has no execution path — it is a guard rail for a future integration.
+LIVE_MODE_ENABLED = os.environ.get("LIVE_MODE_ENABLED", "").strip().lower() == "true"
+
+VALID_TRADING_MODES = {"paper", "local_paper"}   # "live" is not in this set intentionally
 
 MARKET_DATA_TTL_SECONDS  = 30
 SUMMARY_TTL_SECONDS      = 90
@@ -271,6 +289,44 @@ def init_db():
         win_rate_before FLOAT,
         win_rate_after FLOAT
     )""")
+
+    # ── Risk backstop (kill-switch) ────────────────────────────────────
+    # One row per user. Tracks peak balance and whether the account is
+    # halted due to exceeding max_account_drawdown_pct.
+    # Independent of all strategy logic — checked before any trade opens.
+    c.execute("""CREATE TABLE IF NOT EXISTS risk_backstop (
+        user_id          TEXT PRIMARY KEY,
+        peak_balance     REAL    NOT NULL DEFAULT 0,
+        current_balance  REAL    NOT NULL DEFAULT 0,
+        drawdown_pct     REAL    NOT NULL DEFAULT 0,
+        halted           BOOLEAN NOT NULL DEFAULT FALSE,
+        halted_at        TIMESTAMPTZ,
+        halted_reason    TEXT,
+        last_updated     TIMESTAMPTZ DEFAULT NOW()
+    )""")
+
+    # ── Fill reconciliation log ────────────────────────────────────────
+    # Records expected entry/exit (from signal levels) vs. the price that
+    # was actually used for the paper fill. Exposes divergence between
+    # backtest assumptions and real-time execution simulation.
+    c.execute("""CREATE TABLE IF NOT EXISTS fill_log (
+        id               TEXT PRIMARY KEY,
+        user_id          TEXT NOT NULL,
+        trade_id         TEXT,
+        symbol           TEXT NOT NULL,
+        side             TEXT NOT NULL,
+        mode             TEXT NOT NULL DEFAULT 'paper',
+        expected_entry   REAL,
+        actual_fill      REAL,
+        expected_sl      REAL,
+        expected_tp      REAL,
+        expected_rr      REAL,
+        slippage_pct     REAL,
+        signal_time      TIMESTAMPTZ,
+        fill_time        TIMESTAMPTZ DEFAULT NOW(),
+        notes            TEXT
+    )""")
+
     conn.commit()
     conn.close()
 
@@ -3477,6 +3533,143 @@ def run_lean_confluence_strategy(
 
 
 # ─────────────────────────────────────────────
+# RISK BACKSTOP  (kill-switch)
+# ─────────────────────────────────────────────
+# These functions are entirely independent of strategy logic.
+# They operate only on account balance data from the trades table.
+
+def _get_risk_state(user_id):
+    """Return the risk_backstop row for user_id, or None if not initialised."""
+    conn = get_conn(); c = conn.cursor()
+    c.execute("SELECT peak_balance, current_balance, drawdown_pct, halted, "
+              "       halted_at, halted_reason, last_updated "
+              "FROM risk_backstop WHERE user_id=%s", (user_id,))
+    row = c.fetchone(); conn.close()
+    if not row:
+        return None
+    return {
+        "peak_balance":    row[0], "current_balance": row[1],
+        "drawdown_pct":    row[2], "halted":          row[3],
+        "halted_at":       str(row[4]) if row[4] else None,
+        "halted_reason":   row[5],
+        "last_updated":    str(row[6]) if row[6] else None,
+    }
+
+
+def update_risk_backstop(user_id, current_balance, cfg=None):
+    """
+    Recalculate drawdown from peak_balance and current_balance.
+    If drawdown exceeds max_account_drawdown_pct, set halted=True.
+    Call this after every trade close.
+
+    Returns the updated risk state dict.
+    """
+    limit_pct = float((cfg or {}).get("max_account_drawdown_pct", 5.0))
+    conn = get_conn(); c = conn.cursor()
+
+    c.execute("SELECT peak_balance, halted FROM risk_backstop WHERE user_id=%s",
+              (user_id,))
+    row = c.fetchone()
+
+    if row is None:
+        # First-time initialisation for this user
+        peak = max(current_balance, 0.01)
+        c.execute("""INSERT INTO risk_backstop
+                     (user_id, peak_balance, current_balance, drawdown_pct,
+                      halted, last_updated)
+                     VALUES (%s, %s, %s, 0, FALSE, NOW())""",
+                  (user_id, peak, current_balance))
+        conn.commit(); conn.close()
+        return _get_risk_state(user_id)
+
+    peak, already_halted = row
+    # Ratchet peak upward — never lower it
+    new_peak = max(peak, current_balance)
+    dd_pct   = (new_peak - current_balance) / new_peak * 100 if new_peak > 0 else 0.0
+
+    should_halt = dd_pct >= limit_pct
+    reason      = None
+    if should_halt and not already_halted:
+        reason = (f"Account drawdown {dd_pct:.2f}% reached the "
+                  f"{limit_pct:.1f}% limit. All new trades blocked.")
+        c.execute("""UPDATE risk_backstop
+                     SET peak_balance=%s, current_balance=%s, drawdown_pct=%s,
+                         halted=TRUE, halted_at=NOW(), halted_reason=%s,
+                         last_updated=NOW()
+                     WHERE user_id=%s""",
+                  (new_peak, current_balance, round(dd_pct, 4), reason, user_id))
+    else:
+        c.execute("""UPDATE risk_backstop
+                     SET peak_balance=%s, current_balance=%s, drawdown_pct=%s,
+                         last_updated=NOW()
+                     WHERE user_id=%s""",
+                  (new_peak, current_balance, round(dd_pct, 4), user_id))
+
+    conn.commit(); conn.close()
+    return _get_risk_state(user_id)
+
+
+def is_risk_halted(user_id):
+    """
+    Fast check: returns (halted: bool, reason: str).
+    Does NOT update any state — purely reads the current flag.
+    """
+    state = _get_risk_state(user_id)
+    if state is None:
+        return False, None
+    return bool(state["halted"]), state.get("halted_reason")
+
+
+def _compute_account_balance(user_id, starting_balance):
+    """
+    Sum all realised PnL from closed paper trades and add to starting_balance.
+    Used to keep the risk backstop balance current.
+    """
+    conn = get_conn(); c = conn.cursor()
+    c.execute("SELECT COALESCE(SUM(pnl), 0) FROM trades "
+              "WHERE user_id=%s AND status='CLOSED'", (user_id,))
+    realised_pnl = float(c.fetchone()[0] or 0)
+    conn.close()
+    return starting_balance + realised_pnl
+
+
+# ─────────────────────────────────────────────
+# FILL RECONCILIATION  (paper vs. expectation)
+# ─────────────────────────────────────────────
+
+def log_fill(user_id, trade_id, symbol, side, mode,
+             expected_entry, actual_fill, expected_sl, expected_tp,
+             expected_rr=None, notes=None):
+    """
+    Write one row to fill_log.
+    slippage_pct = (actual_fill - expected_entry) / expected_entry * 100
+    For BUY: positive slippage = paid more than expected (bad).
+    For SELL: negative slippage = sold lower than expected (bad).
+    """
+    if expected_entry and expected_entry > 0 and actual_fill:
+        raw_slip = (actual_fill - expected_entry) / expected_entry * 100
+        # Normalise: for SELL a negative raw_slip is also "cost"
+        slippage_pct = raw_slip if side == "BUY" else -raw_slip
+    else:
+        slippage_pct = None
+
+    fill_id = str(uuid.uuid4())
+    try:
+        conn = get_conn(); c = conn.cursor()
+        c.execute("""INSERT INTO fill_log
+                     (id, user_id, trade_id, symbol, side, mode,
+                      expected_entry, actual_fill, expected_sl, expected_tp,
+                      expected_rr, slippage_pct, fill_time, notes)
+                     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(),%s)""",
+                  (fill_id, user_id, trade_id, symbol, side, mode,
+                   expected_entry, actual_fill, expected_sl, expected_tp,
+                   expected_rr, slippage_pct, notes))
+        conn.commit(); conn.close()
+    except Exception as _fe:
+        print(f"[fill_log] write error: {_fe}")
+
+
+# ─────────────────────────────────────────────
 # API ROUTES
 # ─────────────────────────────────────────────
 
@@ -3484,6 +3677,165 @@ def run_lean_confluence_strategy(
 def health():
     polygon_key = os.environ.get("POLYGON_API_KEY", "")
     return jsonify({"ok": True, "time": now_str(), "polygon_key": bool(polygon_key)})
+
+
+# ── Trading mode ──────────────────────────────────────────────────────────────
+@app.route("/api/trading-mode", methods=["GET"])
+@auth_required
+def get_trading_mode():
+    """
+    Returns the current trading mode and whether live trading is possible.
+
+    live_possible is always False until:
+      1. A broker API is integrated (none exists yet)
+      2. LIVE_MODE_ENABLED env var is set to "true" on the server
+      3. PRE_LIVE_CHECKLIST.md is fully signed off
+
+    This endpoint is safe to call from the frontend to display a mode badge.
+    """
+    cfg  = get_user_config()
+    mode = cfg.get("trading_mode", "local_paper")
+
+    # Block any attempt to set a live mode without the env var
+    if mode not in VALID_TRADING_MODES and not LIVE_MODE_ENABLED:
+        mode = "local_paper"   # silently normalise back to paper
+
+    return jsonify({
+        "mode":          mode,
+        "live_possible": LIVE_MODE_ENABLED,
+        "live_enabled":  False,   # no broker API exists — always False
+        "warning":       (
+            "Live trading is not implemented. "
+            "LIVE_MODE_ENABLED is for future use only."
+        ) if LIVE_MODE_ENABLED else None,
+        "valid_modes":   list(VALID_TRADING_MODES),
+    })
+
+
+# ── Risk backstop status & management ────────────────────────────────────────
+@app.route("/api/risk-status", methods=["GET"])
+@auth_required
+def risk_status():
+    """
+    Returns the current kill-switch state for this account.
+    Call this from the frontend to show a drawdown gauge and halt badge.
+    """
+    cfg             = get_user_config()
+    starting_bal    = float(cfg.get("starting_balance", 10000))
+    current_bal     = _compute_account_balance(g.user_id, starting_bal)
+    limit_pct       = float(cfg.get("max_account_drawdown_pct", 5.0))
+
+    # Ensure risk state exists and is up to date
+    state = update_risk_backstop(g.user_id, current_bal, cfg)
+
+    return jsonify({
+        "ok":                    True,
+        "halted":                state["halted"],
+        "halted_reason":         state.get("halted_reason"),
+        "halted_at":             state.get("halted_at"),
+        "peak_balance":          round(state["peak_balance"], 2),
+        "current_balance":       round(current_bal, 2),
+        "drawdown_pct":          round(state["drawdown_pct"], 4),
+        "max_drawdown_pct":      limit_pct,
+        "headroom_pct":          round(max(0, limit_pct - state["drawdown_pct"]), 4),
+        "last_updated":          state.get("last_updated"),
+    })
+
+
+@app.route("/api/risk/reset-halt", methods=["POST", "OPTIONS"])
+@auth_required
+def reset_risk_halt():
+    """
+    Manually clears the kill-switch halt flag.
+
+    This should only be done after:
+      - Reviewing why the drawdown limit was hit
+      - Adjusting position sizing or strategy parameters
+      - Deliberately deciding to continue paper trading
+
+    The halt flag is NOT auto-cleared when balance recovers — that would
+    defeat the purpose of the rule.
+    """
+    conn = get_conn(); c = conn.cursor()
+    c.execute("""UPDATE risk_backstop
+                 SET halted=FALSE, halted_reason=NULL, halted_at=NULL,
+                     last_updated=NOW()
+                 WHERE user_id=%s""", (g.user_id,))
+    conn.commit(); conn.close()
+    add_alert(g.user_id, "Risk halt manually cleared — trading resumed")
+    return jsonify({"ok": True, "message": "Halt cleared. Monitor drawdown closely."})
+
+
+# ── Fill reconciliation ───────────────────────────────────────────────────────
+@app.route("/api/fill-reconciliation", methods=["GET"])
+@auth_required
+def fill_reconciliation():
+    """
+    Returns per-trade fill divergence and aggregate slippage summary.
+
+    Use this to compare paper-trading fills against backtest assumptions:
+      - If mean_slippage_pct > 0.15%, your backtester is too optimistic on entry.
+      - If max_slippage_pct > 0.50%, review position sizing for volatile entries.
+      - high_divergence_count is fills where |slippage_pct| > 0.5%.
+
+    Query params:
+      limit  — max rows returned (default 100)
+      symbol — filter by symbol (optional)
+    """
+    limit  = max(1, min(int(request.args.get("limit", 100)), 500))
+    symbol = (request.args.get("symbol") or "").upper().strip() or None
+
+    conn = get_conn(); c = conn.cursor()
+    if symbol:
+        c.execute("""SELECT id, trade_id, symbol, side, mode,
+                            expected_entry, actual_fill, expected_sl, expected_tp,
+                            expected_rr, slippage_pct, fill_time, notes
+                     FROM fill_log WHERE user_id=%s AND symbol=%s
+                     ORDER BY fill_time DESC LIMIT %s""",
+                  (g.user_id, symbol, limit))
+    else:
+        c.execute("""SELECT id, trade_id, symbol, side, mode,
+                            expected_entry, actual_fill, expected_sl, expected_tp,
+                            expected_rr, slippage_pct, fill_time, notes
+                     FROM fill_log WHERE user_id=%s
+                     ORDER BY fill_time DESC LIMIT %s""",
+                  (g.user_id, limit))
+    rows = c.fetchall(); conn.close()
+
+    fills = [{
+        "id":             r[0],  "trade_id":      r[1],
+        "symbol":         r[2],  "side":          r[3],
+        "mode":           r[4],  "expected_entry":r[5],
+        "actual_fill":    r[6],  "expected_sl":   r[7],
+        "expected_tp":    r[8],  "expected_rr":   r[9],
+        "slippage_pct":   r[10], "fill_time":     str(r[11]) if r[11] else None,
+        "notes":          r[12],
+    } for r in rows]
+
+    # ── Aggregate stats ───────────────────────────────────────────────────────
+    slippages = [f["slippage_pct"] for f in fills if f["slippage_pct"] is not None]
+    mean_slip  = round(sum(slippages) / len(slippages), 4) if slippages else None
+    max_slip   = round(max(slippages), 4)                   if slippages else None
+    min_slip   = round(min(slippages), 4)                   if slippages else None
+    high_div   = sum(1 for s in slippages if abs(s) > 0.50)
+
+    return jsonify({
+        "ok":                  True,
+        "total_logged":        len(fills),
+        "aggregate": {
+            "mean_slippage_pct":   mean_slip,
+            "max_slippage_pct":    max_slip,
+            "min_slippage_pct":    min_slip,
+            "high_divergence_count": high_div,
+            "high_divergence_threshold_pct": 0.50,
+            "assessment": (
+                "ACCEPTABLE"   if mean_slip is not None and mean_slip <= 0.15 else
+                "REVIEW NEEDED" if mean_slip is not None and mean_slip <= 0.40 else
+                "UNACCEPTABLE" if mean_slip is not None else "NO DATA"
+            ),
+        },
+        "fills": fills,
+    })
 
 
 @app.route("/api/symbols", methods=["GET"])
@@ -4261,6 +4613,20 @@ def paper_bot_scan():
         except Exception:
             cfg = dict(DEFAULT_CONFIG)
 
+        # ── KILL-SWITCH: hard risk backstop check ─────────────────────────
+        # This is independent of strategy logic and must run before anything
+        # else that could open a trade.
+        _halted, _halt_reason = is_risk_halted(g.user_id)
+        if _halted:
+            return jsonify({
+                "ok":         False,
+                "halted":     True,
+                "halt_reason": _halt_reason,
+                "message":    "Risk kill-switch is active. No new trades allowed. "
+                              "Review drawdown and call POST /api/risk/reset-halt "
+                              "to resume after investigation.",
+            }), 403
+
         symbols = (cfg.get("symbols") or ALL_SYMBOLS)[:12]
 
         min_conf   = int(cfg.get("min_confidence", 70))
@@ -4338,6 +4704,25 @@ def paper_bot_scan():
                     "INSERT INTO trades VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NULL,NULL,'OPEN',%s)",
                     (tid, g.user_id, sym, signal, ep, levels["sl"], levels["tp"], size, now_str()))
                 conn.commit(); conn.close()
+
+                # ── Fill reconciliation: log expected vs. actual fill ──────
+                # expected_entry = the signal price (current market close).
+                # actual_fill    = ep (which includes simulated slippage).
+                # This divergence is what /api/fill-reconciliation reports.
+                log_fill(
+                    user_id        = g.user_id,
+                    trade_id       = tid,
+                    symbol         = sym,
+                    side           = signal,
+                    mode           = cfg.get("trading_mode", "local_paper"),
+                    expected_entry = levels.get("signal_price") or ep,
+                    actual_fill    = ep,
+                    expected_sl    = levels["sl"],
+                    expected_tp    = levels["tp"],
+                    expected_rr    = levels.get("rr"),
+                    notes          = f"bot_scan conf={confidence:.1f}%",
+                )
+
                 add_alert(g.user_id,
                           f"BOT OPEN {sym} {signal} @ {format_price(ep, sym)} "
                           f"(conf {confidence:.0f}%)")
@@ -4454,6 +4839,15 @@ def open_paper_trade():
     side = d.get("side", "BUY").upper()
     cfg  = get_user_config()
 
+    # ── KILL-SWITCH: hard risk backstop check ────────────────────────
+    _halted, _halt_reason = is_risk_halted(g.user_id)
+    if _halted:
+        return jsonify({
+            "error":       "Risk kill-switch active — no new trades allowed",
+            "halt_reason": _halt_reason,
+            "halted":      True,
+        }), 403
+
     # ── Weekly pause gate ─────────────────────────────────────────────
     weekly = is_weekly_paused(g.user_id, cfg)
     if weekly["weekly_trading_paused"]:
@@ -4492,6 +4886,22 @@ def open_paper_trade():
         "INSERT INTO trades VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NULL,NULL,'OPEN',%s)",
         (tid, g.user_id, sym, side, price, levels["sl"], levels["tp"], size, now_str()))
     conn.commit(); conn.close()
+
+    # ── Fill reconciliation: log expected vs. actual fill ─────────────
+    log_fill(
+        user_id        = g.user_id,
+        trade_id       = tid,
+        symbol         = sym,
+        side           = side,
+        mode           = cfg.get("trading_mode", "local_paper"),
+        expected_entry = levels.get("signal_price") or price,
+        actual_fill    = price,
+        expected_sl    = levels["sl"],
+        expected_tp    = levels["tp"],
+        expected_rr    = levels.get("rr"),
+        notes          = "manual open",
+    )
+
     add_alert(g.user_id, f"OPEN {sym} {side} @ {format_price(price, sym)}")
     return jsonify({
         "ok":    True, "id": tid,
@@ -4520,6 +4930,18 @@ def close_paper_trade(tid):
         "UPDATE trades SET exit=%s,pnl=%s,status='CLOSED',time=%s WHERE id=%s",
         (price, pnl, now_str(), tid))
     conn.commit(); conn.close()
+
+    # ── Update risk backstop after every trade close ──────────────────
+    # This keeps the drawdown figure current so the kill-switch fires
+    # promptly if the limit is breached.
+    try:
+        cfg         = get_user_config()
+        starting_b  = float(cfg.get("starting_balance", 10000))
+        current_bal = _compute_account_balance(g.user_id, starting_b)
+        update_risk_backstop(g.user_id, current_bal, cfg)
+    except Exception as _rb_err:
+        print(f"[risk_backstop] update error after close: {_rb_err}")
+
     add_alert(g.user_id, f"CLOSED {sym} PnL {round(pnl, 4)}")
     return jsonify({"ok": True, "exit_price": price, "pnl": round(pnl, 4)})
 
