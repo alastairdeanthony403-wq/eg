@@ -1027,7 +1027,8 @@ function parseTradeTime(str) {
 
 function BacktestChart({ candles, trades, symbol }) {
   // ── ALL hooks must be called before any early return ──────────────────
-  const [hovered, setHovered] = React.useState(null);
+  const [hovered,       setHovered]       = React.useState(null);
+  const [annotationsOn, setAnnotationsOn] = React.useState(false);
 
   if (!candles?.length) return (
     <div style={{background:T.bg3,border:`1px solid ${T.border}`,borderRadius:5,
@@ -1036,130 +1037,186 @@ function BacktestChart({ candles, trades, symbol }) {
     </div>
   );
 
-  // Build close-price line from sampled candles
-  const lineData = candles.map(c => ({
-    t:     c.t,
-    close: c.c,
-    label: new Date(c.t).toLocaleDateString("en-GB",{month:"short",day:"numeric"}),
-  }));
-
-  // Map trades to chart entries/exits
+  // Map trades to chart entries/exits (include sl/tp for annotations)
   const tradeMarkers = trades.map((t, i) => {
     const tEntry = parseTradeTime(t.open_time  || t.entry_time);
     const tExit  = parseTradeTime(t.close_time || t.exit_time);
     const win = (t.pnl || 0) > 0;
     return {
-      id:       i,
-      tEntry,
-      tExit,
-      entry:    t.entry,
-      exit:     t.exit,
-      side:     t.side,
-      pnl:      t.pnl,
-      win,
-      reason:   t.exit_reason || t.reason || "—",
-      session:  t.session || "—",
+      id: i, tEntry, tExit,
+      entry: t.entry, exit: t.exit,
+      sl: t.sl, tp: t.tp,
+      side: t.side, pnl: t.pnl, win,
+      reason:  t.exit_reason || t.reason || "—",
+      session: t.session || "—",
+      confluence: t.confluence || 0,
     };
   });
 
-  const minT  = lineData[0]?.t || 0;
-  const maxT  = lineData[lineData.length - 1]?.t || 1;
+  const minT  = candles[0]?.t || 0;
+  const maxT  = candles[candles.length - 1]?.t || 1;
   const tSpan = maxT - minT || 1;
-  const prices  = lineData.map(d => d.close);
-  const minP  = Math.min(...prices);
-  const maxP  = Math.max(...prices);
+
+  // Price range: include all OHLC + SL/TP levels from trades
+  const allPrices = candles.flatMap(c => [c.h, c.l]);
+  tradeMarkers.forEach(m => {
+    if (m.sl) allPrices.push(m.sl);
+    if (m.tp) allPrices.push(m.tp);
+  });
+  const minP  = Math.min(...allPrices) * 0.9995;
+  const maxP  = Math.max(...allPrices) * 1.0005;
   const pSpan = maxP - minP || 1;
 
   // SVG dimensions
-  const W = 900; const H = 340;
-  const PAD = { top: 20, right: 20, bottom: 36, left: 70 };
+  const W = 900; const H = 380;
+  const PAD = { top: 20, right: 20, bottom: 36, left: 72 };
   const cW = W - PAD.left - PAD.right;
   const cH = H - PAD.top  - PAD.bottom;
 
-  const tx = t  => PAD.left + ((t  - minT) / tSpan) * cW;
-  const ty = p  => PAD.top  + cH - ((p - minP) / pSpan) * cH;
+  const tx = t => PAD.left + ((t - minT) / tSpan) * cW;
+  const ty = p => PAD.top  + cH - ((p - minP) / pSpan) * cH;
 
-  // Build SVG path for close-price line
-  const path = lineData.map((d, i) =>
-    `${i === 0 ? "M" : "L"}${tx(d.t).toFixed(1)},${ty(d.close).toFixed(1)}`
-  ).join(" ");
+  // Candlestick geometry
+  const spacing   = cW / candles.length;
+  const bodyW     = Math.max(1, spacing * 0.7);
+  const halfBody  = bodyW / 2;
 
-  // Y-axis tick values
+  // Y-axis ticks
   const yTicks = 5;
   const yTickVals = Array.from({length: yTicks}, (_, i) =>
     minP + (pSpan * i / (yTicks - 1))
   );
 
-  // X-axis tick labels (sample ~6 dates)
-  const xTickCount = Math.min(6, lineData.length);
-  const xTickStep  = Math.floor(lineData.length / xTickCount);
-  const xTicks     = lineData.filter((_, i) => i % xTickStep === 0);
+  // X-axis ticks
+  const xTickStep = Math.max(1, Math.floor(candles.length / 6));
+  const xTicks    = candles.filter((_, i) => i % xTickStep === 0);
+
+  const fmtLbl = v => v >= 1000
+    ? v.toLocaleString("en", {maximumFractionDigits: 0})
+    : v < 0.01 ? v.toExponential(2)
+    : v.toFixed(v < 1 ? 5 : 2);
 
   return (
     <div style={{background:T.bg3,border:`1px solid ${T.border}`,borderRadius:6,
       padding:"16px 10px 10px",marginBottom:14}}>
-      <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:12,padding:"0 10px"}}>
+      {/* Header + legend + annotation toggle */}
+      <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:12,padding:"0 10px",flexWrap:"wrap"}}>
         <span style={{fontFamily:MONO,fontSize:10,color:T.blue,letterSpacing:2}}>
-          PRICE CHART — {symbol}
+          CANDLESTICK CHART — {symbol}
         </span>
         <span style={{fontFamily:MONO,fontSize:9,color:T.t2}}>
-          {candles.length} sampled candles
+          {candles.length} candles
         </span>
-        <div style={{marginLeft:"auto",display:"flex",gap:16}}>
-          <span style={{fontFamily:MONO,fontSize:9,color:T.green}}>▲ BUY entry</span>
-          <span style={{fontFamily:MONO,fontSize:9,color:T.red}}>▼ SELL entry</span>
-          <span style={{fontFamily:MONO,fontSize:9,color:T.green}}>◆ Win exit</span>
-          <span style={{fontFamily:MONO,fontSize:9,color:T.red}}>◆ Loss exit</span>
+        <div style={{marginLeft:"auto",display:"flex",gap:12,alignItems:"center",flexWrap:"wrap"}}>
+          <span style={{fontFamily:MONO,fontSize:9,color:T.green}}>▲ BUY</span>
+          <span style={{fontFamily:MONO,fontSize:9,color:T.red}}>▼ SELL</span>
+          <span style={{fontFamily:MONO,fontSize:9,color:T.green}}>◆ Win</span>
+          <span style={{fontFamily:MONO,fontSize:9,color:T.red}}>◆ Loss</span>
+          <button onClick={() => setAnnotationsOn(a => !a)}
+            style={{fontFamily:MONO,fontSize:9,letterSpacing:1,
+              background: annotationsOn ? `${T.gold}22` : T.bg2,
+              border: `1px solid ${annotationsOn ? T.gold : T.border}`,
+              color: annotationsOn ? T.gold : T.t2,
+              borderRadius:3,padding:"3px 10px",cursor:"pointer"}}>
+            {annotationsOn ? "HIDE ANNOTATIONS" : "SHOW ANNOTATIONS"}
+          </button>
         </div>
       </div>
 
       <div style={{width:"100%",overflowX:"auto"}}>
         <svg width="100%" viewBox={`0 0 ${W} ${H}`} style={{display:"block",minWidth:400}}>
-          {/* Background */}
-          <rect x={PAD.left} y={PAD.top} width={cW} height={cH}
-            fill={T.bg2} rx="3"/>
+          {/* Background + clip */}
+          <defs>
+            <clipPath id="chartClip">
+              <rect x={PAD.left} y={PAD.top} width={cW} height={cH}/>
+            </clipPath>
+          </defs>
+          <rect x={PAD.left} y={PAD.top} width={cW} height={cH} fill={T.bg2} rx="3"/>
 
           {/* Y-axis grid + labels */}
           {yTickVals.map((v, i) => {
             const yy = ty(v);
-            const lbl = v >= 1000
-              ? v.toLocaleString("en",{maximumFractionDigits:0})
-              : v < 0.01 ? v.toExponential(2)
-              : v.toFixed(v < 1 ? 4 : 2);
             return (
               <g key={i}>
                 <line x1={PAD.left} y1={yy} x2={PAD.left + cW} y2={yy}
                   stroke={T.border} strokeDasharray="3 3" strokeWidth="0.5"/>
-                <text x={PAD.left - 6} y={yy + 4} textAnchor="end"
-                  fill={T.t2} fontSize="9" fontFamily={MONO}>{lbl}</text>
+                <text x={PAD.left - 5} y={yy + 4} textAnchor="end"
+                  fill={T.t2} fontSize="9" fontFamily={MONO}>{fmtLbl(v)}</text>
               </g>
             );
           })}
 
           {/* X-axis labels */}
-          {xTicks.map((d, i) => (
-            <text key={i} x={tx(d.t)} y={H - PAD.bottom + 14} textAnchor="middle"
-              fill={T.t2} fontSize="9" fontFamily={MONO}>{d.label}</text>
+          {xTicks.map((c, i) => (
+            <text key={i} x={tx(c.t)} y={H - PAD.bottom + 14} textAnchor="middle"
+              fill={T.t2} fontSize="9" fontFamily={MONO}>
+              {new Date(c.t).toLocaleDateString("en-GB",{month:"short",day:"numeric"})}
+            </text>
           ))}
 
-          {/* Price line gradient fill */}
-          <defs>
-            <linearGradient id="chartFill" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%"   stopColor={T.blue} stopOpacity="0.25"/>
-              <stop offset="100%" stopColor={T.blue} stopOpacity="0.02"/>
-            </linearGradient>
-            <clipPath id="chartClip">
-              <rect x={PAD.left} y={PAD.top} width={cW} height={cH}/>
-            </clipPath>
-          </defs>
+          {/* ── OHLC Candlesticks ── */}
+          <g clipPath="url(#chartClip)">
+            {candles.map((c, i) => {
+              const x   = PAD.left + (i / (candles.length - 1 || 1)) * cW;
+              const yo  = ty(c.o); const yc = ty(c.c);
+              const yh  = ty(c.h); const yl = ty(c.l);
+              const bull = c.c >= c.o;
+              const col  = bull ? T.green : T.red;
+              const bTop = Math.min(yo, yc);
+              const bHt  = Math.max(Math.abs(yo - yc), 1);
+              return (
+                <g key={i}>
+                  {/* Wick */}
+                  <line x1={x} y1={yh} x2={x} y2={yl}
+                    stroke={col} strokeWidth="0.7" strokeOpacity="0.7"/>
+                  {/* Body */}
+                  <rect x={x - halfBody} y={bTop} width={bodyW} height={bHt}
+                    fill={bull ? `${T.green}88` : `${T.red}88`}
+                    stroke={col} strokeWidth="0.4"/>
+                </g>
+              );
+            })}
+          </g>
 
-          {/* Area fill */}
-          <path d={path + ` L${tx(maxT).toFixed(1)},${PAD.top+cH} L${tx(minT).toFixed(1)},${PAD.top+cH} Z`}
-            fill="url(#chartFill)" clipPath="url(#chartClip)"/>
-
-          {/* Price line */}
-          <path d={path} fill="none" stroke={T.blue} strokeWidth="1.5"
-            clipPath="url(#chartClip)"/>
+          {/* ── Annotation overlay (SL/TP zone rectangles + level lines) ── */}
+          {annotationsOn && (
+            <g clipPath="url(#chartClip)">
+              {tradeMarkers.filter(m => m.sl && m.tp && m.tEntry && m.tExit).map(m => {
+                const x1 = tx(m.tEntry); const x2 = tx(m.tExit);
+                const yEntry = ty(m.entry);
+                const ySL    = ty(m.sl);
+                const yTP    = ty(m.tp);
+                const col    = m.win ? T.green : T.red;
+                const rectTop    = Math.min(ySL, yTP);
+                const rectBottom = Math.max(ySL, yTP);
+                const rectH  = Math.max(rectBottom - rectTop, 2);
+                return (
+                  <g key={m.id}>
+                    {/* SL–TP zone rectangle */}
+                    <rect x={x1} y={rectTop} width={Math.max(x2 - x1, 2)} height={rectH}
+                      fill={`${col}0D`} stroke={`${col}30`} strokeWidth="0.5"
+                      strokeDasharray="3 2"/>
+                    {/* Entry price line */}
+                    <line x1={x1} y1={yEntry} x2={x2} y2={yEntry}
+                      stroke={m.side === "BUY" ? T.green : T.red}
+                      strokeWidth="1.2" strokeDasharray="5 3"/>
+                    {/* SL line */}
+                    <line x1={x1} y1={ySL} x2={x2} y2={ySL}
+                      stroke={T.red} strokeWidth="0.8" strokeDasharray="3 3" strokeOpacity="0.7"/>
+                    {/* TP line */}
+                    <line x1={x1} y1={yTP} x2={x2} y2={yTP}
+                      stroke={T.green} strokeWidth="0.8" strokeDasharray="3 3" strokeOpacity="0.7"/>
+                    {/* SL label */}
+                    <text x={x2 + 3} y={ySL + 3} fill={T.red}
+                      fontSize="7" fontFamily={MONO} clipPath="url(#chartClip)">SL</text>
+                    {/* TP label */}
+                    <text x={x2 + 3} y={yTP + 3} fill={T.green}
+                      fontSize="7" fontFamily={MONO} clipPath="url(#chartClip)">TP</text>
+                  </g>
+                );
+              })}
+            </g>
+          )}
 
           {/* Trade entry/exit markers */}
           {tradeMarkers.map(m => {

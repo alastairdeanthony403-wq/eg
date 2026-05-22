@@ -2272,7 +2272,8 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                               weekly_win_goal=3,
                               weekly_profit_target_pct=3.0,
                               weekly_max_loss_pct=0.8,
-                              user_cfg=None):
+                              user_cfg=None,
+                              htf_candles=None):
     """
     ICT — Asian Range → London Push → New York Reversal
 
@@ -2502,9 +2503,20 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                         continue
                     if fb_dir == "SELL" and e50_f is not None and e9_f > e50_f * 1.002:
                         continue
+                    # HTF bias filter: skip counter-trend EMA fallbacks
+                    _fb_htf = _htf_bias_lu.get(int(c_fb[0])) if _htf_bias_lu else None
+                    if _fb_htf == 'BEAR' and fb_dir == 'BUY':
+                        continue
+                    if _fb_htf == 'BULL' and fb_dir == 'SELL':
+                        continue
                     fb_c   = float(c_fb[4])
                     fb_ep  = fb_c * (1 + slip_rate) if fb_dir == "BUY" else fb_c * (1 - slip_rate)
-                    fb_sl_d = max(atr_f * 1.5, fb_ep * 0.002)
+                    # SL: use HTF ATR if available; hard minimum 0.5% (was 0.2% — too tight)
+                    _fb_htf_atr = _htf_atr_lu.get(int(c_fb[0])) if _htf_atr_lu else None
+                    if _fb_htf_atr and _fb_htf_atr > 0:
+                        fb_sl_d = max(_fb_htf_atr * 1.5, fb_ep * 0.003)
+                    else:
+                        fb_sl_d = max(atr_f * 3.0, fb_ep * 0.005)
                     fb_tp_d = fb_sl_d * 2.5
                     fb_sl  = fb_ep - fb_sl_d if fb_dir == "BUY" else fb_ep + fb_sl_d
                     fb_tp  = fb_ep + fb_tp_d if fb_dir == "BUY" else fb_ep - fb_tp_d
@@ -2767,6 +2779,36 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
     # R:R and position size scale dynamically with the confluence score.
     # Trailing stop activates at 1R profit.
     # ====================================================================
+
+    # ── Build HTF (1h) ATR + EMA50 bias lookup ────────────────────────────
+    # Keyed by each candle's ms timestamp → used for proper SL sizing and
+    # direction filter (only trade WITH the higher-timeframe trend).
+    import bisect as _bisect
+    _htf_atr_lu  = {}  # ts → 1h ATR value
+    _htf_bias_lu = {}  # ts → 'BULL' or 'BEAR'
+
+    if htf_candles and len(htf_candles) >= 20:
+        _hc   = htf_candles
+        _hcls = [float(c[4]) for c in _hc]
+        _hhi  = [float(c[2]) for c in _hc]
+        _hlo  = [float(c[3]) for c in _hc]
+        _hatr = _atr_series(_hhi, _hlo, _hcls, 14)
+        _hema = _ema_series(_hcls, 50)
+        _hts  = sorted(
+            [(int(_hc[j][0]), _hatr[j], _hema[j], _hcls[j])
+             for j in range(len(_hc))],
+            key=lambda x: x[0]
+        )
+        _hts_keys = [x[0] for x in _hts]
+        for c5 in candles:
+            ts5 = int(c5[0])
+            idx = _bisect.bisect_right(_hts_keys, ts5) - 1
+            if idx >= 0:
+                _, h_atr, h_ema, h_cls = _hts[idx]
+                if h_atr and h_ema:
+                    _htf_atr_lu[ts5]  = h_atr
+                    _htf_bias_lu[ts5] = 'BULL' if h_cls >= h_ema else 'BEAR'
+
     closes  = [float(c[4]) for c in candles]
     highs   = [float(c[2]) for c in candles]
     lows    = [float(c[3]) for c in candles]
@@ -2877,6 +2919,8 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
                     "pnl": round(net, 4),
                     "open_time": position["time"], "close_time": t_str,
                     "exit_reason": exit_reason,
+                    "sl":  round(position["sl"],  6),
+                    "tp":  round(position["tp"],  6),
                     "rr": position.get("rr", 3.0),
                     "sl_pct": position.get("sl_pct", 0),
                     "session": "Daily",
@@ -2905,10 +2949,18 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
         # ── EMA50 5-bar slope ────────────────────────────────────────────
         e50_prev = ema50_s[i - 5] if i >= 5 and ema50_s[i - 5] is not None else e50
 
-        # ── HTF bias: permissive when EMA200 data unavailable ────────────
-        # FIX: e200 is None when window < 200 bars → was blocking ALL trades
-        htf_ok_buy  = (e200 is None) or (close > e200)
-        htf_ok_sell = (e200 is None) or (close < e200)
+        # ── HTF bias: use 1h EMA50 direction if available ────────────────
+        # Falls back to EMA200 on same TF when no HTF candles were passed.
+        _curr_ts_b   = int(candles[i][0])
+        _htf_bias_v  = _htf_bias_lu.get(_curr_ts_b)  # 'BULL', 'BEAR', or None
+        if _htf_bias_v == 'BULL':
+            htf_ok_buy  = True;  htf_ok_sell = False
+        elif _htf_bias_v == 'BEAR':
+            htf_ok_buy  = False; htf_ok_sell = True
+        else:
+            # No HTF data → fall back to EMA200 on this timeframe
+            htf_ok_buy  = (e200 is None) or (close > e200)
+            htf_ok_sell = (e200 is None) or (close < e200)
 
         # ── Market activity gate: skip dead-flat bars ─────────────────────
         # Require ATR to be at least 60% of its 20-bar average
@@ -2997,7 +3049,16 @@ def run_unified_bot_strategy(candles, starting_balance=1000,
         risk_pct    = _dynamic_risk_pct(score)
         risk_dollar_dyn = balance * risk_pct
 
-        sl_dist  = max(atr_v * 1.5, close * 0.001)
+        # ── SL distance: use HTF ATR when available; hard minimum 0.5% ──
+        _atr_mult_b = float((_ucfg or {}).get("atr_multiplier", 1.5))
+        _htf_atr_v  = _htf_atr_lu.get(_curr_ts_b)
+        if _htf_atr_v and _htf_atr_v > 0:
+            # 1h ATR × multiplier — properly wide, respects real market noise
+            sl_dist = max(_htf_atr_v * _atr_mult_b, close * 0.003)
+        else:
+            # No HTF data: use current-TF ATR but enforce 0.5% minimum
+            # (was 0.1% — way too tight, caused constant stop-outs)
+            sl_dist = max(atr_v * _atr_mult_b, close * 0.005)
         ep       = close * (1 + slip_rate) if direction == "BUY" else close * (1 - slip_rate)
         sl_p     = ep - sl_dist if direction == "BUY" else ep + sl_dist
         tp_p     = ep + sl_dist * dyn_rr if direction == "BUY" else ep - sl_dist * dyn_rr
@@ -3214,6 +3275,19 @@ def api_backtest():
     _wpt_pct = cfg.get("weekly_profit_target_percent", 3.0)
     _wml_pct = cfg.get("weekly_max_loss_percent",      0.8)
 
+    # ── Fetch 1h HTF candles for proper SL sizing + trend bias filter ────────
+    # Only for crypto (Binance). Non-crypto uses Polygon daily bars (already HTF).
+    htf_candles = None
+    if market == "crypto" and strategy in ("unified_bot", "bot"):
+        try:
+            htf_start_ms = int((start_dt - timedelta(days=5)).timestamp() * 1000)
+            htf_candles  = fetch_binance_range_paginated(
+                symbol, "1h", htf_start_ms, end_ms,
+                max_candles=period_days * 25 + 150
+            )
+        except Exception as _htf_err:
+            print(f"[backtest] HTF 1h fetch skipped: {_htf_err}")
+
     try:
         if strategy in ("unified_bot", "bot"):   # "bot" kept as legacy alias
             trades, ending_balance = run_unified_bot_strategy(
@@ -3221,7 +3295,8 @@ def api_backtest():
                 weekly_win_goal=_ww_goal,
                 weekly_profit_target_pct=_wpt_pct,
                 weekly_max_loss_pct=_wml_pct,
-                user_cfg=cfg,   # pass learn-adjusted config
+                user_cfg=cfg,
+                htf_candles=htf_candles,  # 1h candles for MTF SL + bias
             )
         elif strategy == "orb_0dte":
             trades, ending_balance = run_orb_strategy(candles, sb, fee_pct, slip_pct)
@@ -4239,6 +4314,86 @@ def _analyze_losing_trades(losing_trades, backtest_runs, cfg):
     return {"patterns": patterns, "adjustments": adjustments}
 
 
+def _analyze_winning_trades(winning_trades, cfg):
+    """
+    Analyse winning trades to find what conditions reliably produce wins.
+    Returns {patterns, adjustments} — merged with loss analysis to guide config.
+    """
+    patterns    = []
+    adjustments = {}
+    total       = len(winning_trades)
+
+    if total < 3:
+        return {"patterns": [], "adjustments": {}}
+
+    # ── 1. Common strategy signals across wins ────────────────────────────
+    signal_counts = {}
+    for t in winning_trades:
+        for sig in (t.get("strategy_signals") or []):
+            signal_counts[sig] = signal_counts.get(sig, 0) + 1
+
+    for sig, cnt in sorted(signal_counts.items(), key=lambda x: -x[1])[:3]:
+        if cnt / total >= 0.70:
+            patterns.append(
+                f"{cnt}/{total} wins had signal '{sig}' — key edge to preserve"
+            )
+
+    # ── 2. Session clustering in wins ────────────────────────────────────
+    sess_counts = {}
+    for t in winning_trades:
+        s = t.get("session", "Unknown")
+        sess_counts[s] = sess_counts.get(s, 0) + 1
+
+    if sess_counts:
+        best_s = max(sess_counts, key=sess_counts.get)
+        bpct   = sess_counts[best_s] / total
+        if bpct >= 0.65:
+            patterns.append(
+                f"{sess_counts[best_s]}/{total} wins ({round(bpct*100)}%) "
+                f"occurred in {best_s} — strongest session edge"
+            )
+
+    # ── 3. Average winning confluence ─────────────────────────────────────
+    avg_conf = sum(t.get("confluence", 0) or 0 for t in winning_trades) / total
+    if avg_conf >= 6:
+        cur_cm = int(cfg.get("confluence_min", 5))
+        target = min(int(avg_conf), 8)
+        if target > cur_cm:
+            adjustments["confluence_min"] = target
+            patterns.append(
+                f"Avg winning confluence {avg_conf:.1f} → raising "
+                f"confluence_min from {cur_cm} to {target}"
+            )
+
+    # ── 4. Healthy SL % range ─────────────────────────────────────────────
+    sl_pcts = [float(t.get("sl_pct") or 0) for t in winning_trades if t.get("sl_pct")]
+    if sl_pcts:
+        avg_sl = sum(sl_pcts) / len(sl_pcts)
+        if 0.3 < avg_sl < 2.0:
+            patterns.append(
+                f"Winning trades averaged {avg_sl:.2f}% SL distance — "
+                f"healthy risk sizing"
+            )
+
+    # ── 5. Average R:R of wins ────────────────────────────────────────────
+    rrs = [float(t.get("rr") or 0) for t in winning_trades if t.get("rr")]
+    if rrs:
+        avg_rr = sum(rrs) / len(rrs)
+        patterns.append(f"Average R:R on winning trades: {avg_rr:.2f}")
+        cur_rr = float(cfg.get("risk_reward", 2))
+        if avg_rr > cur_rr + 0.5:
+            adjustments["risk_reward"] = round(min(avg_rr, cur_rr + 0.5), 1)
+            patterns.append(
+                f"Wins achieved higher R:R than configured → "
+                f"raising risk_reward target to {adjustments['risk_reward']}"
+            )
+
+    if not patterns:
+        patterns.append(f"No dominant winning pattern yet ({total} wins analyzed)")
+
+    return {"patterns": patterns, "adjustments": adjustments}
+
+
 def _auto_learn_silent(user_id):
     """
     Called automatically after every backtest completes.
@@ -4269,7 +4424,7 @@ def _auto_learn_silent(user_id):
         if not rows:
             return {"applied": False, "adjustments": {}, "patterns": []}
 
-        backtest_runs, losing_trades = [], []
+        backtest_runs, losing_trades, winning_trades = [], [], []
         for r in rows:
             backtest_runs.append({
                 "win_rate":      r[0],
@@ -4278,19 +4433,31 @@ def _auto_learn_silent(user_id):
             })
             try:
                 for t in json.loads(r[2] or "[]"):
-                    if float(t.get("pnl", 0) or 0) < 0:
+                    pnl = float(t.get("pnl", 0) or 0)
+                    if pnl < 0:
                         losing_trades.append(t)
+                    elif pnl > 0:
+                        winning_trades.append(t)
             except Exception:
                 pass
 
-        analysis = _analyze_losing_trades(losing_trades, backtest_runs, cfg)
-        all_adj  = analysis["adjustments"]
-        real_adj = {k: v for k, v in all_adj.items() if not k.startswith("_r_")}
+        # Merge loss + win analysis adjustments
+        loss_analysis = _analyze_losing_trades(losing_trades, backtest_runs, cfg)
+        win_analysis  = _analyze_winning_trades(winning_trades, cfg)
 
-        if not real_adj:
-            return {"applied": False, "adjustments": {}, "patterns": analysis["patterns"]}
+        # Loss adjustments take priority; win adjustments fill gaps
+        merged_adj = {}
+        merged_adj.update({k: v for k, v in win_analysis["adjustments"].items()
+                           if not k.startswith("_r_")})
+        merged_adj.update({k: v for k, v in loss_analysis["adjustments"].items()
+                           if not k.startswith("_r_")})
 
-        new_cfg = dict(cfg); new_cfg.update(real_adj)
+        all_patterns = win_analysis["patterns"] + loss_analysis["patterns"]
+
+        if not merged_adj:
+            return {"applied": False, "adjustments": {}, "patterns": all_patterns}
+
+        new_cfg = dict(cfg); new_cfg.update(merged_adj)
         conn = get_conn(); cur = conn.cursor()
         cur.execute("UPDATE users SET settings=%s WHERE id=%s",
                     (json.dumps(new_cfg), user_id))
@@ -4298,9 +4465,9 @@ def _auto_learn_silent(user_id):
 
         return {
             "applied":              True,
-            "adjustments_applied":  len(real_adj),
-            "adjustments":          real_adj,
-            "patterns":             analysis["patterns"],
+            "adjustments_applied":  len(merged_adj),
+            "adjustments":          merged_adj,
+            "patterns":             all_patterns,
         }
     except Exception as e:
         print(f"[auto_learn] error: {e}")
