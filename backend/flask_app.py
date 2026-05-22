@@ -3769,104 +3769,124 @@ def paper_bot_scan():
     Scan watched symbols for live signals.
     When bot is active (or force=true in body), auto-opens trades for
     BUY/SELL signals that pass confidence + R:R gates and have no open position.
+    Always returns JSON — never raises to Flask's HTML error handler.
     """
-    data       = request.get_json(force=True) or {}
-    force_open = bool(data.get("force", False))
-
-    cfg        = get_user_config()
-    symbols    = cfg.get("symbols", ALL_SYMBOLS)[:12]
-    min_conf   = int(cfg.get("min_confidence", 70))
-    bot_active = AUTO_PAPER_TRADING.get(g.user_id, False)
-
-    # Already-open symbols → skip to prevent pyramiding
-    conn = get_conn(); c = conn.cursor()
-    c.execute("SELECT symbol FROM trades WHERE user_id=%s AND status='OPEN'", (g.user_id,))
-    open_symbols = {row[0] for row in c.fetchall()}
-    conn.close()
-
-    weekly = {}
     try:
-        weekly = is_weekly_paused(g.user_id, cfg)
-    except Exception:
-        pass
+        data       = request.get_json(force=True) or {}
+        force_open = bool(data.get("force", False))
 
-    scan_results, opened, skipped = [], [], []
-
-    for sym in symbols:
+        # ── Load config safely ────────────────────────────────────────────
         try:
-            s = get_symbol_summary(sym, "bot", SIGNALS_INTERVAL, cfg)
-            if not s:
-                continue
-            signal     = s.get("signal", "HOLD")
-            confidence = float(s.get("confidence") or 0)
-            price_val  = float(s.get("price") or 0)
+            cfg = get_user_config()
+        except Exception:
+            cfg = dict(DEFAULT_CONFIG)
 
-            scan_results.append({
-                "symbol":     sym,
-                "signal":     signal,
-                "confidence": confidence,
-                "price":      price_val,
-            })
+        symbols = (cfg.get("symbols") or ALL_SYMBOLS)[:12]
 
-            should_trade = (bot_active or force_open) and signal in ("BUY", "SELL")
-            if not should_trade:
-                continue
-            if confidence < min_conf:
-                skipped.append({"symbol": sym, "reason": "low_confidence", "confidence": confidence})
-                continue
-            if sym in open_symbols:
-                skipped.append({"symbol": sym, "reason": "already_open"})
-                continue
-            if weekly.get("weekly_trading_paused"):
-                skipped.append({"symbol": sym, "reason": "weekly_pause"})
-                continue
+        min_conf   = int(cfg.get("min_confidence", 70))
+        bot_active = AUTO_PAPER_TRADING.get(g.user_id, False)
 
-            df = fetch_df_for_symbol(sym, SIGNALS_INTERVAL, 200)
-            if df is None:
-                skipped.append({"symbol": sym, "reason": "no_data"})
-                continue
+        # ── Already-open symbols → skip to prevent pyramiding ─────────────
+        open_symbols = set()
+        try:
+            conn = get_conn(); c = conn.cursor()
+            c.execute("SELECT symbol FROM trades WHERE user_id=%s AND status='OPEN'", (g.user_id,))
+            open_symbols = {row[0] for row in c.fetchall()}
+            conn.close()
+        except Exception:
+            pass  # If DB fails, allow scan but don't gate on open positions
 
-            levels = calculate_trade_levels(
-                df, signal, cfg.get("risk_reward", 2),
-                cfg.get("atr_multiplier", 1.5), cfg
-            )
-            if not levels.get("rr_valid"):
-                skipped.append({"symbol": sym, "reason": "rr_invalid",
-                                 "rr": levels.get("rr")})
-                continue
+        weekly = {}
+        try:
+            weekly = is_weekly_paused(g.user_id, cfg)
+        except Exception:
+            pass
 
-            ep       = levels["entry"]
-            sd       = levels["sl_distance"]
-            risk_amt = starting_balance_for(g.user_id, cfg) * (cfg.get("risk_percent", 1) / 100)
-            size     = risk_amt / sd if sd else 0
+        scan_results, opened, skipped = [], [], []
 
-            tid = str(uuid.uuid4())
-            conn = get_conn(); cu = conn.cursor()
-            cu.execute(
-                "INSERT INTO trades VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NULL,NULL,'OPEN',%s)",
-                (tid, g.user_id, sym, signal, ep, levels["sl"], levels["tp"], size, now_str()))
-            conn.commit(); conn.close()
-            add_alert(g.user_id,
-                      f"BOT OPEN {sym} {signal} @ {format_price(ep, sym)} "
-                      f"(conf {confidence:.0f}%)")
-            open_symbols.add(sym)
-            opened.append({
-                "id": tid, "symbol": sym, "side": signal,
-                "entry": ep, "sl": levels["sl"], "tp": levels["tp"],
-                "confidence": confidence,
-            })
-        except Exception as e:
-            scan_results.append({"symbol": sym, "signal": "ERROR", "error": str(e)})
+        for sym in symbols:
+            try:
+                s = get_symbol_summary(sym, "bot", SIGNALS_INTERVAL, cfg)
+                if not s:
+                    continue
+                signal     = s.get("signal", "HOLD")
+                confidence = float(s.get("confidence") or 0)
+                price_val  = float(s.get("price") or 0)
 
-    return jsonify({
-        "ok":         True,
-        "scanned":    len(scan_results),
-        "signals":    scan_results,
-        "opened":     opened,
-        "skipped":    skipped,
-        "bot_active": bot_active,
-        "scanned_at": now_str(),
-    })
+                scan_results.append({
+                    "symbol":     sym,
+                    "signal":     signal,
+                    "confidence": confidence,
+                    "price":      price_val,
+                })
+
+                should_trade = (bot_active or force_open) and signal in ("BUY", "SELL")
+                if not should_trade:
+                    continue
+                if confidence < min_conf:
+                    skipped.append({"symbol": sym, "reason": "low_confidence", "confidence": confidence})
+                    continue
+                if sym in open_symbols:
+                    skipped.append({"symbol": sym, "reason": "already_open"})
+                    continue
+                if weekly.get("weekly_trading_paused"):
+                    skipped.append({"symbol": sym, "reason": "weekly_pause"})
+                    continue
+
+                df = fetch_df_for_symbol(sym, SIGNALS_INTERVAL, 200)
+                if df is None:
+                    skipped.append({"symbol": sym, "reason": "no_data"})
+                    continue
+
+                levels = calculate_trade_levels(
+                    df, signal, cfg.get("risk_reward", 2),
+                    cfg.get("atr_multiplier", 1.5), cfg
+                )
+                if not levels.get("rr_valid"):
+                    skipped.append({"symbol": sym, "reason": "rr_invalid",
+                                     "rr": levels.get("rr")})
+                    continue
+
+                ep       = levels["entry"]
+                sd       = levels["sl_distance"]
+                risk_amt = starting_balance_for(g.user_id, cfg) * (cfg.get("risk_percent", 1) / 100)
+                size     = risk_amt / sd if sd else 0
+
+                tid = str(uuid.uuid4())
+                conn = get_conn(); cu = conn.cursor()
+                cu.execute(
+                    "INSERT INTO trades VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NULL,NULL,'OPEN',%s)",
+                    (tid, g.user_id, sym, signal, ep, levels["sl"], levels["tp"], size, now_str()))
+                conn.commit(); conn.close()
+                add_alert(g.user_id,
+                          f"BOT OPEN {sym} {signal} @ {format_price(ep, sym)} "
+                          f"(conf {confidence:.0f}%)")
+                open_symbols.add(sym)
+                opened.append({
+                    "id": tid, "symbol": sym, "side": signal,
+                    "entry": ep, "sl": levels["sl"], "tp": levels["tp"],
+                    "confidence": confidence,
+                })
+            except Exception as e:
+                scan_results.append({"symbol": sym, "signal": "ERROR", "error": str(e)})
+
+        return jsonify({
+            "ok":         True,
+            "scanned":    len(scan_results),
+            "signals":    scan_results,
+            "opened":     opened,
+            "skipped":    skipped,
+            "bot_active": bot_active,
+            "scanned_at": now_str(),
+        })
+
+    except Exception as e:
+        import traceback
+        return jsonify({
+            "ok":     False,
+            "error":  str(e),
+            "detail": traceback.format_exc()[-400:],
+        }), 500
 
 
 def starting_balance_for(user_id, cfg):
@@ -4802,3 +4822,39 @@ def learn_history():
             "win_rate_after":  r[10],
         })
     return jsonify(result)
+
+
+# ── Global error handlers — always return JSON, never HTML ───────────────────
+@app.errorhandler(400)
+def bad_request(e):
+    return jsonify({"error": "Bad request", "detail": str(e)}), 400
+
+@app.errorhandler(401)
+def unauthorized(e):
+    return jsonify({"error": "Unauthorized"}), 401
+
+@app.errorhandler(403)
+def forbidden(e):
+    return jsonify({"error": "Forbidden"}), 403
+
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify({"error": "Not found", "detail": str(e)}), 404
+
+@app.errorhandler(405)
+def method_not_allowed(e):
+    return jsonify({"error": "Method not allowed"}), 405
+
+@app.errorhandler(500)
+def internal_error(e):
+    import traceback
+    return jsonify({"error": "Internal server error", "detail": str(e)}), 500
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    import traceback
+    # Pass through HTTP exceptions to their own handlers
+    from werkzeug.exceptions import HTTPException
+    if isinstance(e, HTTPException):
+        return jsonify({"error": e.description}), e.code
+    return jsonify({"error": str(e), "detail": traceback.format_exc()[-400:]}), 500
