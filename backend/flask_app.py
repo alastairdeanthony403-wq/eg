@@ -4766,6 +4766,11 @@ def api_backtest():
     train_m = _split_metrics(train_trades)
     test_m  = _split_metrics(test_trades)
 
+    # Significance guard: one-tailed binomial test — can we reject H0: win_rate=50%?
+    _pv = _binom_pvalue(test_m["wins"], test_m["total_trades"])
+    test_m["p_value"]    = _pv
+    test_m["significant"] = bool(_pv < 0.05)
+
     # Low-sample warning: fewer than 30 test-period trades → stats unreliable
     low_sample_warning = len(test_trades) < _MIN_MEANINGFUL
     low_sample_msg = (
@@ -6298,17 +6303,33 @@ def learn_history():
 # WALK-FORWARD ANALYSIS
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _binom_pvalue(wins, n):
+    """
+    One-tailed p-value for H0: win_rate = 50% (pure coin-flip, no edge).
+    Uses normal approximation with continuity correction.
+    Returns p in [0,1].  p < 0.05 → edge is statistically significant at 5%.
+    No external deps — stdlib math only.
+    """
+    import math
+    if n < 5: return 1.0
+    z = (wins - n * 0.5 - 0.5) / math.sqrt(n * 0.25)
+    if z <= 0: return 1.0
+    return round(float(0.5 * math.erfc(z / math.sqrt(2))), 4)
+
+
 def _wf_metrics(trades, sb):
     """Compute summary metrics for a list of trades."""
     if not trades:
         return {"total_trades": 0, "wins": 0, "losses": 0,
-                "win_rate": 0.0, "profit_factor": 0.0, "net_pnl": 0.0}
+                "win_rate": 0.0, "profit_factor": 0.0, "net_pnl": 0.0,
+                "p_value": 1.0, "significant": False}
     wins   = [t for t in trades if float(t.get("pnl", 0) or 0) > 0]
     losses = [t for t in trades if float(t.get("pnl", 0) or 0) <= 0]
     gp = sum(float(t.get("pnl", 0) or 0) for t in wins)
     gl = abs(sum(float(t.get("pnl", 0) or 0) for t in losses))
     wr = len(wins) / len(trades) * 100 if trades else 0
     pf = (gp / gl) if gl else (1.0 if gp > 0 else 0.0)
+    pv = _binom_pvalue(len(wins), len(trades))
     return {
         "total_trades":  len(trades),
         "wins":          len(wins),
@@ -6316,6 +6337,8 @@ def _wf_metrics(trades, sb):
         "win_rate":      round(wr, 2),
         "profit_factor": round(pf, 2),
         "net_pnl":       round(sum(float(t.get("pnl", 0) or 0) for t in trades), 2),
+        "p_value":       pv,
+        "significant":   bool(pv < 0.05),
     }
 
 

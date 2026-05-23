@@ -1223,17 +1223,30 @@ function OOSPanel({summary:s}){
   const msg  = s.low_sample_msg;
   const split = s.split_date || "—";
   const tp    = s.train_pct != null ? Math.round(s.train_pct * 100) : 70;
+  const sig   = te.significant;
+  const pv    = te.p_value;
+  const sigColor = sig ? T.green : T.gold;
 
-  const MetaBox = ({label, m, accent}) => (
+  const MetaBox = ({label, m, accent, showSig}) => (
     <div style={{flex:1,minWidth:200,background:T.bg2,border:`1px solid ${accent}44`,
       borderRadius:5,padding:"12px 14px"}}>
-      <div style={{fontFamily:MONO,fontSize:8,color:accent,letterSpacing:2,marginBottom:10}}>{label}</div>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}>
+        <span style={{fontFamily:MONO,fontSize:8,color:accent,letterSpacing:2}}>{label}</span>
+        {showSig && pv != null && (
+          <span style={{fontFamily:MONO,fontSize:8,letterSpacing:1,
+            background:`${sigColor}18`,border:`1px solid ${sigColor}55`,
+            borderRadius:3,padding:"2px 7px",color:sigColor}}>
+            {sig ? "SIGNIFICANT" : "NOT SIGNIFICANT"}
+          </span>
+        )}
+      </div>
       <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
         {[
           ["TRADES",        m.total_trades ?? "—",                                                T.text],
           ["WIN RATE",      (m.total_trades||0)>=1 ? fmtPct(m.win_rate)    : "—",                T.gold],
           ["PROFIT FACTOR", (m.total_trades||0)>=1 ? fmt(m.profit_factor)  : "—",                T.blue],
           ["NET P&L",       (m.total_trades||0)>=1 ? fmtPnl(m.net_pnl)+"$": "—", (m.net_pnl||0)>=0?T.green:T.red],
+          ...(showSig && pv != null ? [["P-VALUE", `p=${pv}`, sigColor]] : []),
         ].map(([lbl,val,col])=>(
           <div key={lbl}>
             <div style={{fontFamily:MONO,fontSize:8,color:T.t2,letterSpacing:1,marginBottom:2}}>{lbl}</div>
@@ -1257,8 +1270,8 @@ function OOSPanel({summary:s}){
         </span>
       </div>
       <div style={{display:"flex",gap:10,flexWrap:"wrap"}}>
-        <MetaBox label="TRAINING (IN-SAMPLE)"  m={tr} accent={T.blue}/>
-        <MetaBox label="TEST (OUT-OF-SAMPLE)"  m={te} accent={warn?T.gold:T.green}/>
+        <MetaBox label="TRAINING (IN-SAMPLE)"  m={tr} accent={T.blue}  showSig={false}/>
+        <MetaBox label="TEST (OUT-OF-SAMPLE)"  m={te} accent={warn?T.gold:sigColor} showSig={true}/>
       </div>
       {warn&&(
         <div style={{marginTop:10,background:`${T.gold}12`,border:`1px solid ${T.gold}44`,
@@ -1328,12 +1341,13 @@ function WalkForwardResult({data:d, onApply, applying}){
       {/* Aggregate stats — sourced from d.aggregate */}
       <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(130px,1fr))",gap:8,marginBottom:16}}>
         {[
-          ["WINDOWS",        d.n_windows||0,                                              T.text],
-          ["PROFITABLE",     `${agg.windows_profitable||0}/${agg.windows_total||d.n_windows||0}`, T.green],
-          ["CONSISTENCY",    fmtPct(agg.consistency_pct),                                vc],
-          ["OOS PROF FACTOR",fmt(agg.profit_factor),                                     T.blue],
-          ["OOS WIN RATE",   fmtPct(agg.win_rate),                                       T.gold],
-          ["TOTAL OOS TRADES",agg.total_trades||0,                                       T.text],
+          ["WINDOWS",          d.n_windows||0,                                                          T.text],
+          ["PROFITABLE",       `${agg.windows_profitable||0}/${agg.windows_total||d.n_windows||0}`,     T.green],
+          ["CONSISTENCY",      fmtPct(agg.consistency_pct),                                             vc],
+          ["OOS PROF FACTOR",  fmt(agg.profit_factor),                                                  T.blue],
+          ["OOS WIN RATE",     fmtPct(agg.win_rate),                                                    T.gold],
+          ["TOTAL OOS TRADES", agg.total_trades||0,                                                     T.text],
+          ["OOS P-VALUE",      agg.p_value != null ? `p=${agg.p_value}` : "—", agg.significant ? T.green : T.gold],
         ].map(([lbl,val,col])=>(
           <div key={lbl} style={{background:T.bg2,border:`1px solid ${T.border}`,borderRadius:4,padding:"8px 12px"}}>
             <div style={{fontFamily:MONO,fontSize:8,color:T.t2,letterSpacing:1,marginBottom:3}}>{lbl}</div>
@@ -1349,7 +1363,7 @@ function WalkForwardResult({data:d, onApply, applying}){
           <table style={{width:"100%",borderCollapse:"collapse",fontFamily:MONO,fontSize:10}}>
             <thead>
               <tr>
-                {["WIN#","TRAIN PERIOD","TEST PERIOD","IS SCORE","OOS PF","OOS WIN%","OOS TRADES","PARAMS","OUTCOME"].map(h=>(
+                {["WIN#","TRAIN PERIOD","TEST PERIOD","IS SCORE","OOS PF","OOS WIN%","OOS TRADES","P-VALUE","PARAMS","OUTCOME"].map(h=>(
                   <th key={h} style={{padding:"6px 10px",textAlign:"left",fontFamily:MONO,fontSize:8,
                     color:T.t2,borderBottom:`1px solid ${T.border}`,background:T.bg2,
                     letterSpacing:1,whiteSpace:"nowrap"}}>{h}</th>
@@ -1379,6 +1393,10 @@ function WalkForwardResult({data:d, onApply, applying}){
                     <td style={{padding:"6px 10px",color:oc,fontWeight:profitable?700:400}}>{fmt(oospf)}</td>
                     <td style={{padding:"6px 10px",color:T.gold}}>{fmtPct(w.oos?.win_rate)}</td>
                     <td style={{padding:"6px 10px",color:T.text}}>{w.oos?.total_trades||0}</td>
+                    <td style={{padding:"6px 10px",
+                      color:w.oos?.significant ? T.green : T.gold,fontSize:9}}>
+                      {w.oos?.p_value != null ? `p=${w.oos.p_value}` : "—"}
+                    </td>
                     <td style={{padding:"6px 10px",color:T.cyan,fontSize:9}}>{bpStr}</td>
                     <td style={{padding:"6px 10px"}}>
                       <span style={{fontFamily:MONO,fontSize:8,color:oc,
