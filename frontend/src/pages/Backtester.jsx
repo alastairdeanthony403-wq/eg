@@ -95,8 +95,9 @@ export default function Backtester() {
   const [wfRunning, setWfRunning] = useState(false);
   const [wfResult,  setWfResult]  = useState(null);
 
-  // Apply-config (for suggestions from learn/optimise)
+  // Apply-config (for suggestions from learn/optimise/walkforward)
   const [applyingCfg, setApplyingCfg] = useState(false);
+  const [cfgApplied,  setCfgApplied]  = useState(null);   // {key:val,...} shown in green banner
 
   // ── Run backtest ────────────────────────────────────────────────────────────
   const run = async () => {
@@ -126,13 +127,16 @@ export default function Backtester() {
 
   // ── Apply suggested config changes ──────────────────────────────────────────
   const handleApplyConfig = async (changes) => {
-    setApplyingCfg(true);
+    setApplyingCfg(true); setCfgApplied(null);
     try {
-      await apiFetch("/api/apply-config", {
+      const r = await apiFetch("/api/apply-config", {
         method:"POST",
         body:JSON.stringify({ changes }),
       });
       setAutoLearnNote(null);
+      // Show confirmation: use r.applied if backend confirmed keys, else echo changes
+      const applied = (r.applied && Object.keys(r.applied).length) ? r.applied : changes;
+      setCfgApplied(applied);
     } catch(e){ setError(e.message); }
     finally { setApplyingCfg(false); }
   };
@@ -359,6 +363,29 @@ export default function Backtester() {
 
       {/* Error */}
       {error&&<div style={{margin:"0 20px 16px",background:`${T.red}12`,border:`1px solid ${T.red}40`,borderRadius:5,padding:"10px 14px",color:T.red,fontFamily:MONO,fontSize:12}}>⚠ {error}</div>}
+
+      {/* Config applied — success banner */}
+      {cfgApplied&&(
+        <div style={{margin:"0 20px 12px",background:`${T.green}12`,border:`1px solid ${T.green}44`,
+          borderRadius:5,padding:"9px 14px",display:"flex",alignItems:"flex-start",gap:10,animation:"slide .25s ease"}}>
+          <CheckCircle size={14} style={{color:T.green,flexShrink:0,marginTop:1}}/>
+          <div style={{flex:1}}>
+            <span style={{fontFamily:MONO,fontSize:10,color:T.green,letterSpacing:2}}>
+              CONFIG APPLIED · {Object.keys(cfgApplied).length} PARAM{Object.keys(cfgApplied).length!==1?"S":""} UPDATED
+            </span>
+            <div style={{marginTop:4,display:"flex",flexWrap:"wrap",gap:6}}>
+              {Object.entries(cfgApplied).map(([k,v])=>(
+                <span key={k} style={{fontFamily:MONO,fontSize:9,background:`${T.green}18`,
+                  border:`1px solid ${T.green}33`,borderRadius:3,padding:"2px 7px",color:T.green}}>
+                  {k.replace(/_/g," ")} = {String(v)}
+                </span>
+              ))}
+            </div>
+          </div>
+          <button onClick={()=>setCfgApplied(null)}
+            style={{background:"none",border:"none",color:T.t2,cursor:"pointer",fontSize:14,lineHeight:1,flexShrink:0}}>×</button>
+        </div>
+      )}
 
       {/* Auto-learn notification */}
       {autoLearnNote&&(
@@ -1257,16 +1284,26 @@ function WalkForwardResult({data:d, onApply, applying}){
   const VERDICT_COLOR = {STABLE:T.green, MIXED:T.gold, UNSTABLE:T.red};
   const vc = VERDICT_COLOR[verdict] || T.t2;
 
-  // For non-lean strategies: derive "best overall params" from the window
-  // that produced the highest OOS profit factor, then offer Apply.
-  const bestParamsOverall = !isLean && d.windows?.length > 0
+  // For non-lean strategies: derive modal in-sample params — the values the
+  // grid search picked most often across all windows. Never looks at OOS
+  // results, so there is no selection bias on the test set.
+  const modalParams = !isLean && d.windows?.length > 0
     ? (()=>{
-        const best = d.windows.reduce((a,b)=>
-          ((b.oos?.profit_factor)||0) > ((a.oos?.profit_factor)||0) ? b : a,
-          d.windows[0]
-        );
-        const p = best?.best_is_params;
-        return p && Object.keys(p).length > 0 ? p : null;
+        const lists = d.windows
+          .map(w => w.best_is_params || {})
+          .filter(p => Object.keys(p).length > 0);
+        if (!lists.length) return null;
+        const keys = Object.keys(lists[0]);
+        const modal = {};
+        for (const k of keys) {
+          const vals = lists.map(p => p[k]).filter(v => v !== undefined);
+          if (!vals.length) continue;
+          const freq = {};
+          for (const v of vals) { const ks = String(v); freq[ks] = (freq[ks]||0)+1; }
+          const top = Object.entries(freq).sort((a,b)=>b[1]-a[1])[0]?.[0];
+          modal[k] = isNaN(Number(top)) ? top : Number(top);
+        }
+        return Object.keys(modal).length > 0 ? modal : null;
       })()
     : null;
 
@@ -1378,16 +1415,19 @@ function WalkForwardResult({data:d, onApply, applying}){
         </div>
       )}
 
-      {/* Best params overall + Apply button (unified_bot only) */}
-      {bestParamsOverall&&onApply&&(
+      {/* Modal in-sample params + Apply button (unified_bot only) */}
+      {modalParams&&onApply&&(
         <div style={{background:`${T.cyan}08`,border:`1px solid ${T.cyan}33`,borderRadius:5,
           padding:"12px 14px",display:"flex",alignItems:"center",gap:12,flexWrap:"wrap"}}>
           <div style={{flex:1}}>
-            <div style={{fontFamily:MONO,fontSize:8,color:T.cyan,letterSpacing:2,marginBottom:6}}>
-              BEST OOS WINDOW PARAMS — APPLY TO BOT CONFIG
+            <div style={{fontFamily:MONO,fontSize:8,color:T.cyan,letterSpacing:2,marginBottom:4}}>
+              MOST CONSISTENT IN-SAMPLE PARAMS (MODAL ACROSS ALL WINDOWS)
+            </div>
+            <div style={{fontFamily:MONO,fontSize:8,color:T.t2,marginBottom:8}}>
+              These are the params the grid search selected most often — no OOS peeking.
             </div>
             <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
-              {Object.entries(bestParamsOverall).map(([k,v])=>(
+              {Object.entries(modalParams).map(([k,v])=>(
                 <span key={k} style={{fontFamily:MONO,fontSize:9,background:`${T.cyan}18`,
                   border:`1px solid ${T.cyan}33`,borderRadius:3,padding:"2px 8px",color:T.cyan}}>
                   {k.replace(/_/g," ")} = {v}
@@ -1395,7 +1435,7 @@ function WalkForwardResult({data:d, onApply, applying}){
               ))}
             </div>
           </div>
-          <button onClick={()=>onApply(bestParamsOverall)} disabled={applying}
+          <button onClick={()=>onApply(modalParams)} disabled={applying}
             style={{background:`${T.cyan}20`,border:`1px solid ${T.cyan}66`,color:T.cyan,
               borderRadius:4,padding:"8px 18px",cursor:"pointer",fontFamily:MONO,
               fontSize:10,letterSpacing:1,whiteSpace:"nowrap",flexShrink:0}}>
