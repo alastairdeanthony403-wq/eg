@@ -501,12 +501,12 @@ export default function Backtester() {
                     </span>
                   </div>
                   <p style={{margin:0,fontSize:13,color:T.t2,lineHeight:1.65,maxWidth:520}}>
-                    Analyses your losing trades and automatically adjusts bot config parameters —
+                    Analyses your losing trades and suggests bot config parameter changes —
                     confidence threshold, ADX minimum, session filters, and more —
                     to reduce future losses.
                     <br/>
                     <span style={{fontSize:11,color:T.purple}}>
-                      ✦ Also runs automatically every time you finish a backtest.
+                      ✦ Suggestions are shown for review before any changes are applied.
                     </span>
                   </p>
                 </div>
@@ -516,7 +516,7 @@ export default function Backtester() {
                     letterSpacing:1,whiteSpace:"nowrap",flexShrink:0,display:"flex",alignItems:"center",gap:6}}>
                   {learning
                     ?<><div style={{width:11,height:11,border:`2px solid ${T.t2}`,borderTop:`2px solid ${T.purple}`,borderRadius:"50%",animation:"spin 1s linear infinite"}}/>ANALYSING…</>
-                    :<><Brain size={12}/>ANALYSE &amp; APPLY</>}
+                    :<><Brain size={12}/>ANALYSE</>}
                 </button>
               </div>
             </div>
@@ -535,8 +535,8 @@ export default function Backtester() {
                   <p style={{margin:0,fontSize:13,color:T.t2,lineHeight:1.65,maxWidth:520}}>
                     Runs a full grid search across <strong style={{color:T.text}}>60 combinations</strong> of
                     confluence threshold, risk/reward ratio, and displacement body ratio — using
-                    the current symbol &amp; time window. Automatically applies the best-scoring
-                    parameters to your bot config.
+                    the current symbol &amp; time window. Returns the best-scoring parameters
+                    for your review before applying.
                   </p>
                 </div>
                 <button onClick={handleOptimize} disabled={optimizing}
@@ -675,17 +675,26 @@ function TestMeta({result}){
 
 // ── SUMMARY CARDS ─────────────────────────────────────────────────────────────
 function SummaryCards({summary:s}){
-  const pnlPositive = (s.net_pnl||0)>=0;
+  // When an OOS split exists, headline stats come from the test window.
+  const oos = s.test_summary || null;
+  const pnlVal      = oos ? (oos.net_pnl||0)       : (s.net_pnl||0);
+  const winRateVal  = oos ? (oos.win_rate||0)       : (s.win_rate||0);
+  const pfVal       = oos ? (oos.profit_factor||0)  : (s.profit_factor||0);
+  const tradesVal   = oos ? (oos.total_trades||0)   : (s.total_trades||0);
+  const winsVal     = oos ? (oos.wins||0)            : (s.wins||0);
+  const lossesVal   = oos ? (oos.losses||0)          : (s.losses||0);
+  const oosSuffix   = oos ? " (OOS)" : "";
+  const pnlPositive = pnlVal >= 0;
   const mdd = s.max_drawdown_pct ?? buildMaxDD(null);
   const cards = [
-    {label:"NET P&L", val:fmtPnl(s.net_pnl)+" $", color:pnlPositive?T.green:T.red, icon:pnlPositive?<ArrowUpRight size={16}/>:<ArrowDownRight size={16}/>},
-    {label:"WIN RATE", val:fmtPct(s.win_rate), color:T.gold},
-    {label:"PROFIT FACTOR", val:fmt(s.profit_factor), color:T.blue},
+    {label:`NET P&L${oosSuffix}`, val:fmtPnl(pnlVal)+" $", color:pnlPositive?T.green:T.red, icon:pnlPositive?<ArrowUpRight size={16}/>:<ArrowDownRight size={16}/>},
+    {label:`WIN RATE${oosSuffix}`, val:fmtPct(winRateVal), color:T.gold},
+    {label:`PROFIT FACTOR${oosSuffix}`, val:fmt(pfVal), color:T.blue},
     {label:"MAX DRAWDOWN", val:s.max_drawdown?fmt(s.max_drawdown)+"%":"—", color:T.red},
-    {label:"TOTAL TRADES", val:s.total_trades||0, color:T.text},
+    {label:`TOTAL TRADES${oosSuffix}`, val:tradesVal, color:T.text},
     {label:"FINAL BALANCE", val:"$"+(s.final_balance||0).toLocaleString(undefined,{maximumFractionDigits:2}), color:pnlPositive?T.green:T.red},
     {label:"TRADES/DAY", val:fmt(s.trades_per_day,1), color:T.t2},
-    {label:"WINS/LOSSES", val:`${s.wins||0}/${s.losses||0}`, color:T.text},
+    {label:`WINS/LOSSES${oosSuffix}`, val:`${winsVal}/${lossesVal}`, color:T.text},
   ];
   return(
     <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(150px,1fr))",gap:10}}>
