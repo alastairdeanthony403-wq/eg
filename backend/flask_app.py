@@ -4795,7 +4795,7 @@ def api_backtest():
                 start_date, end_date,
                 total, round(net_pnl, 2), round(pf, 2),
                 0, 0, round(win_rate, 2),
-                json.dumps(summary_obj), json.dumps(trades[:200]), now_str(),
+                json.dumps(summary_obj), json.dumps(train_trades[:200]), now_str(),
             ),
         )
         conn.commit(); conn.close()
@@ -6042,6 +6042,70 @@ def optimize_params():
     })
 
 
+@app.route("/api/apply-config", methods=["POST", "OPTIONS"])
+@auth_required
+def apply_config():
+    """
+    Explicitly apply a set of suggested parameter changes to the user's bot config.
+
+    This is the ONLY way config changes from auto-learn / optimise reach the DB.
+    Neither _auto_learn_silent nor /api/optimize write here automatically.
+
+    Body:
+      { "changes": { "confluence_min": 5, "risk_reward": 2.0, ... } }
+
+    Response:
+      { "ok": true, "applied": { <keys that changed> }, "config": { <full new config> } }
+
+    Only keys present in DEFAULT_CONFIG are accepted — unknown keys are silently
+    dropped so a rogue payload cannot pollute the settings object.
+    """
+    data    = request.get_json(force=True) or {}
+    changes = data.get("changes") or {}
+
+    if not isinstance(changes, dict) or not changes:
+        return jsonify({"ok": False, "error": "Body must be {\"changes\": {...}}"}), 400
+
+    # ── Load current config ───────────────────────────────────────────────────
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT settings FROM users WHERE id=%s", (g.user_id,))
+    row = cur.fetchone()
+
+    cfg = dict(DEFAULT_CONFIG)
+    if row and row[0]:
+        try:
+            cfg.update(json.loads(row[0]))
+        except Exception:
+            pass
+
+    # ── Whitelist: only keys that exist in DEFAULT_CONFIG are allowed ─────────
+    allowed  = set(DEFAULT_CONFIG.keys())
+    applied  = {}
+    rejected = []
+
+    for k, v in changes.items():
+        if k in allowed:
+            if cfg.get(k) != v:        # only record genuinely changed keys
+                cfg[k] = v
+                applied[k] = v
+        else:
+            rejected.append(k)
+
+    # ── Persist ───────────────────────────────────────────────────────────────
+    cur.execute(
+        "UPDATE users SET settings=%s WHERE id=%s",
+        (json.dumps(cfg), g.user_id)
+    )
+    conn.commit(); conn.close()
+
+    return jsonify({
+        "ok":       True,
+        "applied":  applied,
+        "rejected": rejected,        # keys that were dropped (not in DEFAULT_CONFIG)
+        "config":   cfg,             # full new config for frontend confirmation
+    })
+
+
 @app.route("/api/learn", methods=["POST", "OPTIONS"])
 @auth_required
 def learn_from_mistakes():
@@ -6228,45 +6292,6 @@ def learn_history():
             "win_rate_after":  r[10],
         })
     return jsonify(result)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# APPLY CONFIG  — explicit user action to apply suggested param changes
-# ─────────────────────────────────────────────────────────────────────────────
-
-@app.route("/api/apply-config", methods=["POST", "OPTIONS"])
-@auth_required
-def apply_config():
-    """
-    Apply suggested configuration changes to the user's bot settings.
-    This is the ONLY endpoint that writes config changes — auto-learn,
-    optimise, and learn-from-mistakes all return suggestions only and
-    require the user to call this endpoint explicitly.
-
-    Body: { "changes": { "confluence_min": 5, "risk_reward": 2.5, ... } }
-    """
-    try:
-        data    = request.get_json(force=True) or {}
-        changes = data.get("changes") or {}
-        if not isinstance(changes, dict) or not changes:
-            return jsonify({"error": "Provide a non-empty 'changes' dict."}), 400
-
-        cfg = get_user_config()
-        before = {k: cfg.get(k) for k in changes}
-        cfg.update(changes)
-
-        conn = get_conn(); cur = conn.cursor()
-        cur.execute("UPDATE users SET settings=%s WHERE id=%s",
-                    (json.dumps(cfg), g.user_id))
-        conn.commit(); conn.close()
-
-        return jsonify({
-            "ok":      True,
-            "applied": changes,
-            "before":  before,
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
 
 
 # ─────────────────────────────────────────────────────────────────────────────
