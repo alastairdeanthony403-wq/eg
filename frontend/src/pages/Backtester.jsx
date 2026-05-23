@@ -218,7 +218,7 @@ export default function Backtester() {
     try {
       const d = await apiFetch("/api/learn", {
         method: "POST",
-        body: JSON.stringify({ auto_apply: true, symbol }),
+        body: JSON.stringify({ auto_apply: false, symbol }),
       });
       setLearnResult(d);
       loadLearnHistory();
@@ -597,6 +597,7 @@ export default function Backtester() {
                       ? <> <strong style={{color:T.green}}>Lean Confluence</strong> has no free parameters — each window runs directly on out-of-sample candles. Tells you whether the fixed signal set is stable across time.</>
                       : <> Each window: grid-search best params on the <em>in-sample</em> portion, then apply them to the <em>out-of-sample</em> portion. Tells you whether the edge is stable or curve-fitted.</>
                     }
+                    {" "}<span style={{color:T.t2}}>Each window reports a p-value (H₀: win rate = 50%) — p&lt;0.05 means the edge is statistically significant.</span>
                   </p>
                   <div style={{marginTop:8,fontSize:11,color:T.t2,fontFamily:MONO}}>
                     STRATEGY: <span style={{color:T.cyan}}>{STRATEGIES.find(s=>s.value===strategy)?.label||strategy}</span>
@@ -1430,6 +1431,18 @@ function WalkForwardResult({data:d, onApply, applying}){
           padding:"8px 12px",fontFamily:MONO,fontSize:10,color:T.green,marginBottom:12}}>
           ✓ Lean Confluence uses fixed parameters (R:R=2.0, Risk=1%, no grid search).
           The edge shown is purely from signal quality — not from curve-fitting.
+        </div>
+      )}
+
+      {/* Significance warning — shown when aggregate OOS is not significant */}
+      {agg.p_value != null && !agg.significant && (
+        <div style={{background:`${T.gold}10`,border:`1px solid ${T.gold}44`,borderRadius:4,
+          padding:"8px 12px",display:"flex",alignItems:"center",gap:8,marginBottom:12}}>
+          <AlertTriangle size={13} style={{color:T.gold,flexShrink:0}}/>
+          <span style={{fontFamily:MONO,fontSize:10,color:T.gold}}>
+            Aggregate OOS edge is <strong>not statistically significant</strong> (p={agg.p_value}, need p&lt;0.05).
+            Applying these params is speculative — consider a longer backtest period.
+          </span>
         </div>
       )}
 
