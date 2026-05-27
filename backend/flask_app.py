@@ -816,6 +816,15 @@ def fetch_polygon_candles(symbol, interval, limit=200):
 _backtest_daily_cache = {}
 BACKTEST_DAILY_TTL    = 1800
 
+# Twelve Data intraday cache — used by pdh_sweep strategy for 5m equity bars.
+# Request-budget note (free plan = 800 req/day, 8 req/min):
+#   Per symbol: ceil((period_days + 30 warmup) × 78 bars/day ÷ 5000 bars/page)
+#   365-day run → 7 pages  |  180-day run → 4 pages
+#   2 symbols (SPY + QQQ) × 7 pages = 14 TD requests for a full battery.
+#   With caching (TTL = 1800 s) each symbol is only fetched once per session.
+_td_intraday_cache = {}
+_TD_INTRADAY_TTL   = 1800   # seconds
+
 
 def fetch_non_crypto_backtest_candles(symbol, period_days, random_window=False):
     cached = _cache_get(_backtest_daily_cache, symbol, BACKTEST_DAILY_TTL)
@@ -861,6 +870,147 @@ def fetch_non_crypto_backtest_candles(symbol, period_days, random_window=False):
     end_date   = ms_to_date(all_candles[trade_end - 1][0])
 
     return window, "1d", start_date, end_date
+
+
+def fetch_twelvedata_intraday(symbol, period_days=365):
+    """
+    Fetch 5-minute bars from Twelve Data for a US equity symbol.
+
+    Covers (period_days + 30 warmup) trading days. Paginates backwards
+    from now in 5000-bar chunks. Returns a list of
+    [ts_ms, open, high, low, close, volume] sorted ascending.
+
+    Rate-limit handling (free plan: 8 req/min, 800 req/day):
+      • 8 s sleep between pages to stay under 8 req/min.
+      • HTTP 429 or JSON "code": 429  →  wait 65 s, retry the same page once.
+      • Any permanent error (auth, bad symbol) raises RuntimeError immediately.
+
+    Results are cached for _TD_INTRADAY_TTL seconds — repeated backtest /
+    walk-forward calls for the same symbol will NOT trigger extra API requests.
+    """
+    import math as _math
+
+    api_key = os.environ.get("TWELVEDATA_API_KEY", "")
+    if not api_key:
+        raise RuntimeError(
+            "TWELVEDATA_API_KEY is not set. "
+            "Add it to your Render environment variables."
+        )
+
+    cache_key = (symbol, period_days)
+    cached = _cache_get(_td_intraday_cache, cache_key, _TD_INTRADAY_TTL)
+    if cached is not None:
+        return cached
+
+    BARS_PER_PAGE = 5000
+    BARS_PER_DAY  = 78          # 6.5 h × 12 five-min bars (US regular session)
+    total_bars    = (period_days + 30) * BARS_PER_DAY
+    pages_needed  = _math.ceil(total_bars / BARS_PER_PAGE)
+
+    TD_URL   = "https://api.twelvedata.com/time_series"
+    all_bars = []
+    end_dt   = datetime.utcnow()
+
+    for page_idx in range(pages_needed):
+        params = {
+            "symbol":     symbol,
+            "interval":   "5min",
+            "outputsize": BARS_PER_PAGE,
+            "end_date":   end_dt.strftime("%Y-%m-%d %H:%M:%S"),
+            "timezone":   "UTC",
+            "format":     "JSON",
+            "apikey":     api_key,
+        }
+
+        # One retry after 65 s on rate-limit; hard fail on auth / permanent errors
+        data = None
+        for attempt in range(2):
+            try:
+                r = requests.get(TD_URL, params=params, timeout=30)
+                if r.status_code == 429:
+                    if attempt == 0:
+                        print(f"[twelvedata] 429 on page {page_idx}, sleeping 65 s")
+                        time.sleep(65)
+                        continue
+                    raise RuntimeError(f"Twelve Data rate-limited for {symbol} (retry exhausted)")
+                data = r.json()
+                # Rate-limit can also appear in JSON body
+                if data.get("code") == 429 or data.get("status") == "rate_limit":
+                    if attempt == 0:
+                        print(f"[twelvedata] JSON 429 on page {page_idx}, sleeping 65 s")
+                        time.sleep(65)
+                        data = None
+                        continue
+                    raise RuntimeError(f"Twelve Data rate-limited for {symbol} (retry exhausted)")
+                break
+            except RuntimeError:
+                raise
+            except Exception as e:
+                if attempt == 0:
+                    time.sleep(5)
+                    continue
+                raise RuntimeError(f"Twelve Data network error for {symbol}: {e}")
+
+        if data is None:
+            break
+
+        status = data.get("status", "ok")
+        if status == "error":
+            msg  = data.get("message", "unknown error")
+            code = data.get("code", 0)
+            raise RuntimeError(f"Twelve Data error for {symbol}: [{code}] {msg}")
+
+        values = data.get("values") or []
+        if not values:
+            break   # no more history available for this symbol / plan
+
+        page_bars = []
+        for v in values:
+            try:
+                # Twelve Data returns UTC datetimes as "YYYY-MM-DD HH:MM:SS"
+                dt    = datetime.strptime(v["datetime"], "%Y-%m-%d %H:%M:%S")
+                ts_ms = int(dt.replace(tzinfo=timezone.utc).timestamp() * 1000)
+                page_bars.append([
+                    ts_ms,
+                    float(v["open"]),
+                    float(v["high"]),
+                    float(v["low"]),
+                    float(v["close"]),
+                    float(v.get("volume") or 0),
+                ])
+            except Exception:
+                continue
+
+        if not page_bars:
+            break
+
+        all_bars.extend(page_bars)
+
+        # Step end_dt backward to 1 minute before the oldest bar received
+        oldest_ts = min(b[0] for b in page_bars)
+        end_dt    = datetime.utcfromtimestamp(oldest_ts / 1000) - timedelta(minutes=1)
+
+        # Rate-limit guard: stay under 8 req/min on the free plan
+        if page_idx < pages_needed - 1:
+            time.sleep(8)
+
+    if not all_bars:
+        raise RuntimeError(
+            f"Twelve Data returned 0 bars for {symbol}. "
+            "Check TWELVEDATA_API_KEY and that the symbol is a US equity "
+            "supported on your plan."
+        )
+
+    # Sort ascending and deduplicate
+    all_bars.sort(key=lambda b: b[0])
+    seen, unique = set(), []
+    for b in all_bars:
+        if b[0] not in seen:
+            seen.add(b[0])
+            unique.append(b)
+
+    _cache_set(_td_intraday_cache, cache_key, unique)
+    return unique
 
 
 # ─────────────────────────────────────────────
@@ -4111,6 +4261,284 @@ def run_lean_confluence_strategy(
     return trades, balance
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# PDH SWEEP SHORT STRATEGY
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_pdh_sweep_strategy(
+    candles,
+    starting_balance=1000,
+    fee_pct=0.04,
+    slippage_pct=0.02,
+    spread_pct=0.0,
+):
+    """
+    PDH Sweep Short — bare hypothesis implementation, no extra filters.
+
+    Setup   : Price sweeps above the Previous Day High (PDH) during the
+              morning session (09:30–11:00 ET, DST-aware).
+    Trigger : That candle closes back below PDH AND volume > 20-bar rolling mean.
+    Entry   : Short at open of the very next 5-minute candle.
+    Stop    : Sweep candle's high (the highest point of the false breakout).
+              Invalidation = any subsequent candle closes above sweep high →
+              this is functionally identical to the stop being hit.
+    Target  : max(structural_support, session_vwap) where both must be < entry.
+              max() = the value closer to entry = more conservative target.
+              Structural support = lowest low of the prior 20 bars.
+              Session VWAP = cumulative from 09:30 ET open to sweep candle.
+    RR gate : Skip if (entry − target) / (stop − entry) < 2.0.
+    Risk    : 1% of current balance per trade (fixed).
+    Limits  : One trade per trading day.
+
+    Candle format expected: [ts_ms, open, high, low, close, volume]
+    Candles should be 5-minute bars sorted ascending.
+    """
+    WARMUP       = 30      # bars needed for rolling volume average
+    RR_MIN       = 2.0
+    RISK_PCT     = 0.01    # 1% per trade
+    VOL_LOOKBACK = 20      # bars for rolling volume mean
+    SUPPORT_BARS = 20      # bars for structural support low
+
+    trades      = []
+    balance     = float(starting_balance)
+    fee_rate    = fee_pct      / 100
+    slip_rate   = slippage_pct / 100
+    spread_rate = spread_pct   / 100
+
+    if not candles or len(candles) < WARMUP + 5:
+        return trades, balance
+
+    # ── DST helper ──────────────────────────────────────────────────────────
+    def _is_edt(ts_ms):
+        """True when UTC timestamp falls inside US EDT period (UTC-4)."""
+        dt   = datetime.utcfromtimestamp(ts_ms / 1000)
+        year = dt.year
+        # DST starts: second Sunday of March at 07:00 UTC (2 AM EST → EDT)
+        mar1      = datetime(year, 3, 1)
+        dst_start = mar1 + timedelta(days=(6 - mar1.weekday()) % 7 + 7, hours=7)
+        # DST ends: first Sunday of November at 06:00 UTC (2 AM EDT → EST)
+        nov1      = datetime(year, 11, 1)
+        dst_end   = nov1 + timedelta(days=(6 - nov1.weekday()) % 7,  hours=6)
+        return dst_start <= dt < dst_end
+
+    def _in_morning_session(ts_ms):
+        """True when ts_ms falls in 09:30–11:00 ET (converted to UTC)."""
+        dt    = datetime.utcfromtimestamp(ts_ms / 1000)
+        utc_m = dt.hour * 60 + dt.minute
+        if _is_edt(ts_ms):
+            return 13 * 60 + 30 <= utc_m < 15 * 60   # EDT: 13:30–15:00 UTC
+        else:
+            return 14 * 60 + 30 <= utc_m < 16 * 60   # EST: 14:30–16:00 UTC
+
+    def _ts_str(ts_ms):
+        return datetime.utcfromtimestamp(ts_ms / 1000).strftime("%Y-%m-%d %H:%M")
+
+    # ── Precompute PDH map: utc_date → max high of the prior trading day ────
+    # Groups bars by UTC calendar date (valid for US equities — all regular-
+    # session bars 09:30–16:00 ET fall within a single UTC calendar day).
+    date_highs = {}
+    for ci in candles:
+        d = datetime.utcfromtimestamp(int(ci[0]) / 1000).date()
+        if d not in date_highs:
+            date_highs[d] = []
+        date_highs[d].append(float(ci[2]))
+
+    sorted_dates = sorted(date_highs.keys())
+    pdh_by_date  = {}
+    for di, d in enumerate(sorted_dates):
+        if di > 0:
+            pdh_by_date[d] = max(date_highs[sorted_dates[di - 1]])
+
+    # ── Main loop ────────────────────────────────────────────────────────────
+    position      = None
+    pending_entry = None   # set at sweep candle, consumed at next bar's open
+    current_day   = None
+    day_traded    = False
+    session_tvol  = 0.0    # sum of (typical_price × volume) — for VWAP
+    session_vol   = 0.0    # sum of volume — for VWAP
+
+    for i in range(WARMUP, len(candles)):
+        ts_ms = int(candles[i][0])
+        o     = float(candles[i][1])
+        h     = float(candles[i][2])
+        lo    = float(candles[i][3])
+        c     = float(candles[i][4])
+        vol   = float(candles[i][5])
+
+        utc_day = datetime.utcfromtimestamp(ts_ms / 1000).date()
+
+        # ── New trading day: flush any leftover position, reset daily state ──
+        if utc_day != current_day:
+            if position is not None:
+                # Close at first-bar open of new day (overnight held → flat)
+                ep    = position["entry"]
+                sz    = position["size"]
+                gp    = (ep - o) * sz
+                fee   = ep * sz * (fee_rate + spread_rate) * 2
+                net   = gp - fee
+                balance += net
+                trades.append({
+                    "side":        "SELL",
+                    "entry":       round(ep, 6),
+                    "exit":        round(o,  6),
+                    "pnl":         round(net, 4),
+                    "open_time":   position["open_time"],
+                    "close_time":  _ts_str(ts_ms),
+                    "exit_reason": "End of session",
+                    "sl":          round(position["stop"],   6),
+                    "tp":          round(position["target"], 6),
+                    "rr":          round(position["rr"],     2),
+                    "sl_pct":      round(abs(position["stop"] - ep) / ep * 100, 3),
+                    "session":     "PDH-Sweep",
+                    "confluence":  1,
+                })
+                position = None
+            current_day   = utc_day
+            day_traded    = False
+            session_tvol  = 0.0
+            session_vol   = 0.0
+            pending_entry = None
+
+        # ── Consume pending entry at this bar's open ─────────────────────────
+        if pending_entry is not None and position is None and not day_traded:
+            ep        = o * (1.0 + slip_rate)      # short: worse fill = higher price
+            sweep_hi  = pending_entry["sweep_high"]
+            risk_dist = sweep_hi - ep
+
+            if risk_dist > 0:
+                support = pending_entry["support"]
+                vwap_t  = pending_entry["vwap"]
+                # Keep only candidates below entry price
+                tgt_candidates = [x for x in [support, vwap_t] if x < ep]
+                if tgt_candidates:
+                    target      = max(tgt_candidates)   # closer to entry
+                    reward_dist = ep - target
+                    rr          = reward_dist / risk_dist
+                    if rr >= RR_MIN:
+                        risk_dlr = balance * RISK_PCT
+                        sz       = risk_dlr / risk_dist
+                        if sz > 0:
+                            position = {
+                                "entry":     ep,
+                                "stop":      sweep_hi,
+                                "target":    target,
+                                "size":      sz,
+                                "rr":        rr,
+                                "open_time": _ts_str(ts_ms),
+                            }
+                            day_traded = True
+            pending_entry = None
+
+        # ── Manage open position ─────────────────────────────────────────────
+        if position is not None:
+            ep    = position["entry"]
+            stop  = position["stop"]
+            tgt   = position["target"]
+            sz    = position["size"]
+
+            # Pessimistic: if SL and TP both touched on the same bar, SL wins.
+            sl_hit = h >= stop
+            tp_hit = lo <= tgt
+
+            if sl_hit and tp_hit:
+                exit_price, exit_reason = stop, "Stop loss (SL/TP same bar)"
+            elif sl_hit:
+                exit_price, exit_reason = stop, "Stop loss"
+            elif tp_hit:
+                exit_price, exit_reason = tgt,  "Take profit"
+            else:
+                exit_price = exit_reason = None
+
+            if exit_price is not None:
+                gp  = (ep - exit_price) * sz
+                fee = ep * sz * (fee_rate + spread_rate) * 2
+                net = gp - fee
+                balance += net
+                trades.append({
+                    "side":        "SELL",
+                    "entry":       round(ep, 6),
+                    "exit":        round(exit_price, 6),
+                    "pnl":         round(net, 4),
+                    "open_time":   position["open_time"],
+                    "close_time":  _ts_str(ts_ms),
+                    "exit_reason": exit_reason,
+                    "sl":          round(stop, 6),
+                    "tp":          round(tgt,  6),
+                    "rr":          round(position["rr"], 2),
+                    "sl_pct":      round(abs(stop - ep) / ep * 100, 3),
+                    "session":     "PDH-Sweep",
+                    "confluence":  1,
+                })
+                position = None
+            continue   # skip signal detection on position bars
+
+        # ── Update session VWAP (all bars from session open) ────────────────
+        tp_bar       = (h + lo + c) / 3.0
+        session_tvol += tp_bar * vol
+        session_vol  += vol
+        vwap          = session_tvol / session_vol if session_vol > 0 else c
+
+        # ── Signal detection ─────────────────────────────────────────────────
+        if day_traded:
+            continue   # one signal per day maximum
+
+        pdh = pdh_by_date.get(utc_day)
+        if pdh is None:
+            continue   # no prior-day data (first day of candle window)
+
+        if not _in_morning_session(ts_ms):
+            continue   # outside 09:30–11:00 ET
+
+        # Sweep: high exceeded PDH but candle closed back below it
+        if not (h > pdh and c < pdh):
+            continue
+
+        # Volume confirmation: volume > 20-bar backward-looking rolling mean
+        vol_window = [float(candles[j][5]) for j in range(i - VOL_LOOKBACK, i)]
+        vol_avg    = sum(vol_window) / len(vol_window) if vol_window else 0
+        if vol == 0 or vol_avg == 0 or vol <= vol_avg:
+            continue
+
+        # Structural support: lowest low in the prior SUPPORT_BARS bars
+        support = min(float(candles[j][3]) for j in range(i - SUPPORT_BARS, i))
+
+        # Queue entry for next bar's open
+        pending_entry = {
+            "sweep_high": h,
+            "pdh":        pdh,
+            "support":    support,
+            "vwap":       vwap,
+        }
+
+    # ── Close any position still open at end of candle data ─────────────────
+    if position is not None and candles:
+        last_c = candles[-1]
+        ep     = position["entry"]
+        sz     = position["size"]
+        lc     = float(last_c[4])
+        gp     = (ep - lc) * sz
+        fee    = ep * sz * (fee_rate + spread_rate) * 2
+        net    = gp - fee
+        balance += net
+        trades.append({
+            "side":        "SELL",
+            "entry":       round(ep,  6),
+            "exit":        round(lc,  6),
+            "pnl":         round(net, 4),
+            "open_time":   position["open_time"],
+            "close_time":  _ts_str(int(last_c[0])),
+            "exit_reason": "End of data",
+            "sl":          round(position["stop"],   6),
+            "tp":          round(position["target"], 6),
+            "rr":          round(position["rr"],     2),
+            "sl_pct":      round(abs(position["stop"] - ep) / ep * 100, 3),
+            "session":     "PDH-Sweep",
+            "confluence":  1,
+        })
+
+    return trades, balance
+
+
 # ─────────────────────────────────────────────
 # RISK BACKSTOP  (kill-switch)
 # ─────────────────────────────────────────────
@@ -4519,7 +4947,9 @@ def api_backtest():
     symbol      = str(data.get("symbol",      "BTCUSDT")).upper()
     interval    = str(data.get("interval",    "5m"))
     strategy    = str(data.get("strategy",    "unified_bot")).lower()
-    period_days = max(2, min(int(data.get("period_days", 30)), 90))   # default 30, max 90
+    # pdh_sweep needs 180–365 days of 5m bars; other strategies keep their 90-day cap
+    _max_days   = 365 if strategy == "pdh_sweep" else 90
+    period_days = max(2, min(int(data.get("period_days", 30)), _max_days))
     rand_window = bool(data.get("random_window", False))               # default False
     sb          = float(data.get("starting_balance", 1000))
     fee_pct     = float(data.get("fee_percent",       0.04))
@@ -4589,6 +5019,27 @@ def api_backtest():
                     )
                 }), 400
 
+        elif strategy == "pdh_sweep":
+            # PDH sweep requires 5m intraday bars from Twelve Data.
+            # Non-crypto symbols only — 24 h crypto has no real daily open/close.
+            if market == "crypto":
+                return jsonify({
+                    "error": "pdh_sweep is designed for equity instruments with a "
+                             "real daily open/close (e.g. SPY, QQQ, AAPL). "
+                             "Use a stock symbol instead of a crypto pair."
+                }), 400
+            all_td = fetch_twelvedata_intraday(symbol, period_days)
+            cutoff_ms  = int(
+                (datetime.utcnow() - timedelta(days=period_days)).timestamp() * 1000
+            )
+            candles    = [ci for ci in all_td if ci[0] >= cutoff_ms]
+            actual_interval = "5m"
+            if candles:
+                start_date = datetime.utcfromtimestamp(candles[0][0]  / 1000).strftime("%Y-%m-%d")
+                end_date   = datetime.utcfromtimestamp(candles[-1][0] / 1000).strftime("%Y-%m-%d")
+            else:
+                start_date = end_date = ""
+
         else:
             candles, actual_interval, start_date, end_date = \
                 fetch_non_crypto_backtest_candles(
@@ -4654,6 +5105,11 @@ def api_backtest():
                 weekly_win_goal=_ww_goal,
                 weekly_profit_target_pct=_wpt_pct,
                 weekly_max_loss_pct=_wml_pct,
+                spread_pct=spread_pct,
+            )
+        elif strategy == "pdh_sweep":
+            trades, ending_balance = run_pdh_sweep_strategy(
+                candles, sb, fee_pct, slip_pct,
                 spread_pct=spread_pct,
             )
         else:
@@ -6387,6 +6843,17 @@ def api_walkforward():
                 symbol, "5m", start_ms, end_ms,
                 max_candles=period_days * 288
             )
+        elif wf_strategy == "pdh_sweep":
+            if market == "crypto":
+                return jsonify({
+                    "error": "pdh_sweep requires a stock symbol (e.g. SPY, QQQ, AAPL), "
+                             "not a crypto pair."
+                }), 400
+            all_td      = fetch_twelvedata_intraday(symbol, period_days)
+            cutoff_ms   = int(
+                (datetime.utcnow() - timedelta(days=period_days)).timestamp() * 1000
+            )
+            all_candles = [ci for ci in all_td if ci[0] >= cutoff_ms]
         else:
             all_candles, _, _, _ = fetch_non_crypto_backtest_candles(
                 symbol, period_days, random_window=False
@@ -6419,6 +6886,12 @@ def api_walkforward():
                     spread_pct=spread_pct_wf,
                 )
                 return tr
+            elif wf_strategy == "pdh_sweep":
+                tr, _ = run_pdh_sweep_strategy(
+                    candle_slice, sb, fee_pct, slip_pct,
+                    spread_pct=spread_pct_wf,
+                )
+                return tr
             else:  # unified_bot / bot (default)
                 _c = dict(cfg)
                 if extra_cfg:
@@ -6433,11 +6906,11 @@ def api_walkforward():
                 )
                 return tr
 
-        if wf_strategy == "lean_confluence":
-            # Lean strategy is parameter-free — no grid search needed.
+        if wf_strategy in ("lean_confluence", "pdh_sweep"):
+            # Parameter-free strategies — no grid search, single empty combo.
             WF_GRID   = {}
             wf_keys   = []
-            wf_combos = [()]   # single empty combo
+            wf_combos = [()]
         else:
             WF_GRID = {
                 "confluence_min": [4, 5, 6, 7],
