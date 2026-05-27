@@ -917,7 +917,8 @@ def fetch_twelvedata_intraday(symbol, period_days=365):
             "interval":   "5min",
             "outputsize": BARS_PER_PAGE,
             "end_date":   end_dt.strftime("%Y-%m-%d %H:%M:%S"),
-            "timezone":   "UTC",
+            # No timezone= param: free plan returns Eastern Time datetime strings.
+            # run_pdh_sweep_strategy reads ET hours directly from the stored ts_ms.
             "format":     "JSON",
             "apikey":     api_key,
         }
@@ -4308,27 +4309,20 @@ def run_pdh_sweep_strategy(
     if not candles or len(candles) < WARMUP + 5:
         return trades, balance
 
-    # ── DST helper ──────────────────────────────────────────────────────────
-    def _is_edt(ts_ms):
-        """True when UTC timestamp falls inside US EDT period (UTC-4)."""
-        dt   = datetime.utcfromtimestamp(ts_ms / 1000)
-        year = dt.year
-        # DST starts: second Sunday of March at 07:00 UTC (2 AM EST → EDT)
-        mar1      = datetime(year, 3, 1)
-        dst_start = mar1 + timedelta(days=(6 - mar1.weekday()) % 7 + 7, hours=7)
-        # DST ends: first Sunday of November at 06:00 UTC (2 AM EDT → EST)
-        nov1      = datetime(year, 11, 1)
-        dst_end   = nov1 + timedelta(days=(6 - nov1.weekday()) % 7,  hours=6)
-        return dst_start <= dt < dst_end
-
+    # ── Morning session check ────────────────────────────────────────────────
     def _in_morning_session(ts_ms):
-        """True when ts_ms falls in 09:30–11:00 ET (converted to UTC)."""
-        dt    = datetime.utcfromtimestamp(ts_ms / 1000)
-        utc_m = dt.hour * 60 + dt.minute
-        if _is_edt(ts_ms):
-            return 13 * 60 + 30 <= utc_m < 15 * 60   # EDT: 13:30–15:00 UTC
-        else:
-            return 14 * 60 + 30 <= utc_m < 16 * 60   # EST: 14:30–16:00 UTC
+        """True when ts_ms falls in 09:30–11:00 ET.
+
+        Twelve Data's free plan returns datetime strings in Eastern Time
+        regardless of the timezone= parameter. fetch_twelvedata_intraday
+        stores those ET strings by treating them as UTC (no offset applied),
+        so ts_ms encodes ET wall-clock time.  Reading the "UTC" hour/minute
+        out of ts_ms therefore gives the actual ET hour/minute directly — no
+        DST conversion required.
+        """
+        dt   = datetime.utcfromtimestamp(ts_ms / 1000)
+        et_m = dt.hour * 60 + dt.minute   # ET wall-clock time encoded as UTC
+        return 9 * 60 + 30 <= et_m < 11 * 60   # 09:30–11:00 ET
 
     def _ts_str(ts_ms):
         return datetime.utcfromtimestamp(ts_ms / 1000).strftime("%Y-%m-%d %H:%M")
