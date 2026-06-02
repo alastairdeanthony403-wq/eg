@@ -87,7 +87,7 @@ MARKETS = {
     ],
     "stocks": [
         "AAPL", "TSLA", "NVDA", "MSFT", "AMZN", "SPY",
-        "GOOGL", "META", "NFLX", "AMD", "QQQ",
+        "GOOGL", "META", "NFLX", "AMD", "QQQ", "DIA",
         "JPM", "BAC", "V", "MA",
     ],
     "commodities": ["XAUUSD", "XAGUSD", "USOIL", "UKOIL", "NATGAS", "COPPER"],
@@ -125,7 +125,7 @@ POLYGON_SYMBOL_MAP = {
     "AAPL": "AAPL", "TSLA": "TSLA", "NVDA": "NVDA",
     "MSFT": "MSFT", "AMZN": "AMZN", "SPY":  "SPY",
     "GOOGL": "GOOGL", "META": "META", "NFLX": "NFLX",
-    "AMD":   "AMD",   "QQQ":  "QQQ",
+    "AMD":   "AMD",   "QQQ":  "QQQ",  "DIA":  "DIA",
     "JPM":   "JPM",   "BAC":  "BAC",
     "V":     "V",     "MA":   "MA",
 }
@@ -4263,6 +4263,152 @@ def run_lean_confluence_strategy(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# TURN-OF-MONTH STRATEGY
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Hypothesis: equity-index daily returns are concentrated in the turn-of-month
+# window driven by mandated month-end rebalancing inflows.
+#
+# Rule (daily bars only, long-only):
+#   Entry  — buy at CLOSE of the last trading day of each calendar month.
+#   Exit   — sell at CLOSE of the 3rd trading day of the following month.
+#   Flat otherwise. One position at a time (new entry fires ~25 days later).
+#
+# Metrics returned include per-day normalised in-window vs out-of-window
+# return comparison so the effect can be evaluated on an apples-to-apples basis.
+
+def run_turn_of_month_strategy(
+    candles,                  # list of [ts_ms, o, h, l, c, vol] daily bars
+    starting_balance=10000,
+    fee_pct=0.04,             # one-way fee %
+    slippage_pct=0.02,        # one-way slippage %
+    spread_pct=0.0,
+):
+    """
+    Returns (trades, ending_balance, extra_metrics).
+
+    extra_metrics dict contains:
+      bah_return_pct      — buy-and-hold total return % over the full period
+      in_window_per_day   — avg daily log-return INSIDE windows (as %)
+      out_window_per_day  — avg daily log-return OUTSIDE windows (as %)
+      in_out_ratio        — in_window_per_day / out_window_per_day (key test stat)
+      in_window_days      — total calendar-bar count inside windows
+      out_window_days     — total calendar-bar count outside windows
+      total_windows       — number of turn-of-month windows attempted
+    """
+    import math as _math
+
+    trades  = []
+    balance = float(starting_balance)
+
+    if not candles or len(candles) < 10:
+        return trades, balance, {}
+
+    # Parse timestamps to (year, month) tuples — daily bars, so one bar = one day.
+    def _ym(bar):
+        from datetime import datetime as _dt
+        return _dt.utcfromtimestamp(int(bar[0]) / 1000).strftime("%Y-%m")
+
+    # ── Identify last-bar-of-month indices ───────────────────────────────────
+    # A bar at index i is the last of its month if the next bar is a different month.
+    last_of_month = []   # indices where we will ENTER (buy at close)
+    for i in range(len(candles) - 1):
+        if _ym(candles[i]) != _ym(candles[i + 1]):
+            last_of_month.append(i)
+    # Never use the very last bar as an entry (no exit bar would exist).
+    last_of_month = [i for i in last_of_month if i + 3 < len(candles)]
+
+    # ── Build a set of bar indices that are INSIDE a window ──────────────────
+    # Window = entry bar + bars 1, 2, 3 of next month (4 bars inclusive).
+    # We mark every bar index that is "inside" so we can split per-day returns.
+    in_window_set = set()
+
+    # ── Execute trades ───────────────────────────────────────────────────────
+    one_way_cost = (fee_pct + slippage_pct + spread_pct) / 100.0
+
+    for entry_idx in last_of_month:
+        exit_idx = entry_idx + 3   # 3rd trading day of next month (0-based offset)
+
+        entry_close = float(candles[entry_idx][4])
+        exit_close  = float(candles[exit_idx][4])
+
+        # Mark bars inside this window (inclusive of entry and exit bars).
+        for wi in range(entry_idx, exit_idx + 1):
+            in_window_set.add(wi)
+
+        # Cost-adjusted return.
+        gross_ret = (exit_close - entry_close) / entry_close
+        net_ret   = gross_ret - 2 * one_way_cost   # round-trip
+
+        pnl   = balance * net_ret
+        balance += pnl
+
+        from datetime import datetime as _dt
+        entry_ts = int(candles[entry_idx][0])
+        exit_ts  = int(candles[exit_idx][0])
+
+        trades.append({
+            "type":       "long",
+            "entry":      entry_close,
+            "exit":       exit_close,
+            "pnl":        round(pnl, 4),
+            "pnl_pct":    round(net_ret * 100, 4),
+            "time":       _dt.utcfromtimestamp(entry_ts / 1000).strftime("%Y-%m-%d"),
+            "exit_time":  _dt.utcfromtimestamp(exit_ts  / 1000).strftime("%Y-%m-%d"),
+            "entry_price": entry_close,
+            "exit_price":  exit_close,
+        })
+
+    # ── Buy-and-hold return over full candle range ───────────────────────────
+    bah_entry = float(candles[0][4])
+    bah_exit  = float(candles[-1][4])
+    bah_return_pct = (bah_exit - bah_entry) / bah_entry * 100.0
+
+    # ── Per-day log-return split: in-window vs out-of-window ─────────────────
+    # For each consecutive bar pair (i, i+1), compute the log return of bar i+1.
+    # Assign it to in-window if bar i+1 is in in_window_set, else out-of-window.
+    # Using log returns so the per-day averages are additive and scale-neutral.
+    in_log_returns  = []
+    out_log_returns = []
+
+    for i in range(len(candles) - 1):
+        c_prev = float(candles[i][4])
+        c_curr = float(candles[i + 1][4])
+        if c_prev <= 0 or c_curr <= 0:
+            continue
+        lr = _math.log(c_curr / c_prev) * 100.0   # as percent
+        if (i + 1) in in_window_set:
+            in_log_returns.append(lr)
+        else:
+            out_log_returns.append(lr)
+
+    def _mean(lst):
+        return sum(lst) / len(lst) if lst else 0.0
+
+    in_per_day  = _mean(in_log_returns)
+    out_per_day = _mean(out_log_returns)
+    # Ratio: how many times more return per day inside vs outside.
+    # Guard division by zero; negative out_per_day makes ratio meaningless —
+    # report raw numbers in that case.
+    if out_per_day > 0:
+        ratio = in_per_day / out_per_day
+    else:
+        ratio = None   # caller will display as "N/A (flat/down out-of-window)"
+
+    extra_metrics = {
+        "bah_return_pct":    round(bah_return_pct, 2),
+        "in_window_per_day": round(in_per_day,  4),
+        "out_window_per_day":round(out_per_day, 4),
+        "in_out_ratio":      round(ratio, 2) if ratio is not None else None,
+        "in_window_days":    len(in_log_returns),
+        "out_window_days":   len(out_log_returns),
+        "total_windows":     len(last_of_month),
+    }
+
+    return trades, balance, extra_metrics
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # PDH SWEEP SHORT STRATEGY
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -4941,8 +5087,10 @@ def api_backtest():
     symbol      = str(data.get("symbol",      "BTCUSDT")).upper()
     interval    = str(data.get("interval",    "5m"))
     strategy    = str(data.get("strategy",    "unified_bot")).lower()
-    # pdh_sweep needs 180–365 days of 5m bars; other strategies keep their 90-day cap
-    _max_days   = 365 if strategy == "pdh_sweep" else 90
+    # pdh_sweep needs 180–365 days of 5m bars; turn_of_month needs 2500 daily bars;
+    # other strategies keep their 90-day cap.
+    _max_days   = 365  if strategy == "pdh_sweep"    else (
+                  2500 if strategy == "turn_of_month" else 90)
     period_days = max(2, min(int(data.get("period_days", 30)), _max_days))
     rand_window = bool(data.get("random_window", False))               # default False
     sb          = float(data.get("starting_balance", 1000))
@@ -5034,6 +5182,22 @@ def api_backtest():
             else:
                 start_date = end_date = ""
 
+        elif strategy == "turn_of_month":
+            # Turn-of-month requires daily equity bars. Uses a higher bar limit
+            # (2500 ≈ 10 years) to get enough monthly windows for significance.
+            if market == "crypto":
+                return jsonify({
+                    "error": "turn_of_month is designed for equity index ETFs "
+                             "(e.g. QQQ, DIA, SPY). Use an equity symbol."
+                }), 400
+            from datetime import datetime as _dt2
+            _tom_bars = min(period_days, 2500)
+            _raw = fetch_polygon_candles(symbol, "1d", limit=_tom_bars)
+            candles      = _raw
+            actual_interval = "1d"
+            start_date   = _dt2.utcfromtimestamp(int(candles[0][0])  / 1000).strftime("%Y-%m-%d") if candles else ""
+            end_date     = _dt2.utcfromtimestamp(int(candles[-1][0]) / 1000).strftime("%Y-%m-%d") if candles else ""
+
         else:
             candles, actual_interval, start_date, end_date = \
                 fetch_non_crypto_backtest_candles(
@@ -5075,6 +5239,7 @@ def api_backtest():
 
     # Per-market spread cost (one-way %; 0 for crypto — absorbed in fee)
     spread_pct = MARKET_SPREADS.get(market, 0.0)
+    _tom_extra = {}   # populated only when strategy == "turn_of_month"
 
     try:
         if strategy in ("unified_bot", "bot"):   # "bot" kept as legacy alias
@@ -5103,6 +5268,11 @@ def api_backtest():
             )
         elif strategy == "pdh_sweep":
             trades, ending_balance = run_pdh_sweep_strategy(
+                candles, sb, fee_pct, slip_pct,
+                spread_pct=spread_pct,
+            )
+        elif strategy == "turn_of_month":
+            trades, ending_balance, _tom_extra = run_turn_of_month_strategy(
                 candles, sb, fee_pct, slip_pct,
                 spread_pct=spread_pct,
             )
@@ -5286,6 +5456,8 @@ def api_backtest():
         "low_sample_msg":       low_sample_msg,
         "random_window":        rand_window,
         "spread_pct":           spread_pct,
+        # turn_of_month only — per-day normalised in/out comparison
+        "turn_of_month_metrics": _tom_extra if strategy == "turn_of_month" else None,
     }
 
     # Sample up to 400 candles for the chart (keep response size reasonable)
@@ -6815,7 +6987,8 @@ def api_walkforward():
         data        = request.get_json(force=True) or {}
         symbol      = (data.get("symbol") or "BTCUSDT").upper()
         wf_strategy = str(data.get("strategy", "unified_bot")).lower()
-        period_days = max(30, min(int(data.get("period_days", 120)), 365))
+        _wf_max_days = 2500 if wf_strategy == "turn_of_month" else 365
+        period_days = max(30, min(int(data.get("period_days", 120)), _wf_max_days))
         n_windows   = max(2, min(int(data.get("n_windows",   4)),   6))
         train_pct   = max(0.50, min(float(data.get("train_pct", 0.70)), 0.90))
         sb          = float(data.get("starting_balance", 10000))
@@ -6848,6 +7021,14 @@ def api_walkforward():
                 (datetime.utcnow() - timedelta(days=period_days)).timestamp() * 1000
             )
             all_candles = [ci for ci in all_td if ci[0] >= cutoff_ms]
+        elif wf_strategy == "turn_of_month":
+            if market == "crypto":
+                return jsonify({
+                    "error": "turn_of_month is designed for equity index ETFs "
+                             "(e.g. QQQ, DIA, SPY). Use an equity symbol."
+                }), 400
+            _tom_wf_bars = min(period_days, 2500)
+            all_candles  = fetch_polygon_candles(symbol, "1d", limit=_tom_wf_bars)
         else:
             all_candles, _, _, _ = fetch_non_crypto_backtest_candles(
                 symbol, period_days, random_window=False
@@ -6886,6 +7067,12 @@ def api_walkforward():
                     spread_pct=spread_pct_wf,
                 )
                 return tr
+            elif wf_strategy == "turn_of_month":
+                tr, _, _ = run_turn_of_month_strategy(
+                    candle_slice, sb, fee_pct, slip_pct,
+                    spread_pct=spread_pct_wf,
+                )
+                return tr
             else:  # unified_bot / bot (default)
                 _c = dict(cfg)
                 if extra_cfg:
@@ -6900,7 +7087,7 @@ def api_walkforward():
                 )
                 return tr
 
-        if wf_strategy in ("lean_confluence", "pdh_sweep"):
+        if wf_strategy in ("lean_confluence", "pdh_sweep", "turn_of_month"):
             # Parameter-free strategies — no grid search, single empty combo.
             WF_GRID   = {}
             wf_keys   = []
