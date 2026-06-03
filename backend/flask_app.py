@@ -4409,6 +4409,167 @@ def run_turn_of_month_strategy(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# INTRADAY MOMENTUM STRATEGY
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Hypothesis: the first 30 min of the regular session (09:30–09:55 ET) predicts
+# the last 30 min (15:30–15:55 ET) — same direction.
+#
+# Rule (5-minute bars, US equity session only):
+#   r1     = close_0955 / open_0930 - 1   (first-half-hour return)
+#   Entry  : open of the 15:30 bar, direction = sign(r1)
+#   Exit   : close of the 15:55 bar (hold-to-close, no SL/TP)
+#   Skip   : any day missing the 09:30, 09:55, 15:30, or 15:55 anchor bars
+#             (early closes, data gaps, holidays all handled implicitly)
+#   Size   : fixed notional (non-compounding) so profit factor = pure signal PF
+#
+# Gross and net PnL are both returned. Diagnostics:
+#   avg_last30_up    — mean last-30-min return on up-morning days (r1 > 0)
+#   avg_last30_down  — mean last-30-min return on down-morning days (r1 < 0)
+#   avg_signed       — mean of sign(r1) × last-30-min return (key test stat)
+#   hit_rate_pct     — % of days where afternoon direction matched morning
+
+def run_intraday_momentum_strategy(
+    candles,                   # [ts_ms, open, high, low, close, volume] 5m bars
+    starting_balance=10000,
+    fee_pct=0.04,              # one-way fee %
+    slippage_pct=0.02,         # one-way slippage %
+    spread_pct=0.0,
+    notional_pct=10.0,         # fixed notional as % of starting_balance (non-compounding)
+):
+    """
+    Returns (trades, ending_balance, diagnostics).
+
+    diagnostics dict:
+      avg_last30_up    — avg last-30-min return % on days where r1 > 0
+      avg_last30_down  — avg last-30-min return % on days where r1 < 0
+      avg_signed       — avg of sign(r1) × last-30-min return % (>0 = edge present)
+      hit_rate_pct     — % of traded days where sign(r1) == sign(last-30-min return)
+      total_days       — total trading days with all four anchor bars present
+      gross_pnl        — sum of PnL before fees/slippage
+      net_pnl          — sum of PnL after fees/slippage
+    """
+    trades        = []
+    balance       = float(starting_balance)
+    fixed_notional = float(starting_balance) * notional_pct / 100.0
+
+    one_way_cost  = (fee_pct + slippage_pct + spread_pct) / 100.0
+    round_trip    = 2 * one_way_cost   # applied once per trade
+
+    if not candles or len(candles) < 10:
+        return trades, balance, {}
+
+    # ── Group bars by ET date ────────────────────────────────────────────────
+    # ts_ms encodes ET wall-clock time as fake-UTC (see fetch_twelvedata_intraday).
+    # datetime.utcfromtimestamp() therefore gives the ET hour/minute directly.
+    from collections import defaultdict as _dd
+
+    day_bars = _dd(list)   # "YYYY-MM-DD" (ET date) → list of bars
+    for bar in candles:
+        dt_et = datetime.utcfromtimestamp(int(bar[0]) / 1000)
+        day_bars[dt_et.strftime("%Y-%m-%d")].append(bar)
+
+    # ── Per-day logic ────────────────────────────────────────────────────────
+    last30_up   = []   # last-30-min returns on up-morning days
+    last30_down = []   # last-30-min returns on down-morning days
+    hits        = []   # True/False: did afternoon direction match morning?
+
+    for date_str in sorted(day_bars.keys()):
+        bars = day_bars[date_str]
+
+        # Index by (hour, minute) for O(1) anchor lookup
+        bar_map = {}
+        for b in bars:
+            dt_et = datetime.utcfromtimestamp(int(b[0]) / 1000)
+            bar_map[(dt_et.hour, dt_et.minute)] = b
+
+        # Four required anchors (all in ET wall-clock time)
+        b_0930 = bar_map.get((9,  30))
+        b_0955 = bar_map.get((9,  55))
+        b_1530 = bar_map.get((15, 30))
+        b_1555 = bar_map.get((15, 55))
+
+        if not (b_0930 and b_0955 and b_1530 and b_1555):
+            continue   # early close, holiday, or data gap — skip silently
+
+        open_0930  = float(b_0930[1])   # open of first bar
+        close_0955 = float(b_0955[4])   # close of sixth bar (end of first 30 min)
+        open_1530  = float(b_1530[1])   # entry price
+        close_1555 = float(b_1555[4])   # exit price
+
+        if open_0930 <= 0:
+            continue
+
+        r1 = (close_0955 - open_0930) / open_0930
+        if r1 == 0:
+            continue   # no signal
+
+        direction = 1 if r1 > 0 else -1   # +1 long, -1 short
+
+        # Last-30-min return (unsigned, from the market's perspective)
+        if open_1530 <= 0:
+            continue
+        last30_raw = (close_1555 - open_1530) / open_1530   # positive = up
+
+        # Record diagnostics (before costs, pure signal)
+        last30_pct = last30_raw * 100.0
+        if direction == 1:
+            last30_up.append(last30_pct)
+        else:
+            last30_down.append(last30_pct)
+        hits.append(direction * last30_raw > 0)
+
+        # ── P&L calculation ──────────────────────────────────────────────────
+        # Fixed notional, non-compounding.
+        # Gross: direction × last-30-min return × notional
+        # Net:   subtract round-trip cost on the notional
+        gross_pnl = direction * last30_raw * fixed_notional
+        net_pnl   = gross_pnl - round_trip * fixed_notional
+
+        balance += net_pnl
+
+        trades.append({
+            "type":        "long" if direction == 1 else "short",
+            "entry":       open_1530,
+            "exit":        close_1555,
+            "entry_price": open_1530,
+            "exit_price":  close_1555,
+            "pnl":         round(net_pnl, 4),
+            "pnl_pct":     round(direction * last30_raw * 100 - round_trip * 100, 4),
+            "gross_pnl":   round(gross_pnl, 4),
+            "r1_pct":      round(r1 * 100, 4),
+            "time":        date_str + " 15:30",
+            "exit_time":   date_str + " 15:55",
+            "open_time":   date_str + " 15:30",
+            "close_time":  date_str + " 15:55",
+        })
+
+    def _mean(lst):
+        return round(sum(lst) / len(lst), 4) if lst else None
+
+    total_days   = len(last30_up) + len(last30_down)
+    gross_total  = sum(t["gross_pnl"] for t in trades)
+    net_total    = sum(t["pnl"]       for t in trades)
+
+    diagnostics = {
+        "avg_last30_up":   _mean(last30_up),
+        "avg_last30_down": _mean(last30_down),
+        "avg_signed":      _mean([d * r for d, r in
+                               zip([1]*len(last30_up) + [-1]*len(last30_down),
+                                   last30_up + last30_down)]),
+        "hit_rate_pct":    round(sum(hits) / len(hits) * 100, 2) if hits else None,
+        "total_days":      total_days,
+        "up_morning_days": len(last30_up),
+        "down_morning_days": len(last30_down),
+        "gross_pnl":       round(gross_total, 2),
+        "net_pnl":         round(net_total,   2),
+        "fixed_notional":  round(fixed_notional, 2),
+    }
+
+    return trades, balance, diagnostics
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # PDH SWEEP SHORT STRATEGY
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -5089,8 +5250,9 @@ def api_backtest():
     strategy    = str(data.get("strategy",    "unified_bot")).lower()
     # pdh_sweep needs 180–365 days of 5m bars; turn_of_month needs 2500 daily bars;
     # other strategies keep their 90-day cap.
-    _max_days   = 365  if strategy == "pdh_sweep"    else (
-                  2500 if strategy == "turn_of_month" else 90)
+    _max_days   = 365  if strategy == "pdh_sweep"       else (
+                  2500 if strategy == "turn_of_month"   else (
+                  730  if strategy == "intraday_momentum" else 90))
     period_days = max(2, min(int(data.get("period_days", 30)), _max_days))
     rand_window = bool(data.get("random_window", False))               # default False
     sb          = float(data.get("starting_balance", 1000))
@@ -5182,6 +5344,25 @@ def api_backtest():
             else:
                 start_date = end_date = ""
 
+        elif strategy == "intraday_momentum":
+            # Intraday momentum uses the same Twelve Data 5m path as pdh_sweep.
+            if market == "crypto":
+                return jsonify({
+                    "error": "intraday_momentum requires a US equity symbol "
+                             "(e.g. SPY, QQQ). Use an equity symbol."
+                }), 400
+            all_td = fetch_twelvedata_intraday(symbol, period_days)
+            cutoff_ms  = int(
+                (datetime.utcnow() - timedelta(days=period_days * 1.5)).timestamp() * 1000
+            )
+            candles    = [ci for ci in all_td if ci[0] >= cutoff_ms]
+            actual_interval = "5m"
+            if candles:
+                start_date = datetime.utcfromtimestamp(candles[0][0]  / 1000).strftime("%Y-%m-%d")
+                end_date   = datetime.utcfromtimestamp(candles[-1][0] / 1000).strftime("%Y-%m-%d")
+            else:
+                start_date = end_date = ""
+
         elif strategy == "turn_of_month":
             # Turn-of-month requires daily equity bars. Uses a higher bar limit
             # (2500 ≈ 10 years) to get enough monthly windows for significance.
@@ -5240,6 +5421,7 @@ def api_backtest():
     # Per-market spread cost (one-way %; 0 for crypto — absorbed in fee)
     spread_pct = MARKET_SPREADS.get(market, 0.0)
     _tom_extra = {}   # populated only when strategy == "turn_of_month"
+    _im_extra  = {}   # populated only when strategy == "intraday_momentum"
 
     try:
         if strategy in ("unified_bot", "bot"):   # "bot" kept as legacy alias
@@ -5273,6 +5455,11 @@ def api_backtest():
             )
         elif strategy == "turn_of_month":
             trades, ending_balance, _tom_extra = run_turn_of_month_strategy(
+                candles, sb, fee_pct, slip_pct,
+                spread_pct=spread_pct,
+            )
+        elif strategy == "intraday_momentum":
+            trades, ending_balance, _im_extra = run_intraday_momentum_strategy(
                 candles, sb, fee_pct, slip_pct,
                 spread_pct=spread_pct,
             )
@@ -5458,6 +5645,8 @@ def api_backtest():
         "spread_pct":           spread_pct,
         # turn_of_month only — per-day normalised in/out comparison
         "turn_of_month_metrics": _tom_extra if strategy == "turn_of_month" else None,
+        # intraday_momentum only — signal diagnostics
+        "intraday_momentum_metrics": _im_extra if strategy == "intraday_momentum" else None,
     }
 
     # Sample up to 400 candles for the chart (keep response size reasonable)
@@ -6987,7 +7176,8 @@ def api_walkforward():
         data        = request.get_json(force=True) or {}
         symbol      = (data.get("symbol") or "BTCUSDT").upper()
         wf_strategy = str(data.get("strategy", "unified_bot")).lower()
-        _wf_max_days = 2500 if wf_strategy == "turn_of_month" else 365
+        _wf_max_days = (2500 if wf_strategy == "turn_of_month"    else
+                        730  if wf_strategy == "intraday_momentum" else 365)
         period_days = max(30, min(int(data.get("period_days", 120)), _wf_max_days))
         n_windows   = max(2, min(int(data.get("n_windows",   4)),   6))
         train_pct   = max(0.50, min(float(data.get("train_pct", 0.70)), 0.90))
@@ -7029,6 +7219,17 @@ def api_walkforward():
                 }), 400
             _tom_wf_bars = min(period_days, 2500)
             all_candles  = fetch_polygon_candles(symbol, "1d", limit=_tom_wf_bars)
+        elif wf_strategy == "intraday_momentum":
+            if market == "crypto":
+                return jsonify({
+                    "error": "intraday_momentum requires a US equity symbol "
+                             "(e.g. SPY, QQQ). Use an equity symbol."
+                }), 400
+            all_td_wf   = fetch_twelvedata_intraday(symbol, period_days)
+            cutoff_ms_wf = int(
+                (datetime.utcnow() - timedelta(days=period_days * 1.5)).timestamp() * 1000
+            )
+            all_candles  = [ci for ci in all_td_wf if ci[0] >= cutoff_ms_wf]
         else:
             all_candles, _, _, _ = fetch_non_crypto_backtest_candles(
                 symbol, period_days, random_window=False
@@ -7073,6 +7274,12 @@ def api_walkforward():
                     spread_pct=spread_pct_wf,
                 )
                 return tr
+            elif wf_strategy == "intraday_momentum":
+                tr, _, _ = run_intraday_momentum_strategy(
+                    candle_slice, sb, fee_pct, slip_pct,
+                    spread_pct=spread_pct_wf,
+                )
+                return tr
             else:  # unified_bot / bot (default)
                 _c = dict(cfg)
                 if extra_cfg:
@@ -7087,7 +7294,7 @@ def api_walkforward():
                 )
                 return tr
 
-        if wf_strategy in ("lean_confluence", "pdh_sweep", "turn_of_month"):
+        if wf_strategy in ("lean_confluence", "pdh_sweep", "turn_of_month", "intraday_momentum"):
             # Parameter-free strategies — no grid search, single empty combo.
             WF_GRID   = {}
             wf_keys   = []
