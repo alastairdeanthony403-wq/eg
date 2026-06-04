@@ -4570,6 +4570,139 @@ def run_intraday_momentum_strategy(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# OVERNIGHT DRIFT STRATEGY
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Hypothesis: the overnight window (previous close → next open) earns a
+# positive risk premium; the intraday session (open → close) is flat-to-
+# negative. Be long overnight every day, flat during the day.
+#
+# Rule (daily bars only, unconditional, zero parameters):
+#   Entry  : previous day's close  (close[t-1])  — MOC equivalent
+#   Exit   : current day's open    (open[t])      — MOO equivalent
+#   Every trading day with a valid prior bar is a trade. Long only.
+#   Sizing : fixed notional (non-compounding) so dollar PF == signal PF.
+#
+# Diagnostics (per-day, cost-free, directly comparable):
+#   avg_overnight_pct   — mean of r_overnight[t] = (open[t]-close[t-1])/close[t-1]
+#   avg_intraday_pct    — mean of r_intraday[t]  = (close[t]-open[t])/open[t]
+#   overnight_minus_intraday — difference (positive = overnight leads)
+#   overnight_hit_rate_pct   — % of days r_overnight > 0
+#   bah_return_pct      — close[first] → close[last] buy-and-hold
+#
+# Interpretation rule (enforced in Step 4 verdict):
+#   Positive overnight + flat/negative intraday → duration alone cannot
+#     explain it; consistent with risk-premium claim.
+#   Both positive, overnight merely larger → AMBIGUOUS (could be duration
+#     in a bull market); flag explicitly, do not call it a confirmed edge.
+
+def run_overnight_drift_strategy(
+    candles,                   # [ts_ms, open, high, low, close, vol] daily bars
+    starting_balance=10000,
+    fee_pct=0.04,              # one-way fee %
+    slippage_pct=0.02,         # one-way slippage %
+    spread_pct=0.0,
+    notional_pct=10.0,         # fixed notional as % of starting_balance
+):
+    """
+    Returns (trades, ending_balance, diagnostics).
+
+    Each trade represents one overnight hold: enter at close[t-1], exit at
+    open[t]. Gross and net PnL both stored per trade. Diagnostics split
+    overnight vs intraday returns for the edge-vs-duration test.
+    """
+    trades        = []
+    balance       = float(starting_balance)
+    fixed_notional = float(starting_balance) * notional_pct / 100.0
+
+    one_way_cost = (fee_pct + slippage_pct + spread_pct) / 100.0
+    round_trip   = 2 * one_way_cost   # both legs cost the same
+
+    if not candles or len(candles) < 2:
+        return trades, balance, {}
+
+    overnight_returns = []   # r_overnight per day (cost-free, raw signal)
+    intraday_returns  = []   # r_intraday  per day (cost-free, for comparison)
+
+    from datetime import datetime as _dt
+
+    for i in range(1, len(candles)):
+        prev = candles[i - 1]
+        curr = candles[i]
+
+        prev_close = float(prev[4])   # close[t-1]
+        curr_open  = float(curr[1])   # open[t]
+        curr_close = float(curr[4])   # close[t]
+
+        if prev_close <= 0 or curr_open <= 0 or curr_close <= 0:
+            continue
+
+        # Pure signal returns (no costs — used for diagnostics)
+        r_overnight = (curr_open  - prev_close) / prev_close
+        r_intraday  = (curr_close - curr_open)  / curr_open
+
+        overnight_returns.append(r_overnight * 100.0)
+        intraday_returns.append(r_intraday   * 100.0)
+
+        # P&L: long overnight, fixed notional
+        gross_pnl = r_overnight * fixed_notional
+        net_pnl   = gross_pnl - round_trip * fixed_notional
+
+        balance += net_pnl
+
+        date_str = _dt.utcfromtimestamp(int(curr[0]) / 1000).strftime("%Y-%m-%d")
+
+        trades.append({
+            "type":        "long",
+            "entry":       prev_close,
+            "exit":        curr_open,
+            "entry_price": prev_close,
+            "exit_price":  curr_open,
+            "pnl":         round(net_pnl,   4),
+            "gross_pnl":   round(gross_pnl, 4),
+            "pnl_pct":     round(r_overnight * 100 - round_trip * 100, 4),
+            "r_overnight_pct": round(r_overnight * 100, 4),
+            "r_intraday_pct":  round(r_intraday  * 100, 4),
+            "time":        date_str,
+            "open_time":   date_str,
+            "close_time":  date_str,
+        })
+
+    def _mean(lst):
+        return round(sum(lst) / len(lst), 4) if lst else None
+
+    n = len(overnight_returns)
+    avg_on  = _mean(overnight_returns)
+    avg_id  = _mean(intraday_returns)
+
+    hits = sum(1 for r in overnight_returns if r > 0)
+
+    # BAH: first bar close → last bar close
+    bah_entry = float(candles[0][4])
+    bah_exit  = float(candles[-1][4])
+    bah_pct   = round((bah_exit - bah_entry) / bah_entry * 100.0, 2) if bah_entry > 0 else None
+
+    gross_total = sum(t["gross_pnl"] for t in trades)
+    net_total   = sum(t["pnl"]       for t in trades)
+
+    diagnostics = {
+        "avg_overnight_pct":        avg_on,
+        "avg_intraday_pct":         avg_id,
+        "overnight_minus_intraday": round(avg_on - avg_id, 4) if (avg_on is not None and avg_id is not None) else None,
+        "overnight_hit_rate_pct":   round(hits / n * 100, 2) if n else None,
+        "bah_return_pct":           bah_pct,
+        "total_days":               n,
+        "gross_pnl":                round(gross_total, 2),
+        "net_pnl":                  round(net_total,   2),
+        "fixed_notional":           round(fixed_notional, 2),
+        "one_way_cost_pct":         round(one_way_cost * 100, 4),   # for sanity-check
+        "round_trip_cost_pct":      round(round_trip   * 100, 4),
+    }
+
+    return trades, balance, diagnostics
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # PDH SWEEP SHORT STRATEGY
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -5250,9 +5383,10 @@ def api_backtest():
     strategy    = str(data.get("strategy",    "unified_bot")).lower()
     # pdh_sweep needs 180–365 days of 5m bars; turn_of_month needs 2500 daily bars;
     # other strategies keep their 90-day cap.
-    _max_days   = 365  if strategy == "pdh_sweep"       else (
-                  2500 if strategy == "turn_of_month"   else (
-                  730  if strategy == "intraday_momentum" else 90))
+    _max_days   = 365  if strategy == "pdh_sweep"         else (
+                  2500 if strategy == "turn_of_month"     else (
+                  730  if strategy == "intraday_momentum"  else (
+                  2500 if strategy == "overnight_drift"    else 90)))
     period_days = max(2, min(int(data.get("period_days", 30)), _max_days))
     rand_window = bool(data.get("random_window", False))               # default False
     sb          = float(data.get("starting_balance", 1000))
@@ -5363,18 +5497,16 @@ def api_backtest():
             else:
                 start_date = end_date = ""
 
-        elif strategy == "turn_of_month":
-            # Turn-of-month requires daily equity bars. Uses a higher bar limit
-            # (2500 ≈ 10 years) to get enough monthly windows for significance.
+        elif strategy in ("turn_of_month", "overnight_drift"):
+            # Daily equity bars via Polygon. limit=2500 to maximise history.
             if market == "crypto":
                 return jsonify({
-                    "error": "turn_of_month is designed for equity index ETFs "
-                             "(e.g. QQQ, DIA, SPY). Use an equity symbol."
+                    "error": f"{strategy} requires a US equity symbol "
+                             "(e.g. SPY, QQQ, DIA). Use an equity symbol."
                 }), 400
             from datetime import datetime as _dt2
-            _tom_bars = min(period_days, 2500)
-            _raw = fetch_polygon_candles(symbol, "1d", limit=_tom_bars)
-            candles      = _raw
+            _raw = fetch_polygon_candles(symbol, "1d", limit=2500)
+            candles         = _raw
             actual_interval = "1d"
             start_date   = _dt2.utcfromtimestamp(int(candles[0][0])  / 1000).strftime("%Y-%m-%d") if candles else ""
             end_date     = _dt2.utcfromtimestamp(int(candles[-1][0]) / 1000).strftime("%Y-%m-%d") if candles else ""
@@ -5422,6 +5554,7 @@ def api_backtest():
     spread_pct = MARKET_SPREADS.get(market, 0.0)
     _tom_extra = {}   # populated only when strategy == "turn_of_month"
     _im_extra  = {}   # populated only when strategy == "intraday_momentum"
+    _od_extra  = {}   # populated only when strategy == "overnight_drift"
 
     try:
         if strategy in ("unified_bot", "bot"):   # "bot" kept as legacy alias
@@ -5460,6 +5593,11 @@ def api_backtest():
             )
         elif strategy == "intraday_momentum":
             trades, ending_balance, _im_extra = run_intraday_momentum_strategy(
+                candles, sb, fee_pct, slip_pct,
+                spread_pct=spread_pct,
+            )
+        elif strategy == "overnight_drift":
+            trades, ending_balance, _od_extra = run_overnight_drift_strategy(
                 candles, sb, fee_pct, slip_pct,
                 spread_pct=spread_pct,
             )
@@ -5647,6 +5785,8 @@ def api_backtest():
         "turn_of_month_metrics": _tom_extra if strategy == "turn_of_month" else None,
         # intraday_momentum only — signal diagnostics
         "intraday_momentum_metrics": _im_extra if strategy == "intraday_momentum" else None,
+        # overnight_drift only — overnight vs intraday per-day breakdown
+        "overnight_drift_metrics": _od_extra if strategy == "overnight_drift" else None,
     }
 
     # Sample up to 400 candles for the chart (keep response size reasonable)
@@ -7176,7 +7316,7 @@ def api_walkforward():
         data        = request.get_json(force=True) or {}
         symbol      = (data.get("symbol") or "BTCUSDT").upper()
         wf_strategy = str(data.get("strategy", "unified_bot")).lower()
-        _wf_max_days = (2500 if wf_strategy == "turn_of_month"    else
+        _wf_max_days = (2500 if wf_strategy in ("turn_of_month", "overnight_drift") else
                         730  if wf_strategy == "intraday_momentum" else 365)
         period_days = max(30, min(int(data.get("period_days", 120)), _wf_max_days))
         n_windows   = max(2, min(int(data.get("n_windows",   4)),   6))
@@ -7211,14 +7351,13 @@ def api_walkforward():
                 (datetime.utcnow() - timedelta(days=period_days)).timestamp() * 1000
             )
             all_candles = [ci for ci in all_td if ci[0] >= cutoff_ms]
-        elif wf_strategy == "turn_of_month":
+        elif wf_strategy in ("turn_of_month", "overnight_drift"):
             if market == "crypto":
                 return jsonify({
-                    "error": "turn_of_month is designed for equity index ETFs "
-                             "(e.g. QQQ, DIA, SPY). Use an equity symbol."
+                    "error": f"{wf_strategy} requires a US equity symbol "
+                             "(e.g. SPY, QQQ, DIA). Use an equity symbol."
                 }), 400
-            _tom_wf_bars = min(period_days, 2500)
-            all_candles  = fetch_polygon_candles(symbol, "1d", limit=_tom_wf_bars)
+            all_candles = fetch_polygon_candles(symbol, "1d", limit=2500)
         elif wf_strategy == "intraday_momentum":
             if market == "crypto":
                 return jsonify({
@@ -7280,6 +7419,12 @@ def api_walkforward():
                     spread_pct=spread_pct_wf,
                 )
                 return tr
+            elif wf_strategy == "overnight_drift":
+                tr, _, _ = run_overnight_drift_strategy(
+                    candle_slice, sb, fee_pct, slip_pct,
+                    spread_pct=spread_pct_wf,
+                )
+                return tr
             else:  # unified_bot / bot (default)
                 _c = dict(cfg)
                 if extra_cfg:
@@ -7294,7 +7439,8 @@ def api_walkforward():
                 )
                 return tr
 
-        if wf_strategy in ("lean_confluence", "pdh_sweep", "turn_of_month", "intraday_momentum"):
+        if wf_strategy in ("lean_confluence", "pdh_sweep", "turn_of_month",
+                           "intraday_momentum", "overnight_drift"):
             # Parameter-free strategies — no grid search, single empty combo.
             WF_GRID   = {}
             wf_keys   = []
