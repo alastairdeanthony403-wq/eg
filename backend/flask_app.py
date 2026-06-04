@@ -4889,6 +4889,317 @@ def run_late_day_drift_strategy(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ORB BREAKOUT STRATEGY  (Zarattini & Aziz 2023)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Pre-committed rule — zero free parameters, no scanning:
+#   First candle : 09:30 bar (bar_map[(9,30)])
+#   Direction    : sign(close_0930 - open_0930)  [close_0930 = [(9,30)][4]]
+#                  up → LONG, down → SHORT, zero → SKIP
+#   Entry        : open of 09:35 bar (bar_map[(9,35)][1])
+#   Stop         : LONG  → low_0930  (bar_map[(9,30)][3])
+#                  SHORT → high_0930 (bar_map[(9,30)][2])
+#   Target       : 10 × |entry − stop| in the trade direction  (10R)
+#   Exit scan    : iterate bars (9,35) through (15,55) using each bar's HIGH and LOW
+#                  LONG  : stop if bar_low  ≤ stop_level; target if bar_high ≥ target
+#                  SHORT : stop if bar_high ≥ stop_level; target if bar_low  ≤ target
+#                  Same-bar spans both → STOP fills first (conservative)
+#                  EOD   : close of (15,55) bar if neither hit
+#   Sizing       : fixed notional (non-compounding), no leverage
+#
+# Significance: bootstrap on per-trade NET returns (2000 resample iterations).
+# Binomial win-rate guard is INVALID for a 10R strategy (low win rate by design);
+# bootstrap mean > 0 is the right test.
+# BOTH gross and net bootstrap p-values are reported so cost drag is visible.
+
+def run_orb_breakout_strategy(
+    candles,                   # [ts_ms, open, high, low, close, vol] 5m bars
+    starting_balance=10000,
+    fee_pct=0.04,              # one-way fee %
+    slippage_pct=0.02,         # one-way slippage %
+    spread_pct=0.0,
+    notional_pct=10.0,         # fixed notional as % of starting_balance
+):
+    """
+    Returns (trades, ending_balance, diagnostics).
+
+    diagnostics keys:
+      gross_expectancy_pct   — mean per-trade gross return %
+      net_expectancy_pct     — mean per-trade net return %
+      gross_pf               — gross profit factor
+      win_rate_pct           — % of trades that hit target (context only)
+      avg_winner_r           — avg winner expressed in R
+      avg_loser_r            — avg loser expressed in R (negative)
+      payoff_ratio           — avg_winner_r / abs(avg_loser_r)
+      pct_target_exit        — % of trades exiting at target
+      pct_stop_exit          — % of trades exiting at stop
+      pct_eod_exit           — % of trades exiting at EOD close
+      avg_cost_in_r          — round-trip cost / avg stop_dist (cost vs risk)
+      bah_open_close_pct     — buy-and-hold open→close over the period (context)
+      bootstrap_p_gross      — one-sided p-value: mean gross return > 0 (2000 iter)
+      bootstrap_p_net        — one-sided p-value: mean net  return > 0 (2000 iter)
+      total_days             — number of days with valid anchors + non-zero direction
+      gross_pnl              — total gross PnL $
+      net_pnl                — total net PnL $
+      fixed_notional         — notional $ applied
+      one_way_cost_pct       — for sanity-check
+      round_trip_cost_pct    — for sanity-check
+    """
+    import random as _random
+    from collections import defaultdict as _dd
+
+    trades         = []
+    balance        = float(starting_balance)
+    fixed_notional = float(starting_balance) * notional_pct / 100.0
+
+    one_way_cost = (fee_pct + slippage_pct + spread_pct) / 100.0
+    round_trip   = 2 * one_way_cost
+
+    if not candles or len(candles) < 20:
+        return trades, balance, {}
+
+    # ── Group bars by ET date ────────────────────────────────────────────────
+    # ts_ms encodes ET wall-clock as fake-UTC (same convention as
+    # intraday_momentum / late_day_drift).
+    day_bars = _dd(list)
+    for bar in candles:
+        dt_et = datetime.utcfromtimestamp(int(bar[0]) / 1000)
+        day_bars[dt_et.strftime("%Y-%m-%d")].append(bar)
+
+    # For BAH context: track open_0930 and close_1555 across all valid days
+    bah_opens  = []
+    bah_closes = []
+
+    # Per-trade R bookkeeping (for avg_winner_r, avg_loser_r, cost_in_r)
+    stop_dists   = []   # |entry - stop_level| for each trade
+
+    for date_str in sorted(day_bars.keys()):
+        bars = day_bars[date_str]
+
+        # Build bar_map keyed by (hour, minute)
+        bar_map = {}
+        for b in bars:
+            dt_et = datetime.utcfromtimestamp(int(b[0]) / 1000)
+            bar_map[(dt_et.hour, dt_et.minute)] = b
+
+        # Required anchors
+        b_0930 = bar_map.get((9,  30))   # first candle
+        b_0935 = bar_map.get((9,  35))   # entry bar
+        b_1555 = bar_map.get((15, 55))   # EOD exit bar
+
+        if not (b_0930 and b_0935 and b_1555):
+            continue
+
+        open_0930  = float(b_0930[1])
+        high_0930  = float(b_0930[2])
+        low_0930   = float(b_0930[3])
+        close_0930 = float(b_0930[4])
+        close_1555 = float(b_1555[4])
+        entry      = float(b_0935[1])   # open of 09:35 bar
+
+        if open_0930 <= 0 or entry <= 0 or close_1555 <= 0:
+            continue
+
+        # BAH context: use 09:30 open and 15:55 close
+        bah_opens.append(open_0930)
+        bah_closes.append(close_1555)
+
+        # Direction from first candle
+        if close_0930 > open_0930:
+            direction = 1    # LONG
+        elif close_0930 < open_0930:
+            direction = -1   # SHORT
+        else:
+            continue         # exactly zero → skip
+
+        # Stop and target levels
+        if direction == 1:
+            stop_level = low_0930
+            if entry <= stop_level:
+                # Entry gapped below stop — degenerate, skip
+                continue
+            stop_dist  = entry - stop_level
+        else:
+            stop_level = high_0930
+            if entry >= stop_level:
+                # Entry gapped above stop — degenerate, skip
+                continue
+            stop_dist  = stop_level - entry
+
+        if stop_dist <= 0:
+            continue
+
+        target = entry + direction * 10.0 * stop_dist   # 10R in trade direction
+
+        # ── Intrabar scan: (9,35) through (15,55) ────────────────────────────
+        # Sorted list of all bar keys in the session from 09:35 onward
+        scan_keys = sorted(
+            (h, m) for (h, m) in bar_map
+            if (h > 9 or (h == 9 and m >= 35)) and h <= 15
+        )
+
+        exit_price  = close_1555   # default: EOD
+        exit_reason = "eod"
+
+        for hm in scan_keys:
+            scan_bar = bar_map[hm]
+            bar_high = float(scan_bar[2])
+            bar_low  = float(scan_bar[3])
+
+            if direction == 1:   # LONG
+                stop_hit   = bar_low  <= stop_level
+                target_hit = bar_high >= target
+            else:                # SHORT
+                stop_hit   = bar_high >= stop_level
+                target_hit = bar_low  <= target
+
+            if stop_hit and target_hit:
+                # Same bar spans both — stop fills first (conservative)
+                exit_price  = stop_level
+                exit_reason = "stop"
+                break
+            elif stop_hit:
+                exit_price  = stop_level
+                exit_reason = "stop"
+                break
+            elif target_hit:
+                exit_price  = target
+                exit_reason = "target"
+                break
+            # else: neither hit on this bar, continue
+
+        # ── P&L ──────────────────────────────────────────────────────────────
+        # Gross: direction × (exit - entry) / entry × notional
+        raw_return  = direction * (exit_price - entry) / entry
+        gross_pnl   = raw_return * fixed_notional
+        net_pnl     = gross_pnl - round_trip * fixed_notional
+
+        balance += net_pnl
+        stop_dists.append(stop_dist)
+
+        trades.append({
+            "type":            "long"  if direction == 1 else "short",
+            "entry":           entry,
+            "exit":            exit_price,
+            "entry_price":     entry,
+            "exit_price":      exit_price,
+            "stop_level":      stop_level,
+            "target_level":    target,
+            "stop_dist":       round(stop_dist, 6),
+            "exit_reason":     exit_reason,
+            "pnl":             round(net_pnl,   4),
+            "gross_pnl":       round(gross_pnl, 4),
+            "pnl_pct":         round(raw_return * 100 - round_trip * 100, 4),
+            "gross_pnl_pct":   round(raw_return * 100, 4),
+            "r_multiple":      round(direction * (exit_price - entry) / stop_dist, 4),
+            "time":            date_str + " 09:35",
+            "open_time":       date_str + " 09:35",
+            "close_time":      date_str + " " + ("15:55" if exit_reason == "eod" else "09:35"),
+        })
+
+    # ── Aggregate diagnostics ─────────────────────────────────────────────────
+    n = len(trades)
+    if n == 0:
+        return trades, balance, {"error": "no trades generated"}
+
+    gross_returns = [t["gross_pnl_pct"] for t in trades]
+    net_returns   = [t["pnl_pct"]       for t in trades]
+    r_multiples   = [t["r_multiple"]    for t in trades]
+
+    winners = [t for t in trades if t["exit_reason"] == "target"]
+    losers  = [t for t in trades if t["exit_reason"] == "stop"]
+    eod     = [t for t in trades if t["exit_reason"] == "eod"]
+
+    def _mean(lst):
+        return sum(lst) / len(lst) if lst else 0.0
+
+    def _pf(returns):
+        """Gross profit factor from a list of return values."""
+        gains  = sum(r for r in returns if r > 0)
+        losses = abs(sum(r for r in returns if r < 0))
+        return round(gains / losses, 4) if losses else (float("inf") if gains > 0 else 0.0)
+
+    # Per-R bookkeeping
+    winner_r = [t["r_multiple"] for t in winners]
+    loser_r  = [t["r_multiple"] for t in losers]
+    eod_r    = [t["r_multiple"] for t in eod]
+    avg_stop_dist = _mean(stop_dists) if stop_dists else 0.0
+
+    # Cost in R: round-trip cost expressed as fraction of one R unit
+    # cost_in_r = round_trip (as fraction of notional) / (stop_dist / entry)
+    # = round_trip * entry / stop_dist — use median or mean entry/stop_dist
+    cost_in_r_list = []
+    for t in trades:
+        sd = t["stop_dist"]
+        ep = t["entry"]
+        if sd > 0 and ep > 0:
+            cost_in_r_list.append(round_trip * ep / sd)
+    avg_cost_in_r = round(_mean(cost_in_r_list), 4) if cost_in_r_list else None
+
+    # Buy-and-hold context: avg open→close return per day
+    bah_returns = []
+    for o, c in zip(bah_opens, bah_closes):
+        if o > 0:
+            bah_returns.append((c - o) / o * 100.0)
+    bah_pct = round(_mean(bah_returns), 4) if bah_returns else None
+
+    # ── Bootstrap significance (stdlib random only) ───────────────────────────
+    # One-sided p-value: H0 = mean per-trade return <= 0.
+    # p = fraction of 2000 bootstrap resample means that are <= 0.
+    # Run on both GROSS and NET returns independently.
+    _rng = _random.Random(42)   # fixed seed for reproducibility
+
+    def _bootstrap_p(returns, n_iter=2000):
+        n_r = len(returns)
+        if n_r < 2:
+            return 1.0
+        obs_mean = _mean(returns)
+        count_le_zero = 0
+        for _ in range(n_iter):
+            sample = [returns[_rng.randint(0, n_r - 1)] for _ in range(n_r)]
+            if _mean(sample) <= 0:
+                count_le_zero += 1
+        return round(count_le_zero / n_iter, 4)
+
+    bootstrap_p_gross = _bootstrap_p(gross_returns)
+    bootstrap_p_net   = _bootstrap_p(net_returns)
+
+    diagnostics = {
+        # Core edge metrics
+        "gross_expectancy_pct":  round(_mean(gross_returns), 4),
+        "net_expectancy_pct":    round(_mean(net_returns),   4),
+        "gross_pf":              _pf(gross_returns),
+        "win_rate_pct":          round(len(winners) / n * 100, 2),
+        # R-multiple breakdown
+        "avg_winner_r":          round(_mean(winner_r), 4) if winner_r else None,
+        "avg_loser_r":           round(_mean(loser_r),  4) if loser_r  else None,
+        "avg_eod_r":             round(_mean(eod_r),    4) if eod_r    else None,
+        "payoff_ratio":          round(_mean(winner_r) / abs(_mean(loser_r)), 4)
+                                 if loser_r and winner_r and _mean(loser_r) != 0 else None,
+        # Exit breakdown
+        "pct_target_exit":       round(len(winners) / n * 100, 2),
+        "pct_stop_exit":         round(len(losers)  / n * 100, 2),
+        "pct_eod_exit":          round(len(eod)     / n * 100, 2),
+        # Cost in R — key viability check
+        "avg_cost_in_r":         avg_cost_in_r,
+        # Context
+        "bah_open_close_pct":    bah_pct,
+        # Bootstrap significance — the valid test for this strategy
+        "bootstrap_p_gross":     bootstrap_p_gross,
+        "bootstrap_p_net":       bootstrap_p_net,
+        # Totals
+        "total_days":            n,
+        "gross_pnl":             round(sum(t["gross_pnl"] for t in trades), 2),
+        "net_pnl":               round(sum(t["pnl"]       for t in trades), 2),
+        "fixed_notional":        round(fixed_notional, 2),
+        "one_way_cost_pct":      round(one_way_cost * 100, 4),
+        "round_trip_cost_pct":   round(round_trip   * 100, 4),
+    }
+
+    return trades, balance, diagnostics
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # PDH SWEEP SHORT STRATEGY
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -5573,7 +5884,8 @@ def api_backtest():
                   2500 if strategy == "turn_of_month"      else (
                   730  if strategy == "intraday_momentum"   else (
                   2500 if strategy == "overnight_drift"     else (
-                  730  if strategy == "late_day_drift"      else 90))))
+                  730  if strategy == "late_day_drift"      else (
+                  730  if strategy == "orb_breakout"        else 90)))))
     period_days = max(2, min(int(data.get("period_days", 30)), _max_days))
     rand_window = bool(data.get("random_window", False))               # default False
     sb          = float(data.get("starting_balance", 1000))
@@ -5665,7 +5977,7 @@ def api_backtest():
             else:
                 start_date = end_date = ""
 
-        elif strategy in ("intraday_momentum", "late_day_drift"):
+        elif strategy in ("intraday_momentum", "late_day_drift", "orb_breakout"):
             # 5m intraday bars from Twelve Data. US equity only.
             if market == "crypto":
                 return jsonify({
@@ -5743,6 +6055,7 @@ def api_backtest():
     _im_extra  = {}   # populated only when strategy == "intraday_momentum"
     _od_extra  = {}   # populated only when strategy == "overnight_drift"
     _ldd_extra = {}   # populated only when strategy == "late_day_drift"
+    _orb_extra = {}   # populated only when strategy == "orb_breakout"
 
     try:
         if strategy in ("unified_bot", "bot"):   # "bot" kept as legacy alias
@@ -5791,6 +6104,11 @@ def api_backtest():
             )
         elif strategy == "late_day_drift":
             trades, ending_balance, _ldd_extra = run_late_day_drift_strategy(
+                candles, sb, fee_pct, slip_pct,
+                spread_pct=spread_pct,
+            )
+        elif strategy == "orb_breakout":
+            trades, ending_balance, _orb_extra = run_orb_breakout_strategy(
                 candles, sb, fee_pct, slip_pct,
                 spread_pct=spread_pct,
             )
@@ -5982,6 +6300,8 @@ def api_backtest():
         "overnight_drift_metrics": _od_extra if strategy == "overnight_drift" else None,
         # late_day_drift only — closing-window vs rest-of-day per-minute breakdown
         "late_day_drift_metrics": _ldd_extra if strategy == "late_day_drift" else None,
+        # orb_breakout only — expectancy, R-multiples, bootstrap significance
+        "orb_breakout_metrics": _orb_extra if strategy == "orb_breakout" else None,
     }
 
     # Sample up to 400 candles for the chart (keep response size reasonable)
@@ -7512,7 +7832,8 @@ def api_walkforward():
         symbol      = (data.get("symbol") or "BTCUSDT").upper()
         wf_strategy = str(data.get("strategy", "unified_bot")).lower()
         _wf_max_days = (2500 if wf_strategy in ("turn_of_month", "overnight_drift") else
-                        730  if wf_strategy in ("intraday_momentum", "late_day_drift") else 365)
+                        730  if wf_strategy in ("intraday_momentum", "late_day_drift",
+                                                 "orb_breakout") else 365)
         period_days = max(30, min(int(data.get("period_days", 120)), _wf_max_days))
         n_windows   = max(2, min(int(data.get("n_windows",   4)),   6))
         train_pct   = max(0.50, min(float(data.get("train_pct", 0.70)), 0.90))
@@ -7553,7 +7874,7 @@ def api_walkforward():
                              "(e.g. SPY, QQQ, DIA). Use an equity symbol."
                 }), 400
             all_candles = fetch_polygon_candles(symbol, "1d", limit=2500)
-        elif wf_strategy in ("intraday_momentum", "late_day_drift"):
+        elif wf_strategy in ("intraday_momentum", "late_day_drift", "orb_breakout"):
             if market == "crypto":
                 return jsonify({
                     "error": f"{wf_strategy} requires a US equity symbol "
@@ -7626,6 +7947,12 @@ def api_walkforward():
                     spread_pct=spread_pct_wf,
                 )
                 return tr
+            elif wf_strategy == "orb_breakout":
+                tr, _, _ = run_orb_breakout_strategy(
+                    candle_slice, sb, fee_pct, slip_pct,
+                    spread_pct=spread_pct_wf,
+                )
+                return tr
             else:  # unified_bot / bot (default)
                 _c = dict(cfg)
                 if extra_cfg:
@@ -7641,7 +7968,8 @@ def api_walkforward():
                 return tr
 
         if wf_strategy in ("lean_confluence", "pdh_sweep", "turn_of_month",
-                           "intraday_momentum", "overnight_drift", "late_day_drift"):
+                           "intraday_momentum", "overnight_drift", "late_day_drift",
+                           "orb_breakout"):
             # Parameter-free strategies — no grid search, single empty combo.
             WF_GRID   = {}
             wf_keys   = []
