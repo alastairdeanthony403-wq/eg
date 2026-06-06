@@ -4205,7 +4205,8 @@ def run_pdh_sweep_strategy(
                     rr          = reward_dist / risk_dist
                     if rr >= RR_MIN:
                         risk_dlr = balance * RISK_PCT
-                        sz       = risk_dlr / risk_dist
+                        max_sz   = balance / ep          # notional cap: no leverage
+                        sz       = min(risk_dlr / risk_dist, max_sz)
                         if sz > 0:
                             position = {
                                 "entry":     ep,
@@ -4225,14 +4226,16 @@ def run_pdh_sweep_strategy(
             tgt   = position["target"]
             sz    = position["size"]
 
-            # Pessimistic: if SL and TP both touched on the same bar, SL wins.
-            sl_hit = h >= stop
+            # Spec: SL fires when a 5-min candle CLOSES above sweep high; fill at close.
+            # TP fires when low touches target; fill at target.
+            # Pessimistic same-bar rule: if both trigger, SL wins.
+            sl_hit = c > stop
             tp_hit = lo <= tgt
 
             if sl_hit and tp_hit:
-                exit_price, exit_reason = stop, "Stop loss (SL/TP same bar)"
+                exit_price, exit_reason = c,    "Stop loss (SL/TP same bar)"
             elif sl_hit:
-                exit_price, exit_reason = stop, "Stop loss"
+                exit_price, exit_reason = c,    "Stop loss"
             elif tp_hit:
                 exit_price, exit_reason = tgt,  "Take profit"
             else:
