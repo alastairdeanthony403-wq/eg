@@ -6691,7 +6691,7 @@ def api_walkforward():
             train_c = w_candles[:sp]
             test_c  = w_candles[sp:]
 
-            # ── Grid search on in-sample candles (unified_bot only) ───────────
+            # ── Grid search on in-sample candles ─────────────────────────────
             best_score  = -1
             best_params = {k: cfg.get(k) for k in wf_keys}  # fallback / empty for lean
 
