@@ -3158,6 +3158,7 @@ def run_turn_of_month_strategy(
 
     trades  = []
     balance = float(starting_balance)
+    fixed_notional = float(starting_balance) * 0.10   # 10% of starting balance, non-compounding
 
     if not candles or len(candles) < 10:
         return trades, balance, {}
@@ -3173,11 +3174,11 @@ def run_turn_of_month_strategy(
     for i in range(len(candles) - 1):
         if _ym(candles[i]) != _ym(candles[i + 1]):
             last_of_month.append(i)
-    # Never use the very last bar as an entry (no exit bar would exist).
-    last_of_month = [i for i in last_of_month if i + 3 < len(candles)]
+    # Guards: need i-1 >= 0 (to fill at day -1) and i+3 < len(candles) (exit bar exists).
+    last_of_month = [i for i in last_of_month if i - 1 >= 0 and i + 3 < len(candles)]
 
     # ── Build a set of bar indices that are INSIDE a window ──────────────────
-    # Window = entry bar + bars 1, 2, 3 of next month (4 bars inclusive).
+    # Window = bars i-1, i, i+1, i+2, i+3 (day -1 through day +3, 5 bars).
     # We mark every bar index that is "inside" so we can split per-day returns.
     in_window_set = set()
 
@@ -3185,24 +3186,25 @@ def run_turn_of_month_strategy(
     one_way_cost = (fee_pct + slippage_pct + spread_pct) / 100.0
 
     for entry_idx in last_of_month:
-        exit_idx = entry_idx + 3   # 3rd trading day of next month (0-based offset)
+        fill_idx = entry_idx - 1   # day -1: close of bar before month-end bar
+        exit_idx = entry_idx + 3   # day +3: close of 3rd trading day of next month
 
-        entry_close = float(candles[entry_idx][4])
+        entry_close = float(candles[fill_idx][4])   # FIX 1: fill at day -1 close
         exit_close  = float(candles[exit_idx][4])
 
-        # Mark bars inside this window (inclusive of entry and exit bars).
-        for wi in range(entry_idx, exit_idx + 1):
+        # Mark bars inside this window (day -1 through day +3 inclusive).
+        for wi in range(fill_idx, exit_idx + 1):
             in_window_set.add(wi)
 
         # Cost-adjusted return.
         gross_ret = (exit_close - entry_close) / entry_close
         net_ret   = gross_ret - 2 * one_way_cost   # round-trip
 
-        pnl   = balance * net_ret
+        pnl     = fixed_notional * net_ret          # FIX 2: fixed notional, non-compounding
         balance += pnl
 
         from datetime import datetime as _dt
-        entry_ts = int(candles[entry_idx][0])
+        entry_ts = int(candles[fill_idx][0])
         exit_ts  = int(candles[exit_idx][0])
 
         trades.append({
