@@ -4958,11 +4958,11 @@ def api_backtest():
 
     # ── Normalize trade field names so frontend always gets consistent keys ──
     def _parse_ts(s):
-        """Parse 'YYYY-MM-DD HH:MM' or ISO string → epoch seconds, or 0."""
+        """Parse 'YYYY-MM-DD', 'YYYY-MM-DD HH:MM', or ISO string → epoch seconds, or 0."""
         if not s:
             return 0
         try:
-            for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+            for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
                 try:
                     return int(datetime.strptime(str(s), fmt).replace(tzinfo=timezone.utc).timestamp())
                 except ValueError:
@@ -5048,6 +5048,19 @@ def api_backtest():
 
     train_trades = [t for t in trades if _parse_ts(t.get("open_time") or t.get("entry_time")) < _split_ts_sec]
     test_trades  = [t for t in trades if _parse_ts(t.get("open_time") or t.get("entry_time")) >= _split_ts_sec]
+
+    # Sanity guard: every trade must land in exactly one partition.
+    # A mismatch means _parse_ts returned 0 for unparseable timestamps (silent data loss).
+    _unaccounted = len(trades) - len(train_trades) - len(test_trades)
+    if _unaccounted != 0:
+        return jsonify({
+            "error": (
+                f"Split accounting error: {len(trades)} total trades but "
+                f"{len(train_trades)} train + {len(test_trades)} test = "
+                f"{len(train_trades)+len(test_trades)} "
+                f"({_unaccounted} trades have unparseable timestamps)."
+            )
+        }), 500
 
     train_m = _split_metrics(train_trades)
     test_m  = _split_metrics(test_trades)
